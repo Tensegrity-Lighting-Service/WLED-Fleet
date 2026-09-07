@@ -11,6 +11,7 @@ rf-scans.log
 pairing.log
 desktop/target/
 desktop/gen/
+desktop/embed/
 release/
 wizard.json
 wizard-dev.json

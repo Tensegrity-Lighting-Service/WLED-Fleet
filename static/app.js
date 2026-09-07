@@ -1,5 +1,16 @@
 (() => {
   const $ = s => document.querySelector(s);
+  // ── thème clair / sombre / système : tout en haut pour limiter le flash au chargement ──
+  // 'system' = pas d'attribut, la media query prefers-color-scheme décide (style.css) ;
+  // un choix explicite pose data-theme sur <html>, qui l'emporte dans les deux sens.
+  let theme = 'system'; try { theme = localStorage.getItem('wf.theme') || 'system'; } catch { /* défaut */ }
+  function applyTheme(t) {
+    theme = t; try { localStorage.setItem('wf.theme', t); } catch { /* ignore */ }
+    if (t === 'system') document.documentElement.removeAttribute('data-theme'); else document.documentElement.setAttribute('data-theme', t);
+    document.querySelectorAll('#themeSw button').forEach(b => b.classList.toggle('active', b.dataset.theme === t));
+  }
+  applyTheme(theme);
+  document.querySelectorAll('#themeSw button').forEach(b => b.onclick = () => applyTheme(b.dataset.theme));
   let COLS = [], GROUPS = [], fleet = { nodes: [] }, LED_TYPES = {}, COLOR_ORDERS = {};
   let ledProfilesCache = []; // local library (led-profiles.json), kept in sync for the Sorties/DMX badge and table
   let sortKey = 'name', sortDir = 1, editing = null;
@@ -27,6 +38,27 @@
   const key = n => n.meta.ip;
   // tooltip text for a column: label, explanation, then how it is read/written
   const helpText = c => `${c.label}\n${c.help || c.title || ''}\n\n${c.write ? `✎ modifiable → ${c.write.target === 'cfg' ? 'cfg.json' : 'état'} : ${c.write.path}${c.reboot ? ' (⟳ redémarrage requis)' : ''}` : 'lecture seule'}\nlu dans ${c.path}`;
+  // ── présence & qualité de signal (partie figée) ──────────────────────────────
+  // hors ligne officiellement après 2 relevés manqués (serveur) ; ici un 1er
+  // relevé manqué se voit déjà (pastille orange qui pulse) au lieu d'attendre
+  // en silence le 2e. La jauge (façon téléphone, 0-4 barres) reflète le RSSI
+  // Wi-Fi du node — plus parlant que la latence pour le risque de décrochage ;
+  // absente pour un node en Ethernet (pas de RSSI).
+  function presenceHtml(n) {
+    const fails = n.meta.fails || 0;
+    const cls = !n.meta.online ? 'bad' : fails >= 1 ? 'warn pulse' : 'ok';
+    const rssi = n.info && n.info.wifi && n.info.wifi.rssi != null ? n.info.wifi.rssi : null;
+    const status = !n.meta.online
+      ? `hors ligne${n.meta.lastSeenAgo != null ? ' depuis ' + fmtDur(n.meta.lastSeenAgo) : ''}`
+      : fails >= 1 ? '⚠ 1 relevé manqué : risque de décrochage au prochain'
+      : [rssi != null ? `signal ${rssi} dBm` : null, n.meta.latency != null ? `latence ${n.meta.latency} ms` : null].filter(Boolean).join(', ') || 'en ligne';
+    let bars = '';
+    if (n.meta.online && fails === 0 && rssi != null) {
+      const q = rssi >= -55 ? 4 : rssi >= -67 ? 3 : rssi >= -75 ? 2 : 1;
+      bars = `<span class="sigbars q${q}" title="signal Wi-Fi : ${rssi} dBm"><i></i><i></i><i></i><i></i></span>`;
+    }
+    return { cls, status, bars };
+  }
 
   function display(col, v) {
     if (v === undefined || v === null) return '';
@@ -267,20 +299,53 @@
     });
     return { box, close };
   }
-  let dragId = null, justResized = false;
+  let justResized = false, colDrag = null, justColMoved = false;
+  // column drag to reorder, pointer events — same principle as the row ⋮⋮ drag
+  // (lift + neighbours slide out of the way) rather than native HTML5 drag/drop,
+  // which never actually fired a drop in the desktop shell's webview.
+  function colDragStart(th, id, e) {
+    if (e.button !== 0 || colDrag || e.target.closest('.rs')) return;
+    e.preventDefault();
+    try { th.setPointerCapture(e.pointerId); } catch { /* ignore */ }
+    const row = th.parentElement;
+    const ths = [...row.querySelectorAll('th[data-col]')].filter(t => !PINNED.includes(t.dataset.col));
+    const from = ths.indexOf(th); if (from < 0) return;
+    const d = colDrag = { th, ths, from, to: from, x: e.clientX, startX: e.clientX, lefts: ths.map(t => t.offsetLeft), w: th.offsetWidth };
+    th.classList.add('dragging'); document.body.classList.add('col-dragging');
+    const place = () => {
+      const dx = d.x - d.startX;
+      d.th.style.transform = `translateX(${dx}px)`;
+      const center = d.lefts[d.from] + d.w / 2 + dx;
+      let to = 0; d.ths.forEach((t, i) => { if (i !== d.from && d.lefts[i] + t.offsetWidth / 2 < center) to++; });
+      d.to = to;
+      d.ths.forEach((t, i) => {
+        if (i === d.from) return;
+        const s = i > d.from && i <= to ? -d.w : i < d.from && i >= to ? d.w : 0;
+        t.style.transform = s ? `translateX(${s}px)` : '';
+      });
+    };
+    const finish = () => {
+      if (colDrag !== d) return; colDrag = null;
+      th.onpointermove = th.onpointerup = th.onpointercancel = null;
+      d.ths.forEach(t => t.style.transform = ''); th.classList.remove('dragging'); document.body.classList.remove('col-dragging');
+      if (d.to === d.from) return; // plain click: let th.onclick sort as usual
+      justColMoved = true; setTimeout(() => justColMoved = false, 50);
+      const seq = d.ths.slice(); const [mv] = seq.splice(d.from, 1); seq.splice(d.to, 0, mv);
+      const beforeId = seq[d.to + 1] ? seq[d.to + 1].dataset.col : '__end';
+      moveColumn(id, beforeId);
+    };
+    th.onpointermove = ev => { d.x = ev.clientX; place(); };
+    th.onpointerup = finish; th.onpointercancel = finish;
+  }
   function attachHeaderBehaviour(th) {
     const id = th.dataset.col;
     // sort on plain click
-    th.onclick = () => { if (justResized) { justResized = false; return; } const k = th.dataset.sort; if (!k) return; if (sortKey === k) sortDir = -sortDir; else { sortKey = k; sortDir = 1; } saveRowOrder(); renderHead(); renderBody(); };
+    th.onclick = () => { if (justResized || justColMoved) { justResized = false; return; } const k = th.dataset.sort; if (!k) return; if (sortKey === k) sortDir = -sortDir; else { sortKey = k; sortDir = 1; } saveRowOrder(); renderHead(); renderBody(); };
     // drag to reorder (the pinned name / ip columns stay put)
     if (!PINNED.includes(id)) {
-      th.draggable = true;
-      th.ondragstart = e => { dragId = id; e.dataTransfer.effectAllowed = 'move'; e.dataTransfer.setData('text/plain', id); th.classList.add('dragging'); };
-      th.ondragend = () => { th.classList.remove('dragging'); $('#grid thead').querySelectorAll('.dragover').forEach(x => x.classList.remove('dragover')); };
+      th.classList.add('draggable');
+      th.onpointerdown = e => colDragStart(th, id, e);
     }
-    th.ondragover = e => { if (!dragId || PINNED.includes(id)) return; e.preventDefault(); e.dataTransfer.dropEffect = 'move'; th.classList.add('dragover'); };
-    th.ondragleave = () => th.classList.remove('dragover');
-    th.ondrop = e => { if (!dragId) return; e.preventDefault(); const from = dragId; dragId = null; moveColumn(from, id); };
     // right click: fit to content, this column or all of them
     th.oncontextmenu = e => {
       e.preventDefault(); e.stopPropagation();
@@ -302,9 +367,8 @@
     if (rs) rs.onmousedown = e => {
       e.preventDefault(); e.stopPropagation();
       const col = COLS.find(c => c.id === id) || CHECK_COL; const x0 = e.clientX, w0 = widthOf(col);
-      th.draggable = false;
       const mv = ev => { colWidths[id] = Math.max(40, Math.round(w0 + ev.clientX - x0)); applyWidths(); };
-      const up = ev => { if (ev && ev.clientX !== undefined) mv(ev); document.removeEventListener('mousemove', mv); document.removeEventListener('mouseup', up); th.draggable = !PINNED.includes(id); justResized = true; saveLayout(); setTimeout(() => justResized = false, 50); };
+      const up = ev => { if (ev && ev.clientX !== undefined) mv(ev); document.removeEventListener('mousemove', mv); document.removeEventListener('mouseup', up); justResized = true; saveLayout(); setTimeout(() => justResized = false, 50); };
       document.addEventListener('mousemove', mv); document.addEventListener('mouseup', up);
     };
   }
@@ -505,8 +569,13 @@
   // ── grid context menu: on a selection (cells and / or checked rows) or in the void ──
   const nodeOf = ip => fleet.nodes.find(n => key(n) === ip);
   const nameOf = ip => { const n = nodeOf(ip); return (n && n.info && n.info.name) || ip; };
+  // Fleet-only fields written straight to the node's MQTT config (group, sorties non
+  // utilisées, profils de sortie) : mis en attente (⏳) quand le node est hors ligne.
+  const OFFLINE_FIELD_LABEL = { group: 'groupe', ignoredOutputs: 'sorties non utilisées', outputProfiles: 'profils de sortie' };
   async function setGroup(ips, g) {
-    for (const ip of ips) { try { await post(`/api/node/${encodeURIComponent(ip)}/group`, { group: g }); } catch (e) { toast(`${nameOf(ip)} : ${e.message}`, true); } }
+    let queued = 0;
+    for (const ip of ips) { try { const r = await post(`/api/node/${encodeURIComponent(ip)}/group`, { group: g }); if (r.queued) queued++; } catch (e) { toast(`${nameOf(ip)} : ${e.message}`, true); } }
+    if (queued) toast(`${queued} node(s) hors ligne : le groupe sera proposé au retour (⏳ sur la ligne)`);
     await refresh(); renderBody();
   }
   function gridMenu(e) {
@@ -533,6 +602,45 @@
       { label: 'Nouveau groupe…', act: async () => { const g = prompt(`Nom du nouveau groupe pour ${lbl} :`); if (g && g.trim()) await setGroup(ips, g.trim()); } },
     ];
     const items = [{ label: 'Groupe', sub: groupSub, help: `${lbl} : choisir le groupe (Group topic MQTT du node, écrit tout de suite)` }];
+    // right-click the name / mDNS / AP-SSID cell of one node: push that cell's value as
+    // the reference into the other two (same server endpoint as the ≡ unifier row button —
+    // showAdv only, easy to miss — but any of the three fields can now be the source,
+    // not just the name)
+    if (c && ['name', 'mdns', 'apssid'].includes(c.col) && !fleet.readonly) {
+      const node = nodeOf(c.ip);
+      if (node && node.info) {
+        const col = COLS.find(x => x.id === c.col);
+        const p = pending.get(pkey(c.ip, c.col));
+        const value = p ? p.value : (get(node, col.path) ?? (c.col === 'name' ? node.info.name : undefined));
+        if (value) {
+          items.push({ label: `Renommer « ${nameOf(c.ip)} » d'après cette cellule`, help: `« ${value} » (${col.label}) devient le nom, le mDNS (forme d'hôte) et le SSID de l'AP de ce node — les trois s'alignent dessus. Redémarrage nécessaire, lancé automatiquement.`, act: async () => {
+            if (!await confirmBox(`Aligner nom / mDNS / SSID de l'AP de « ${nameOf(c.ip)} » sur « ${value} » ?\n\nRedémarrage immédiat.`)) return;
+            try { const r = await post(`/api/node/${encodeURIComponent(c.ip)}/unify`, { name: value, reboot: true }); toast(`${nameOf(c.ip)} : nom / mDNS / AP = ${r.name}, redémarrage`); } catch (e) { toast(e.message, true); }
+          } });
+        }
+      }
+    }
+    // right-click a cell that's part of a multi-cell selection in one column: offer to
+    // align the other selected cells of that column on THIS one (same fillBox as Entrée
+    // sur une cellule éditée, juste sans avoir à retaper la valeur)
+    if (c) {
+      const col = COLS.find(x => x.id === c.col);
+      const targets = col ? columnTargets(c.col) : [];
+      if (col && col.write && !fleet.readonly && targets.length > 1 && targets.includes(c.ip) && nodeOf(c.ip)) {
+        const p = pending.get(pkey(c.ip, col.id));
+        const value = p ? p.value : get(nodeOf(c.ip), col.path);
+        items.push({ label: `Aligner « ${col.label} » sur « ${nameOf(c.ip)} » (${targets.length} cellules)`, help: `propose la même valeur — ou incrémentale — pour les ${targets.length - 1} autre(s) cellule(s) sélectionnée(s) de cette colonne, à partir de celle-ci ; rien n'est envoyé avant Déployer`, act: async () => {
+          const chosen = await fillBox(col, value, c.ip, targets);
+          if (!chosen) return;
+          if (col.local) {
+            for (const { ip: t, value: v } of chosen) { try { await post(`/api/node/${encodeURIComponent(t)}/${col.write.path}`, { [col.write.path]: v }); } catch (e) { toast(`${t} : ${e.message}`, true); } }
+            await refresh(); renderBody(); return;
+          }
+          for (const { ip: t, value: v } of chosen) stageValue(t, col, v);
+          updatePendingUI(); renderBody();
+        } });
+      }
+    }
     // documented WLED defaults for the selected cells (columns that carry `def`)
     const cells = [...cellSel].map(k => { const i = k.indexOf('|'); return { ip: k.slice(0, i), col: COLS.find(x => x.id === k.slice(i + 1)) }; }).filter(x => x.col && x.col.def !== undefined && x.col.write && !fleet.readonly && nodeOf(x.ip));
     if (cells.length) {
@@ -610,9 +718,13 @@
       }).join('');
       const pn = pending.get(pkey(k, 'name'));
       const name = pn ? pn.value : (get(n, nameCol.path) ?? (n.info && n.info.name) ?? '');
+      const pr = presenceHtml(n);
+      const oq = n.meta.offlineQueue;
+      const oqWhat = oq ? Object.keys(oq).map(f => OFFLINE_FIELD_LABEL[f] || f).join(', ') : '';
+      const nameTitle = [n.meta.err, pr.status, n.derived && n.derived.nameMismatch ? n.derived.nameMismatch + ' — bouton ≡ unifier en bout de ligne' : '', oq ? `⏳ en attente (${oqWhat}) — ${n.meta.online ? 'cliquer pour envoyer ou abandonner' : 'sera proposé au retour du node'}` : ''].filter(Boolean).join('\n');
       return `<tr class="${n.meta.online ? '' : 'offline'}${selected.has(k) ? ' selected' : ''}" data-ip="${esc(k)}" data-rid="${esc(rid(n))}">` +
         `<td class="pin"><span class="cell"><span class="grip" title="glisser pour réordonner les lignes (passe en ordre manuel)"></span><input type="checkbox" class="sel" title="cocher la ligne pour les actions (identifier, préréglage, mise à jour)" ${selected.has(k) ? 'checked' : ''}></span></td>` +
-        `<td class="pin2 ${nameCol.write && !fleet.readonly ? 'rw' : ''}${pn ? ' pending' : ''}${changedCls(k, 'name')}" data-ip="${esc(k)}" data-col="name" title="${esc(n.meta.err || (n.derived && n.derived.nameMismatch ? n.derived.nameMismatch + ' — bouton ≡ unifier en bout de ligne' : ''))}"><span class="cell"><span class="dot ${n.meta.online ? 'ok' : 'bad'}"></span><button class="idbtn" data-act="identify" title="identifier : allume ce node en blanc plein 3 s (même sous flux E1.31 / DDP) puis rétablit son état ; rien n'est écrit en mémoire">💡</button>${esc(name)}${n.derived && n.derived.nameMismatch ? ' <span style="color:var(--warn)" title="' + esc(n.derived.nameMismatch) + '">≠</span>' : ''}${n.meta.pending ? ' <span class="muted">…</span>' : ''}</span></td>` +
+        `<td class="pin2 ${nameCol.write && !fleet.readonly ? 'rw' : ''}${pn ? ' pending' : ''}${changedCls(k, 'name')}" data-ip="${esc(k)}" data-col="name" title="${esc(nameTitle)}"><span class="cell"><span class="dot ${pr.cls}"></span>${pr.bars}<button class="idbtn" data-act="identify" title="identifier : allume ce node en blanc plein 3 s (même sous flux E1.31 / DDP) puis rétablit son état ; rien n'est écrit en mémoire">💡</button>${oq ? `<button class="idbtn" data-act="offline-queue" style="color:var(--warn)" title="${esc(`en attente (${oqWhat}) — ${n.meta.online ? 'cliquer pour envoyer au node ou abandonner' : 'sera proposé dès que le node répond'}`)}">⏳</button>` : ''}${esc(name)}${n.derived && n.derived.nameMismatch ? ' <span style="color:var(--warn)" title="' + esc(n.derived.nameMismatch) + '">≠</span>' : ''}${n.meta.pending ? ' <span class="muted">…</span>' : ''}</span></td>` +
         `<td class="pin3${n.meta.foreign ? ' chg-ext' : ''}" data-ip="${esc(k)}" data-col="ip" title="${esc(helpText(COLS.find(c => c.id === 'ip')))}"><span class="cell">${display(COLS.find(c => c.id === 'ip'), k)}</span></td>` +
         cells +
         (!showAdv ? '<td></td>' : `<td><span class="cell"><a class="rowbtn" href="/api/node/${encodeURIComponent(k)}/cfg" title="télécharger le cfg.json complet de ce node (sauvegarde de toute sa configuration)">⬇ cfg</a>` +
@@ -1017,7 +1129,7 @@
     p.querySelectorAll('input[data-ignore]').forEach(cb => cb.onchange = async () => {
       const ip = cb.closest('tr').dataset.node;
       const starts = rowsOf(ip).map(tr => tr.querySelector('input[data-ignore]')).filter(x => !x.checked).map(x => Number(x.dataset.ignore));
-      try { await post(`/api/node/${encodeURIComponent(ip)}/outputs-ignore`, { starts }); toast(starts.length ? `${starts.length} sortie(s) non utilisée(s), mémorisé sur le node` : 'toutes les sorties utilisées'); }
+      try { const r = await post(`/api/node/${encodeURIComponent(ip)}/outputs-ignore`, { starts }); toast(r.queued ? 'node hors ligne : sera proposé au retour (⏳ sur la ligne)' : (starts.length ? `${starts.length} sortie(s) non utilisée(s), mémorisé sur le node` : 'toutes les sorties utilisées')); }
       catch (e) { toast(e.message, true); cb.checked = !cb.checked; return; }
       cb.closest('tr').classList.toggle('offline', !cb.checked); renderConflicts(); // in place: the unsaved edits of the page stay
     });
@@ -1082,7 +1194,7 @@
     // the node remembers the profile of each output (MQTT client id suffix) ; in place, no re-render
     async function remember(tr, id) {
       const ip = tr.dataset.node, index = Number(tr.dataset.outrow);
-      try { await post(`/api/node/${encodeURIComponent(ip)}/output-profile`, { index, id }); } catch (e) { toast(`profil non mémorisé sur le node : ${e.message}`, true); }
+      try { const r = await post(`/api/node/${encodeURIComponent(ip)}/output-profile`, { index, id }); if (r.queued) toast('node hors ligne : le profil sera proposé au retour (⏳ sur la ligne)'); } catch (e) { toast(`profil non mémorisé sur le node : ${e.message}`, true); }
     }
     // the one Save button: outputs block per changed node (backup first), then the node's DMX settings through pending + deploy
     const sb = $('#dmxSave'); if (sb) sb.onclick = async () => {
@@ -1884,6 +1996,20 @@
         if (!await confirmBox(`Écrire sur ${ip} :\n  nom  = ${name}\n  mDNS = ${name.toLowerCase().replace(/[^a-z0-9-]+/g, '-').replace(/^-+|-+$/g, '')}\n  AP   = ${name}\npuis redémarrer le node ?`)) return;
         try { const r = await post(`/api/node/${encodeURIComponent(ip)}/unify`, { name, reboot: true }); toast(`${ip} : nom / mDNS / AP = ${r.name}, redémarrage`); } catch (e) { toast(e.message, true); }
         refresh(); return;
+      }
+      if (act === 'offline-queue') {
+        const n = fleet.nodes.find(x => key(x) === ip); const q = n && n.meta.offlineQueue;
+        if (!q) return;
+        const what = Object.keys(q).map(f => OFFLINE_FIELD_LABEL[f] || f).join(', ');
+        menuBox(lastPointer.x, lastPointer.y + 8, [
+          { label: `Mettre à jour le node (${what})`, help: n.meta.online ? 'envoie ces changements en attente au node maintenant' : 'le node est toujours hors ligne : réessayer à son retour', act: async () => {
+            try { const r = await post(`/api/node/${encodeURIComponent(ip)}/offline-queue/apply`, {}); toast(r.applied.length ? `${nameOf(ip)} : ${r.applied.join(', ')} envoyé(s)` : `${nameOf(ip)} : toujours hors ligne`); } catch (e) { toast(e.message, true); } refresh();
+          } },
+          { label: 'Récupérer depuis le node (abandonner)', danger: true, help: 'jette ces changements en attente ; la config actuelle du node fait foi', act: async () => {
+            try { await post(`/api/node/${encodeURIComponent(ip)}/offline-queue/discard`, {}); toast(`${nameOf(ip)} : changements en attente abandonnés`); } catch (e) { toast(e.message, true); } refresh();
+          } },
+        ]);
+        return;
       }
       if (act === 'identify') {
         try { await post(`/api/node/${encodeURIComponent(ip)}/identify`, { ms: 3000 }); toast(`💡 ${ip} en blanc 3 s`); } catch (e) { toast(e.message, true); }

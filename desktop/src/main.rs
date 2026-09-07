@@ -1,8 +1,12 @@
 // WLED Fleet — native window (Tauri 2 / WebView2), same recipe as Lumitrack.
 //
-// The whole application lives in the parent folder as plain files
-// (server.js, columns.js, static/index.html …). This shell only:
-//   1. finds that folder (next to the exe, or the source tree in dev),
+// The application (server.js, columns.js, static/index.html …) is baked into
+// this binary at compile time (build.rs stages it into embed/, include_dir!
+// below embeds it) and self-extracts next to the exe on first launch, or
+// whenever the embedded version changes — see ensure_app_dir(). That's the
+// whole point: GitHub Releases only ever has to offer ONE .exe, not a zip of
+// loose files. This shell then only:
+//   1. makes sure server.js & friends are there (extracting if needed),
 //   2. starts `node server.js` hidden (no console), with WLED_FLEET_LAUNCHER=1
 //      so the page's « Redémarrer le serveur » button works: node exits with
 //      code 75 and this supervisor relaunches it at once,
@@ -16,7 +20,7 @@
 // target_os cfg is needed here.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use std::io::Cursor;
+use include_dir::{include_dir, Dir};
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -27,6 +31,12 @@ use tauri_plugin_updater::UpdaterExt;
 
 const PORT: u16 = 8792;
 const RESTART_EXIT_CODE: i32 = 75;
+// build.rs stages the app into embed/ (from ../, minus dev/runtime-only stuff:
+// desktop/, test/, snapshots/, firmware/, settings.json, known-nodes.json…)
+// and stamps WF_APP_VERSION from tauri.conf.json (Cargo.toml's own version is
+// internal-only, see its comment — deliberately not used as the freshness key).
+static APP_FILES: Dir = include_dir!("$CARGO_MANIFEST_DIR/embed");
+const APP_VERSION: &str = env!("WF_APP_VERSION");
 
 /// Resolves `node` on PATH, with a couple of well-known fallback locations on
 /// macOS: a GUI app launched from Finder does NOT inherit the shell's PATH
@@ -45,25 +55,53 @@ fn find_node() -> Command {
     Command::new("node")
 }
 
-/// Folder holding server.js: the exe's folder (or up to 3 parents, so the
-/// exe can also run from desktop/target/release), else the source tree.
-fn app_dir() -> Option<PathBuf> {
+/// Writes the embedded app tree under `dst`, creating folders as needed.
+/// Never touches anything else — settings.json, known-nodes.json, snapshots/,
+/// firmware/, logs… simply aren't part of the embed (see build.rs), so a
+/// re-extract (first run, or after an update) can never clobber local data.
+fn extract_embedded(d: &Dir, dst: &Path) -> std::io::Result<()> {
+    for file in d.files() {
+        let target = dst.join(file.path());
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(target, file.contents())?;
+    }
+    for sub in d.dirs() {
+        extract_embedded(sub, dst)?;
+    }
+    Ok(())
+}
+
+/// The app's folder: normally wherever this exe currently sits, self-extracted
+/// there if missing or out of date. `WLED_FLEET_DIR` (dev only) points at a
+/// live source tree instead and skips extraction entirely — the escape hatch
+/// for editing server.js/static/* without losing the changes to a re-extract
+/// on the next build; WLED-Fleet.cmd (console launch) never goes through any
+/// of this, it always runs the folder's own files.
+fn ensure_app_dir() -> Option<PathBuf> {
     if let Ok(dir) = std::env::var("WLED_FLEET_DIR") {
         let p = PathBuf::from(dir);
-        if p.join("server.js").is_file() { return Some(p); }
-    }
-    if let Ok(exe) = std::env::current_exe() {
-        let mut d = exe.parent().map(Path::to_path_buf);
-        for _ in 0..4 {
-            if let Some(ref p) = d {
-                if p.join("server.js").is_file() { return Some(p.clone()); }
-                d = p.parent().map(Path::to_path_buf);
-            }
+        if p.join("server.js").is_file() {
+            return Some(p);
         }
     }
-    let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
-    if src.join("server.js").is_file() { return Some(src); }
-    None
+    let dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
+    let marker = dir.join(".wf-embedded-version");
+    let up_to_date = std::fs::read_to_string(&marker).map(|v| v.trim() == APP_VERSION).unwrap_or(false);
+    if !up_to_date {
+        match extract_embedded(&APP_FILES, &dir) {
+            Ok(()) => {
+                let _ = std::fs::write(&marker, APP_VERSION);
+            }
+            Err(e) => eprintln!("WLED Fleet: extraction impossible : {e}"),
+        }
+    }
+    if dir.join("server.js").is_file() {
+        Some(dir)
+    } else {
+        None
+    }
 }
 
 fn port_open() -> bool {
@@ -92,13 +130,13 @@ struct Sidecar {
 }
 
 // ── Portable updater ─────────────────────────────────────────────────────────
-// No installer (no NSIS/MSI/dmg): a release is a signed .zip of the plain app
-// folder (server.js, static/, …, and a freshly built exe named WLED-Fleet.exe
-// — see desktop/build-release.cmd). `Update::download()` already verifies the
-// minisign signature against the pubkey in tauri.conf.json; we deliberately
-// never call `Update::install()` (it expects a platform installer, which we
-// don't have) and instead extract the zip ourselves and copy it over this
-// folder, then swap the running executable.
+// No installer, no zip: a release is just the signed exe (see
+// desktop/build-release.cmd). `Update::download()` already verifies the
+// minisign signature against the pubkey in tauri.conf.json against the raw
+// exe bytes; we deliberately never call `Update::install()` (it expects a
+// platform installer, which we don't have) and instead swap the running
+// executable ourselves. The new exe re-extracts its own (newer) embedded
+// files next to itself the moment it starts, via ensure_app_dir() above.
 #[derive(Clone, serde::Serialize)]
 struct UpdateInfo {
     version: String,
@@ -114,88 +152,35 @@ async fn check_update(app: tauri::AppHandle) -> Result<Option<UpdateInfo>, Strin
 
 #[tauri::command]
 async fn install_update(app: tauri::AppHandle) -> Result<(), String> {
-    let dir = app_dir().ok_or("dossier de l'application introuvable")?;
     let updater = app.updater().map_err(|e| e.to_string())?;
-    let update = updater
-        .check()
-        .await
-        .map_err(|e| e.to_string())?
-        .ok_or("aucune mise à jour disponible")?;
-    let bytes = update
-        .download(|_, _| {}, || {})
-        .await
-        .map_err(|e| e.to_string())?;
-    apply_update(&dir, bytes).map_err(|e| e.to_string())?;
+    let update = updater.check().await.map_err(|e| e.to_string())?.ok_or("aucune mise à jour disponible")?;
+    let bytes = update.download(|_, _| {}, || {}).await.map_err(|e| e.to_string())?;
+    let current_exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    swap_and_relaunch(&current_exe, &bytes).map_err(|e| e.to_string())?;
     // the supervisor's RunEvent::Exit handler stops node cleanly before quitting
     app.exit(0);
     Ok(())
 }
 
-/// Extracts the release zip into a scratch folder, copies every file it
-/// contains over `dir` (the zip only ever holds app code — the same
-/// .gitignore-filtered fileset that gets published, so this never touches
-/// settings.json / known-nodes.json / snapshots/ / firmware/ / logs — they
-/// simply aren't in the zip), then swaps the running executable last.
-fn apply_update(dir: &Path, bytes: Vec<u8>) -> std::io::Result<()> {
-    let mut archive = zip::ZipArchive::new(Cursor::new(bytes))
-        .map_err(|e| std::io::Error::other(format!("archive invalide : {e}")))?;
-    let scratch = std::env::temp_dir().join(format!("wled-fleet-update-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&scratch);
-    archive
-        .extract(&scratch)
-        .map_err(|e| std::io::Error::other(format!("extraction : {e}")))?;
-
-    let current_exe = std::env::current_exe()?;
-    let new_exe_in_scratch = scratch.join("WLED-Fleet.exe");
-    copy_tree(&scratch, dir, &new_exe_in_scratch)?;
-
-    if new_exe_in_scratch.is_file() {
-        swap_and_relaunch(&current_exe, &new_exe_in_scratch)?;
-    }
-    let _ = std::fs::remove_dir_all(&scratch);
-    Ok(())
-}
-
-/// Recursively copies `src` over `dst`, skipping `skip` (the new executable —
-/// the currently running one can't be overwritten in place, see
-/// `swap_and_relaunch`).
-fn copy_tree(src: &Path, dst: &Path, skip: &Path) -> std::io::Result<()> {
-    for entry in std::fs::read_dir(src)? {
-        let entry = entry?;
-        let from = entry.path();
-        if from == skip {
-            continue;
-        }
-        let to = dst.join(entry.file_name());
-        if entry.file_type()?.is_dir() {
-            std::fs::create_dir_all(&to)?;
-            copy_tree(&from, &to, skip)?;
-        } else {
-            std::fs::copy(&from, &to)?;
-        }
-    }
-    Ok(())
-}
-
 /// Windows allows renaming a running executable's file (just not overwriting
 /// it in place), so: rename the current exe aside as `<name>.old.exe`
-/// (cleaned up on the next launch, see `main()`), write the new one in its
+/// (cleaned up on the next launch, see `main()`), write the new bytes in its
 /// place, launch it, and let the caller exit this process. On macOS/Linux the
 /// running binary's inode stays valid after its path is overwritten, so a
 /// plain overwrite + relaunch is enough — left as the fallback branch below;
 /// worth re-checking once this runs as a macOS .app bundle (a directory, not
 /// a single file) rather than a bare binary.
-fn swap_and_relaunch(current_exe: &Path, new_exe: &Path) -> std::io::Result<()> {
+fn swap_and_relaunch(current_exe: &Path, new_bytes: &[u8]) -> std::io::Result<()> {
     #[cfg(windows)]
     {
         let old = current_exe.with_extension("old.exe");
         let _ = std::fs::remove_file(&old);
         std::fs::rename(current_exe, &old)?;
-        std::fs::copy(new_exe, current_exe)?;
+        std::fs::write(current_exe, new_bytes)?;
     }
     #[cfg(not(windows))]
     {
-        std::fs::copy(new_exe, current_exe)?;
+        std::fs::write(current_exe, new_bytes)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -209,10 +194,6 @@ fn swap_and_relaunch(current_exe: &Path, new_exe: &Path) -> std::io::Result<()> 
 }
 
 fn main() {
-    let dir = app_dir();
-    let reuse = port_open();
-    let sidecar = Arc::new(Sidecar { child: Mutex::new(None), stop: Mutex::new(false) });
-
     // best-effort cleanup of a previous update's renamed-away executable: by
     // now nothing has it open any more
     if let Ok(exe) = std::env::current_exe() {
@@ -221,6 +202,10 @@ fn main() {
             let _ = std::fs::remove_file(&old);
         }
     }
+
+    let reuse = port_open();
+    let dir = if reuse { None } else { ensure_app_dir() };
+    let sidecar = Arc::new(Sidecar { child: Mutex::new(None), stop: Mutex::new(false) });
 
     if !reuse {
         match dir {
@@ -255,8 +240,9 @@ fn main() {
                 });
             }
             None => {
-                // no server.js found: the window will show the page's own error
-                eprintln!("WLED Fleet: server.js introuvable à côté de l'exécutable");
+                // extraction failed and no leftover server.js either: the window
+                // will show its own "can't connect" error
+                eprintln!("WLED Fleet: impossible de préparer le dossier de l'application");
             }
         }
     }

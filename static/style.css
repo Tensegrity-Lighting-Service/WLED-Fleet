@@ -4,9 +4,12 @@
     --chip:#21262d; --sel:rgba(88,166,255,.14); --diff:rgba(210,153,34,.16); --edit:rgba(88,166,255,.10);
   }
   @media (prefers-color-scheme: light){
-    :root{ --bg:#f5f7fa; --panel:#fff; --panel2:#f0f3f7; --line:#e2e8f0; --line2:#cbd3dd;
+    :root:not([data-theme="dark"]){ --bg:#f5f7fa; --panel:#fff; --panel2:#f0f3f7; --line:#e2e8f0; --line2:#cbd3dd;
       --txt:#1a2027; --muted:#5b6672; --chip:#eef1f5; --sel:rgba(9,105,218,.10); --diff:rgba(210,153,34,.22); --edit:rgba(9,105,218,.08);}
   }
+  /* explicit choice (⚙ Réglages ou le sélecteur clair/sombre/système) l'emporte sur le thème système */
+  :root[data-theme="light"]{ --bg:#f5f7fa; --panel:#fff; --panel2:#f0f3f7; --line:#e2e8f0; --line2:#cbd3dd;
+    --txt:#1a2027; --muted:#5b6672; --chip:#eef1f5; --sel:rgba(9,105,218,.10); --diff:rgba(210,153,34,.22); --edit:rgba(9,105,218,.08);}
   *{box-sizing:border-box}
   html,body{height:100%}
   body{margin:0;background:var(--bg);color:var(--txt);display:flex;flex-direction:column;
@@ -16,7 +19,21 @@
   .sub{color:var(--muted);font-size:12px}
   .dot{width:8px;height:8px;border-radius:50%;display:inline-block;margin-right:6px;vertical-align:middle;background:var(--muted)}
   .dot.ok{background:var(--accent)} .dot.bad{background:var(--bad)} .dot.warn{background:var(--warn)}
+  .dot.pulse{animation:dotpulse 1.1s ease-in-out infinite}
+  @keyframes dotpulse{0%,100%{opacity:1}50%{opacity:.35}}
+  /* jauge de signal façon téléphone (RSSI Wi-Fi), 0 à 4 barres, à côté de la pastille de présence */
+  .sigbars{display:inline-flex;align-items:flex-end;gap:1px;height:11px;margin:0 4px 0 1px;vertical-align:middle}
+  .sigbars i{display:block;width:3px;border-radius:1px;background:var(--line2)}
+  .sigbars i:nth-child(1){height:3px} .sigbars i:nth-child(2){height:6px} .sigbars i:nth-child(3){height:9px} .sigbars i:nth-child(4){height:12px}
+  .sigbars.q4 i{background:var(--accent)}
+  .sigbars.q3 i:nth-child(1),.sigbars.q3 i:nth-child(2),.sigbars.q3 i:nth-child(3){background:var(--accent)}
+  .sigbars.q2 i:nth-child(1),.sigbars.q2 i:nth-child(2){background:var(--warn)}
+  .sigbars.q1 i:nth-child(1){background:var(--bad)}
   .spacer{flex:1}
+  .themesw{display:inline-flex;align-items:center;background:var(--chip);border:1px solid var(--line2);border-radius:20px;padding:2px}
+  .themesw button{border:0;background:none;border-radius:16px;width:26px;height:22px;line-height:22px;padding:0;font-size:12px;color:var(--muted);cursor:pointer}
+  .themesw button:hover{color:var(--txt)}
+  .themesw button.active{background:var(--panel);color:var(--txt);box-shadow:0 1px 3px rgba(0,0,0,.25)}
   button,input[type=text],select{font:inherit;color:var(--txt);background:var(--panel2);border:1px solid var(--line2);border-radius:7px;padding:5px 10px}
   button{cursor:pointer} button:hover{border-color:var(--info)} button:disabled{opacity:.5;cursor:default}
   button.primary{background:var(--info);color:#fff;border-color:transparent}
@@ -35,9 +52,10 @@
   th{position:sticky;top:0;z-index:3;background:var(--panel);color:var(--muted);font-weight:600;font-size:11px;text-align:left}
   thead tr.cols th{position:sticky;overflow:visible}
   thead tr.cols th .lbl{display:block;overflow:hidden;text-overflow:ellipsis}
-  thead tr.cols th[draggable=true]{cursor:grab}
-  thead tr.cols th.dragging{opacity:.4}
-  thead tr.cols th.dragover{box-shadow:inset 3px 0 0 var(--info)}
+  thead tr.cols th.draggable{cursor:grab}
+  thead tr.cols th{transition:transform .16s ease}
+  thead tr.cols th.dragging{transition:none;position:relative;z-index:6;cursor:grabbing;background:var(--panel2);filter:drop-shadow(0 4px 10px rgba(0,0,0,.4))}
+  body.col-dragging,body.col-dragging *{cursor:grabbing!important;user-select:none}
   .rs{position:absolute;top:0;right:-3px;width:7px;height:100%;cursor:col-resize;z-index:5}
   .rs:hover{background:var(--info);opacity:.6}
   thead tr.groups th{top:0;height:22px;padding:2px 8px;text-transform:uppercase;letter-spacing:.05em;border-bottom:0;background:var(--panel2);text-align:center}
@@ -52,9 +70,10 @@
   th.pin3{z-index:4}
   td{background:var(--bg)}
   /* a light, stable tint per column group (index in GROUPS: Identité, Santé, Réseau, Antenne, LEDs, Live, Sync, État, Défauts, MAJ) */
-  :root{--gk-0:rgba(139,148,158,.07);--gk-1:rgba(63,185,80,.07);--gk-2:rgba(88,166,255,.08);--gk-3:rgba(57,197,207,.08);--gk-4:rgba(240,136,62,.08);--gk-5:rgba(219,97,162,.09);--gk-6:rgba(46,160,140,.08);--gk-7:rgba(227,179,65,.09);--gk-8:rgba(163,113,247,.09);--gk-9:rgba(248,81,73,.08)}
-  @media(prefers-color-scheme:light){:root:not([data-theme="dark"]){--gk-0:rgba(87,96,106,.08);--gk-1:rgba(31,136,61,.09);--gk-2:rgba(9,105,218,.09);--gk-3:rgba(9,146,166,.09);--gk-4:rgba(188,96,24,.1);--gk-5:rgba(191,57,137,.1);--gk-6:rgba(26,127,110,.09);--gk-7:rgba(154,103,0,.11);--gk-8:rgba(130,80,223,.1);--gk-9:rgba(207,34,46,.09)}}
-  td.gk-0{background:linear-gradient(var(--gk-0),var(--gk-0)),var(--bg)} thead tr.groups th.gk-0{background:linear-gradient(var(--gk-0),var(--gk-0)),var(--panel2)} thead tr.cols th.gk-0{background:linear-gradient(var(--gk-0),var(--gk-0)),var(--panel)} .chip.gk-0{box-shadow:inset 3px 0 0 rgba(139,148,158,.8)}
+  :root{--gk-0:rgba(99,102,241,.09);--gk-1:rgba(63,185,80,.07);--gk-2:rgba(88,166,255,.08);--gk-3:rgba(57,197,207,.08);--gk-4:rgba(240,136,62,.08);--gk-5:rgba(219,97,162,.09);--gk-6:rgba(46,160,140,.08);--gk-7:rgba(227,179,65,.09);--gk-8:rgba(163,113,247,.09);--gk-9:rgba(248,81,73,.08)}
+  @media(prefers-color-scheme:light){:root:not([data-theme="dark"]){--gk-0:rgba(79,70,229,.1);--gk-1:rgba(31,136,61,.09);--gk-2:rgba(9,105,218,.09);--gk-3:rgba(9,146,166,.09);--gk-4:rgba(188,96,24,.1);--gk-5:rgba(191,57,137,.1);--gk-6:rgba(26,127,110,.09);--gk-7:rgba(154,103,0,.11);--gk-8:rgba(130,80,223,.1);--gk-9:rgba(207,34,46,.09)}}
+  :root[data-theme="light"]{--gk-0:rgba(79,70,229,.1);--gk-1:rgba(31,136,61,.09);--gk-2:rgba(9,105,218,.09);--gk-3:rgba(9,146,166,.09);--gk-4:rgba(188,96,24,.1);--gk-5:rgba(191,57,137,.1);--gk-6:rgba(26,127,110,.09);--gk-7:rgba(154,103,0,.11);--gk-8:rgba(130,80,223,.1);--gk-9:rgba(207,34,46,.09)}
+  td.gk-0{background:linear-gradient(var(--gk-0),var(--gk-0)),var(--bg)} thead tr.groups th.gk-0{background:linear-gradient(var(--gk-0),var(--gk-0)),var(--panel2)} thead tr.cols th.gk-0{background:linear-gradient(var(--gk-0),var(--gk-0)),var(--panel)} .chip.gk-0{box-shadow:inset 3px 0 0 rgba(99,102,241,.8)}
   td.gk-1{background:linear-gradient(var(--gk-1),var(--gk-1)),var(--bg)} td.gk-2{background:linear-gradient(var(--gk-2),var(--gk-2)),var(--bg)} td.gk-3{background:linear-gradient(var(--gk-3),var(--gk-3)),var(--bg)} td.gk-4{background:linear-gradient(var(--gk-4),var(--gk-4)),var(--bg)} td.gk-5{background:linear-gradient(var(--gk-5),var(--gk-5)),var(--bg)} td.gk-6{background:linear-gradient(var(--gk-6),var(--gk-6)),var(--bg)} td.gk-7{background:linear-gradient(var(--gk-7),var(--gk-7)),var(--bg)} td.gk-8{background:linear-gradient(var(--gk-8),var(--gk-8)),var(--bg)} td.gk-9{background:linear-gradient(var(--gk-9),var(--gk-9)),var(--bg)}
   thead th.gk-1{box-shadow:inset 0 -3px 0 var(--gk-1)} thead tr.groups th.gk-1{background:linear-gradient(var(--gk-1),var(--gk-1)),var(--panel2)} thead tr.groups th.gk-2{background:linear-gradient(var(--gk-2),var(--gk-2)),var(--panel2)} thead tr.groups th.gk-3{background:linear-gradient(var(--gk-3),var(--gk-3)),var(--panel2)} thead tr.groups th.gk-4{background:linear-gradient(var(--gk-4),var(--gk-4)),var(--panel2)} thead tr.groups th.gk-5{background:linear-gradient(var(--gk-5),var(--gk-5)),var(--panel2)} thead tr.groups th.gk-6{background:linear-gradient(var(--gk-6),var(--gk-6)),var(--panel2)} thead tr.groups th.gk-7{background:linear-gradient(var(--gk-7),var(--gk-7)),var(--panel2)} thead tr.groups th.gk-8{background:linear-gradient(var(--gk-8),var(--gk-8)),var(--panel2)} thead tr.groups th.gk-9{background:linear-gradient(var(--gk-9),var(--gk-9)),var(--panel2)}
   thead tr.cols th.gk-1{background:linear-gradient(var(--gk-1),var(--gk-1)),var(--panel)} thead tr.cols th.gk-2{background:linear-gradient(var(--gk-2),var(--gk-2)),var(--panel)} thead tr.cols th.gk-3{background:linear-gradient(var(--gk-3),var(--gk-3)),var(--panel)} thead tr.cols th.gk-4{background:linear-gradient(var(--gk-4),var(--gk-4)),var(--panel)} thead tr.cols th.gk-5{background:linear-gradient(var(--gk-5),var(--gk-5)),var(--panel)} thead tr.cols th.gk-6{background:linear-gradient(var(--gk-6),var(--gk-6)),var(--panel)} thead tr.cols th.gk-7{background:linear-gradient(var(--gk-7),var(--gk-7)),var(--panel)} thead tr.cols th.gk-8{background:linear-gradient(var(--gk-8),var(--gk-8)),var(--panel)} thead tr.cols th.gk-9{background:linear-gradient(var(--gk-9),var(--gk-9)),var(--panel)}

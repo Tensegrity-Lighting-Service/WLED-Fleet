@@ -141,17 +141,25 @@ function profilesFromCfg(rec) {
   const out = []; for (let i = 0; i + 1 < m[1].length + 1; i += 2) { const t = m[1].slice(i, i + 2); if (!t) break; out.push(t === '..' ? null : t); }
   return out;
 }
+// Fleet-only fields (group, ignored outputs, output↔profile links) are written straight to
+// the node's MQTT config fields — no staging/Déployer for these. A node offline has nowhere
+// to write to: the intent is kept in rec.meta.offlineQueue (persisted in known-nodes.json)
+// and shown as if already applied (derive() below prefers it over the node's cached cfg);
+// POST /api/node/:ip/offline-queue/apply|discard resolves it once the node is seen again.
+function queueOffline(rec, field, value) { rec.meta.offlineQueue = { ...(rec.meta.offlineQueue || {}), [field]: value }; derive(rec); }
+function unqueueOffline(rec, field) { if (!rec.meta.offlineQueue) return; delete rec.meta.offlineQueue[field]; if (!Object.keys(rec.meta.offlineQueue).length) rec.meta.offlineQueue = null; }
 async function writeProfiles(rec, ids, source) {
   const c = clientId(rec); if (c === null) throw new Error('config du node non lue');
   const base = c.replace(/#p[0-9a-z.]*$/, '');
   let list = ids.map(x => (x && /^[0-9a-z]{2}$/.test(x) ? x : '..')); while (list.length && list[list.length - 1] === '..') list.pop();
   const next = list.length ? `${base}#p${list.join('')}` : base;
   if (next.length > 40) throw new Error('marqueur trop long pour le champ MQTT du node');
-  if (next === c) { rec.meta.outputProfiles = ids; return false; }
-  if (!rec.meta.online) throw new Error('node hors ligne : le profil est mémorisé sur le node (MQTT client id)');
+  if (next === c) { unqueueOffline(rec, 'outputProfiles'); rec.meta.outputProfiles = ids; return false; }
+  if (!rec.meta.online) { queueOffline(rec, 'outputProfiles', ids); return 'queued'; }
   await postJson(rec.meta.ip, '/json/cfg', { if: { mqtt: { cid: next } } }, 8000);
   rec.cfg.if.mqtt.cid = next; rec.meta.outputProfiles = ids;
   recordChange(rec, 'outputs-profiles', c, next, source);
+  unqueueOffline(rec, 'outputProfiles');
   return true;
 }
 async function writeIgnored(rec, starts, source) {
@@ -160,29 +168,52 @@ async function writeIgnored(rec, starts, source) {
   const idx = ins.map((b, i) => starts.includes(b.start) ? i + 1 : 0).filter(Boolean);
   const base = t.replace(/#u[0-9.]*$/, ''); const next = idx.length ? `${base}#u${idx.join('.')}` : base;
   if (next.length > 32) throw new Error('marqueur trop long pour le champ MQTT du node');
-  if (next === t) { rec.meta.ignoredOutputs = starts; return false; }
-  if (!rec.meta.online) throw new Error('node hors ligne : le marqueur est écrit sur le node (MQTT device topic)');
+  if (next === t) { unqueueOffline(rec, 'ignoredOutputs'); rec.meta.ignoredOutputs = starts; return false; }
+  if (!rec.meta.online) { queueOffline(rec, 'ignoredOutputs', starts); return 'queued'; }
   await postJson(rec.meta.ip, '/json/cfg', { if: { mqtt: { topics: { device: next } } } }, 8000);
   rec.cfg.if.mqtt.topics.device = next; rec.meta.ignoredOutputs = starts;
   recordChange(rec, 'outputs-unused', t, next, source);
+  unqueueOffline(rec, 'ignoredOutputs');
   return true;
 }
 // write the group on the node (cfg partial merge keeps broker / user / password untouched)
 async function writeGroup(rec, next, source) {
   const prev = rec.meta.group || '';
-  if (next === prev) return { changed: false };
-  if (!rec.meta.online) throw new Error('node hors ligne : le groupe est écrit sur le node (Group topic MQTT), réessayer quand il répond');
+  if (next === prev) { unqueueOffline(rec, 'group'); return { changed: false }; }
+  if (!rec.meta.online) { queueOffline(rec, 'group', next); return { changed: false, queued: true }; }
   await postJson(rec.meta.ip, '/json/cfg', { if: { mqtt: { topics: { group: next || NO_GROUP } } } }, 8000);
   rec.meta.group = next; if (rec.cfg && rec.cfg.if && rec.cfg.if.mqtt && rec.cfg.if.mqtt.topics) rec.cfg.if.mqtt.topics.group = next || NO_GROUP;
   recordChange(rec, 'group', prev, next, source);
   rec.meta.cfgUpdated = 0; // re-read the config soon
+  unqueueOffline(rec, 'group');
   return { changed: true };
 }
+// applies every field kept in rec.meta.offlineQueue now that the node answers again ;
+// partial failure keeps whatever didn't make it queued, for a retry
+async function applyOfflineQueue(rec) {
+  const q = rec.meta.offlineQueue; if (!q || !Object.keys(q).length) return { applied: [] };
+  if (!rec.meta.online) throw new Error('toujours hors ligne');
+  const applied = [];
+  try {
+    if (q.group !== undefined) { await writeGroup(rec, q.group, 'grille'); applied.push('groupe'); }
+    if (q.ignoredOutputs !== undefined) { await writeIgnored(rec, q.ignoredOutputs, 'grille'); applied.push('sorties non utilisées'); }
+    if (q.outputProfiles !== undefined) { await writeProfiles(rec, q.outputProfiles, 'grille'); applied.push('profils de sortie'); }
+  } finally { saveKnown(); }
+  return { applied };
+}
+// abandons the queued edits: the node's own current config wins back
+function discardOfflineQueue(rec) { rec.meta.offlineQueue = null; derive(rec); saveKnown(); }
 function derive(rec) {
   const { info, cfg } = rec;
   { const g = groupFromCfg(rec); if (g !== null) rec.meta.group = g; }
   { const ig = ignoredFromCfg(rec); if (ig !== null) rec.meta.ignoredOutputs = ig; }
   { const pr = profilesFromCfg(rec); if (pr !== null) rec.meta.outputProfiles = pr; }
+  // an offline-queued edit displays as if already applied, until resolved (apply/discard)
+  if (rec.meta.offlineQueue) {
+    if (rec.meta.offlineQueue.group !== undefined) rec.meta.group = rec.meta.offlineQueue.group;
+    if (rec.meta.offlineQueue.ignoredOutputs !== undefined) rec.meta.ignoredOutputs = rec.meta.offlineQueue.ignoredOutputs;
+    if (rec.meta.offlineQueue.outputProfiles !== undefined) rec.meta.outputProfiles = rec.meta.offlineQueue.outputProfiles;
+  }
   const d = {};
   if (info) {
     d.product = [info.brand, info.product].filter(Boolean).join(' ');
@@ -699,7 +730,7 @@ async function scan() {
 // known-nodes.json keeps, for every node, the LAST KNOWN info/state/cfg and
 // when it was last seen: a node that is off (or on another site) still shows
 // its whole row, greyed, with "vu il y a", instead of an empty line.
-const knownEntries = () => [...fleet.values()].map(r => ({ ip: r.meta.ip, lastSeen: r.meta.lastSeen, info: r.info, state: r.state, cfg: r.cfg, ignoredOutputs: r.meta.ignoredOutputs || [], group: r.meta.group || '' }));
+const knownEntries = () => [...fleet.values()].map(r => ({ ip: r.meta.ip, lastSeen: r.meta.lastSeen, info: r.info, state: r.state, cfg: r.cfg, ignoredOutputs: r.meta.ignoredOutputs || [], group: r.meta.group || '', offlineQueue: r.meta.offlineQueue || null }));
 let declaredGroups = []; // Fleet-only group names, kept even when no node is in them
 // LED profiles: what gets plugged on an output (type, colour order, pixels), reusable from the Sorties tab
 const PROFILES_FILE = path.join(__dirname, 'led-profiles.json');
@@ -730,9 +761,15 @@ function loadKnown() {
   for (const e of list) {
     if (!e || !e.ip) continue;
     const r = addNode(e.ip);
+    if (e.offlineQueue && typeof e.offlineQueue === 'object') r.meta.offlineQueue = e.offlineQueue; // edits made while this node was unreachable, not yet resolved
     if (e.info) { r.info = e.info; r.state = e.state || null; r.cfg = e.cfg || null; r.meta.lastSeen = e.lastSeen || null; r.meta.fails = 2; derive(r); }
     if (Array.isArray(e.ignoredOutputs)) r.meta.ignoredOutputs = e.ignoredOutputs; // Fleet-only: outputs not counted in the DMX plan
     if (typeof e.group === 'string' && e.group) r.meta.group = e.group; // Fleet-only: node group (zone, type…)
+    if (r.meta.offlineQueue) { // offlineQueue overrides the two legacy fallbacks above too
+      if (r.meta.offlineQueue.group !== undefined) r.meta.group = r.meta.offlineQueue.group;
+      if (r.meta.offlineQueue.ignoredOutputs !== undefined) r.meta.ignoredOutputs = r.meta.offlineQueue.ignoredOutputs;
+      if (r.meta.offlineQueue.outputProfiles !== undefined) r.meta.outputProfiles = r.meta.offlineQueue.outputProfiles;
+    }
   }
 }
 setInterval(saveKnown, 60000).unref();
@@ -1094,10 +1131,10 @@ const server = http.createServer(async (req, res) => {
       if (!rec) return send(res, 404, { error: 'node inconnu' });
       const b = await readBody(req);
       const next = String(b.group == null ? '' : b.group).trim().slice(0, 32);
-      try { await writeGroup(rec, next, 'grille'); } catch (e) { return send(res, rec.meta.online ? 502 : 409, { error: e.message }); }
+      let r; try { r = await writeGroup(rec, next, 'grille'); } catch (e) { return send(res, rec.meta.online ? 502 : 409, { error: e.message }); }
       if (next && !declaredGroups.includes(next)) declaredGroups.push(next);
       saveKnown();
-      return send(res, 200, { ok: true, group: next });
+      return send(res, 200, { ok: true, group: next, queued: !!(r && r.queued) });
     }
     if ((m = /^\/api\/node\/([^/]+)\/output-profile$/.exec(p)) && req.method === 'POST') {
       // remember which LED profile is plugged on output `index` (0-based) : written on the node (MQTT client id suffix)
@@ -1105,9 +1142,9 @@ const server = http.createServer(async (req, res) => {
       if (!rec) return send(res, 404, { error: 'node inconnu' });
       const b = await readBody(req); const idx = Number(b.index); if (!Number.isInteger(idx) || idx < 0 || idx > 15) return send(res, 400, { error: 'index de sortie invalide' });
       const ids = (rec.meta.outputProfiles || []).slice(); while (ids.length <= idx) ids.push(null); ids[idx] = b.id ? String(b.id) : null;
-      try { await writeProfiles(rec, ids, 'grille'); } catch (e) { return send(res, rec.meta.online ? 502 : 409, { error: e.message }); }
+      let r; try { r = await writeProfiles(rec, ids, 'grille'); } catch (e) { return send(res, rec.meta.online ? 502 : 409, { error: e.message }); }
       derive(rec); saveKnown();
-      return send(res, 200, { ok: true, profiles: rec.meta.outputProfiles });
+      return send(res, 200, { ok: true, profiles: rec.meta.outputProfiles, queued: r === 'queued' });
     }
     if ((m = /^\/api\/node\/([^/]+)\/outputs-ignore$/.exec(p)) && req.method === 'POST') {
       // Fleet-only flag: outputs (by start index) that exist in WLED but are not physically used;
@@ -1116,9 +1153,22 @@ const server = http.createServer(async (req, res) => {
       if (!rec) return send(res, 404, { error: 'node inconnu' });
       const b = await readBody(req);
       const starts = (Array.isArray(b.starts) ? b.starts : []).map(Number).filter(Number.isFinite);
-      try { await writeIgnored(rec, starts, 'grille'); } catch (e) { return send(res, rec.meta.online ? 502 : 409, { error: e.message }); }
+      let r; try { r = await writeIgnored(rec, starts, 'grille'); } catch (e) { return send(res, rec.meta.online ? 502 : 409, { error: e.message }); }
       derive(rec); saveKnown();
-      return send(res, 200, { ok: true, ignored: rec.meta.ignoredOutputs });
+      return send(res, 200, { ok: true, ignored: rec.meta.ignoredOutputs, queued: r === 'queued' });
+    }
+    if ((m = /^\/api\/node\/([^/]+)\/offline-queue\/apply$/.exec(p)) && req.method === 'POST') {
+      if (READONLY) return send(res, 403, { error: 'lecture seule' });
+      const ip = decodeURIComponent(m[1]); const rec = fleet.get(ip);
+      if (!rec) return send(res, 404, { error: 'node inconnu' });
+      try { return send(res, 200, { ok: true, ...(await applyOfflineQueue(rec)) }); }
+      catch (e) { return send(res, rec.meta.online ? 502 : 409, { error: e.message }); }
+    }
+    if ((m = /^\/api\/node\/([^/]+)\/offline-queue\/discard$/.exec(p)) && req.method === 'POST') {
+      const ip = decodeURIComponent(m[1]); const rec = fleet.get(ip);
+      if (!rec) return send(res, 404, { error: 'node inconnu' });
+      discardOfflineQueue(rec);
+      return send(res, 200, { ok: true, group: rec.meta.group, ignored: rec.meta.ignoredOutputs, profiles: rec.meta.outputProfiles });
     }
     if (p === '/api/dmx-plan' && req.method === 'GET') {
       // fleet-wide plan + universe conflicts between nodes

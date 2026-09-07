@@ -10,6 +10,11 @@ rust-version = "1.77.2"
 # sans console (CREATE_NO_WINDOW) et relancé sur le code 75 (bouton
 # « Redémarrer le serveur » de la page). Aucune IPC : la fenêtre charge
 # simplement http://127.0.0.1:8792/.
+#
+# Distribution en un seul .exe (2026-09) : build.rs copie server.js/static/…
+# dans embed/, et include_dir! (main.rs) les compile DANS le binaire. Au
+# premier lancement (ou après une mise à jour), l'exe les réextrait à côté de
+# lui — GitHub Releases n'a plus qu'un .exe à proposer, pas un zip.
 
 [build-dependencies]
 tauri-build = { version = "2.6.3", features = [] }
@@ -17,12 +22,17 @@ tauri-build = { version = "2.6.3", features = [] }
 [dependencies]
 tauri = { version = "2.11", features = [] }
 # Mise à jour portable (2026-09) : pas d'installeur (NSIS/MSI) — le plugin sert
-# seulement à vérifier/télécharger l'archive signée depuis les GitHub Releases ;
-# install_update (main.rs) l'extrait et remplace les fichiers sur place.
+# seulement à vérifier/télécharger le nouvel exe signé depuis les GitHub
+# Releases ; install_update (main.rs) le pose à la place de l'actuel (rename
+# tant qu'il tourne encore, comme pour node) et le relance. Le nouvel exe se
+# réextrait lui-même au démarrage suivant (voir ensure_app_dir).
 tauri-plugin-updater = "2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-zip = { version = "2", default-features = false, features = ["deflate"] }
+# Fichiers de l'app compilés dans le binaire (voir build.rs + embed/) — la
+# seule "vraie" dépendance ajoutée par ce chantier, purement côté coquille
+# Rust : server.js et le reste de l'app restent zéro dépendance npm.
+include_dir = "0.7"
 
 [profile.release]
 opt-level = "s"

@@ -39,15 +39,18 @@ d'abord l'API WLED et le modèle de données.
   l'enlever). Sans `-Autostart`, le script ne fait que le raccourci du Bureau.
 - Seul prérequis : Node.js 18+ (aucune dépendance npm, rien à installer
   d'autre). Tout le code reste en fichiers clairs dans ce dossier.
-- **Mise à jour** : pas d'installateur, `WLED-Fleet.exe` reste un dossier
-  portable (l'exe à côté de `server.js`, `settings.json`, `known-nodes.json`,
-  `snapshots/`, `firmware/`…). Au démarrage, l'app vérifie discrètement s'il y a
-  une nouvelle version (dépôt public
-  [WLED-Fleet](https://github.com/Tensegrity-Lighting-Service/WLED-Fleet)) et
-  propose de l'installer : les fichiers de code sont remplacés sur place,
-  jamais tes réglages / la flotte connue / les sauvegardes / le dépôt de
-  firmwares. Rien de silencieux ni de forcé : un clic pour installer, un clic
-  pour ignorer.
+- **Téléchargement** : la [release GitHub](https://github.com/Tensegrity-Lighting-Service/WLED-Fleet/releases)
+  n'a qu'un seul fichier, `WLED-Fleet.exe` — pas de zip, pas d'installateur.
+  Au premier lancement (ou après une mise à jour), il s'extrait lui-même à
+  côté de lui (`server.js`, `columns.js`, `static/`…, l'app y est compilée)
+  et devient alors le même dossier portable qu'avant : l'exe à côté de
+  `settings.json`, `known-nodes.json`, `snapshots/`, `firmware/`… Le dossier
+  entier reste déplaçable à volonté ; rien n'est écrit ailleurs sur le PC.
+- **Mise à jour** : au démarrage, l'app vérifie discrètement s'il y a une
+  nouvelle version et propose de l'installer : le nouvel exe remplace
+  l'actuel (redémarrage automatique), puis se réextrait lui-même — jamais tes
+  réglages / la flotte connue / les sauvegardes / le dépôt de firmwares. Rien
+  de silencieux ni de forcé : un clic pour installer, un clic pour ignorer.
 
 ## Réseau : changement de carte, perte de connexion, nodes égarés
 
@@ -718,9 +721,10 @@ Pas de release automatique en CI — un script local, comme Lumitrack
 
 ```sh
 cd desktop
-./build-release.cmd   # compile, synchronise le dépôt public, zippe, signe, écrit latest.json
-gh release create v<version> ../release/WLED-Fleet_<version>_windows.zip \
-  ../release/WLED-Fleet_<version>_windows.zip.sig ../release/latest.json \
+./build-release.cmd   # compile (l'app est embarquée dedans), signe, écrit latest.json
+node ../tools/publish-to-github.js   # code source, pour la transparence (pas requis pour l'exe)
+gh release create v<version> ../release/WLED-Fleet_<version>_windows.exe \
+  ../release/WLED-Fleet_<version>_windows.exe.sig ../release/latest.json \
   --repo Tensegrity-Lighting-Service/WLED-Fleet --title "WLED Fleet <version>"
 ```
 
@@ -730,10 +734,19 @@ updater : `cargo tauri signer generate -w %USERPROFILE%\.tauri\wled-fleet-update
 deux fichiers vivent hors de tout dépôt** : les perdre = plus aucune app
 installée ne pourra se mettre à jour automatiquement).
 
-Le paquet publié est un `.zip` du dossier applicatif (pas un `.exe`
-d'installation) — voir `desktop/src/main.rs` (`install_update`) : le plugin
-`tauri-plugin-updater` vérifie la signature au téléchargement, puis l'app
-extrait l'archive et remplace ses propres fichiers de code sur place.
+Le paquet publié est directement le `.exe` (pas de zip, pas d'installateur) —
+`desktop/build.rs` compile `server.js`/`static/`/… dedans (`include_dir!`
+dans `main.rs`) ; au lancement, `ensure_app_dir()` les réextrait à côté de
+l'exe si absents ou si la version embarquée a changé. Pour éditer le code
+sans reconstruire à chaque fois pendant le développement : variable
+d'environnement `WLED_FLEET_DIR=<chemin du dépôt>`, qui fait pointer l'exe
+sur les fichiers réels au lieu de sa copie embarquée (`WLED-Fleet.cmd`,
+mode console, n'est de toute façon jamais concerné : il lance toujours les
+fichiers du dossier tel quel). `install_update` (main.rs) : le plugin
+`tauri-plugin-updater` vérifie la signature de l'exe téléchargé, puis
+l'écriture se fait par le même tour de passe-passe que node (renommer
+l'actuel en `.old.exe`, écrire le nouveau, le relancer) — le nouvel exe se
+réextrait tout seul à son premier démarrage.
 
 ## macOS (préparation, à finir depuis un Mac)
 
@@ -742,17 +755,23 @@ bundler, pas d'installateur ici non plus) : `node` doit être sur le PATH,
 avec un repli déjà en place (`/opt/homebrew/bin/node`, `/usr/local/bin/node`,
 `desktop/src/main.rs`) pour les apps GUI lancées depuis le Finder, qui
 n'héritent pas du PATH du shell. `icons/icon.icns` est déjà généré (`cargo
-tauri icon` fonctionne depuis Windows). Reste à faire sur le Mac :
+tauri icon` fonctionne depuis Windows). `build.rs` (embarque l'app dans
+l'exe) est déjà cross-platform, testé uniquement sous Windows. Reste à faire
+sur le Mac :
 
-- `cargo build --release` dans `desktop/`, copier l'exe (`wled-fleet-desktop`)
-  à côté de `server.js` sous un nom stable, comme sous Windows.
-- Adapter `desktop/build-release.cmd` en équivalent shell (zip via `ditto -c -k
-  --sequesterRsrc --keepParent` ou `zip -r`, signature via `cargo tauri signer
-  sign`, `tools/make-latest-json.js` détecte déjà `darwin-x86_64`/
-  `darwin-aarch64` selon `process.arch` et **fusionne** avec le `latest.json`
-  déjà publié pour ne pas perdre l'entrée `windows-x86_64`).
+- Un exe brut Unix ne se double-clique pas proprement depuis le Finder : il
+  faudra probablement un vrai `.app` (`bundle.active: true`, `targets:
+  ["app"]`) plutôt que la distribution single-file de Windows — d'où
+  `tools/make-latest-json.js` qui garde `.app.zip` pour macOS (le `.app` est
+  un dossier, pas un fichier). Le zip existant (`ditto -c -k
+  --sequesterRsrc --keepParent` ou `zip -r`) redevient donc pertinent là,
+  seulement là.
+- `cargo tauri signer sign` sur l'archive .app.zip, comme sous Windows.
+  `tools/make-latest-json.js` détecte déjà `darwin-x86_64`/`darwin-aarch64`
+  selon `process.arch` et **fusionne** avec le `latest.json` déjà publié pour
+  ne pas perdre l'entrée `windows-x86_64`.
 - Non signé/notarié : premier lancement → clic droit → Ouvrir, ou
-  `xattr -dr com.apple.quarantine WLED-Fleet` (même avertissement que
+  `xattr -dr com.apple.quarantine WLED-Fleet.app` (même avertissement que
   Lumitrack, voir son `packaging/README.md`).
 - CI déjà en place sur le dépôt public (`.github/workflows/ci.yml`, job
   `rust-macos`) : compile déjà sous macOS avant que tu t'y mettes.
