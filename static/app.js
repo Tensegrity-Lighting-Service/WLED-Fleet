@@ -1011,6 +1011,16 @@
 
   // ── DMX plan: universe.address of every output, content of every universe ──
   let dmxOpen = false;
+  // « localiser » : allume juste le dernier pixel d'une sortie (blanc, le reste
+  // en bleu léger) sur le vrai node, pour compter en direct en ajustant Pixels.
+  // Une seule sortie à la fois ; le serveur restaure tout seul après 90 s
+  // d'inactivité si on part sans cliquer Arrêter.
+  let locating = null; // { ip, index }
+  async function stopLocating() {
+    if (!locating) return;
+    const ip = locating.ip; locating = null;
+    try { await api(`/api/node/${encodeURIComponent(ip)}/locate-pixel`, { method: 'DELETE' }); } catch { /* déjà éteint, ou node parti */ }
+  }
   async function renderDmx() {
     const p = $('#dmxpanel');
     let d; try { [d] = await Promise.all([api('/api/dmx-plan'), loadLedProfiles()]); } catch (e) { p.innerHTML = `<div class="st-bad">${esc(e.message)}</div>`; return; }
@@ -1058,7 +1068,7 @@
         <td>${sel('type', LED_TYPES, r.type)}</td>
         <td>${sel('order', COLOR_ORDERS, (r.order || 0) & 0x0f)}</td>
         <td><input type="number" data-out="start" data-orig="${o.start}" value="${o.start}" min="0" title="index du premier pixel de cette sortie dans le node"></td>
-        <td><span style="display:inline-flex;align-items:center;gap:4px"><input type="number" data-out="len" data-orig="${o.len}" value="${o.len}" min="1" title="nombre de pixels sur ce câble"><button class="rowbtn" data-calc="1" title="calculer : LEDs par mètre × longueur">📏</button></span></td>
+        <td><span style="display:inline-flex;align-items:center;gap:4px"><input type="number" data-out="len" data-orig="${o.len}" value="${o.len}" min="1" title="nombre de pixels sur ce câble"><button class="rowbtn" data-calc="1" title="calculer : LEDs par mètre × longueur">📏</button><button class="rowbtn${locating && locating.ip === n.ip && locating.index === i ? ' primary' : ''}" data-locate="1" title="allumer le dernier pixel de cette sortie en blanc (le reste en bleu léger) sur le vrai node, pour compter en changeant Pixels et en regardant où ça s'arrête sur le ruban">📍</button></span></td>
         <td><label class="chip"><input type="checkbox" data-out="rev" data-orig="${r.rev ? 1 : 0}" ${r.rev ? 'checked' : ''}> inversée</label></td>
         <td class="oc-addr"><span class="addr"><b>${esc(o.from || '')}</b> → <b>${esc(o.to || '')}</b></span> <span class="straddle">${uniTxt}</span></td></tr>`;
     };
@@ -1124,7 +1134,7 @@
       p.querySelectorAll('.gcf').forEach(el => { const gc = gCards[Number(el.dataset.gi)]; el.hidden = !gc.nodes.some(n => bad.has(n.name || n.ip)); });
     };
     const refreshDirty = () => { const n = changedNodes().length; const b = $('#dmxSave'); if (b) { b.disabled = !n; b.textContent = n ? `Enregistrer les modifications (${n} node${n > 1 ? 's' : ''})` : 'Enregistrer les modifications'; } };
-    p.querySelectorAll('[data-out],[data-nb]').forEach(el => { el.oninput = el.onchange = () => { const tr = el.closest('tr'); if (tr && tr.dataset.node) recompute(tr.dataset.node); refreshDirty(); renderConflicts(); }; });
+    p.querySelectorAll('[data-out],[data-nb]').forEach(el => { el.oninput = el.onchange = () => { const tr = el.closest('tr'); if (tr && tr.dataset.node) recompute(tr.dataset.node); refreshDirty(); renderConflicts(); if (tr && (el.dataset.out === 'start' || el.dataset.out === 'len')) sendLocateUpdate(tr); }; });
     // "comptée" checkboxes: Fleet-only, saved at once, conflicts recomputed
     p.querySelectorAll('input[data-ignore]').forEach(cb => cb.onchange = async () => {
       const ip = cb.closest('tr').dataset.node;
@@ -1139,6 +1149,32 @@
       const rgbw = rgbwTypes.includes(Number(tr.querySelector('[data-out=type]').value)); const per = rgbw ? 128 : 170;
       const px = await calcBox(b, per, rgbw); if (px == null) return;
       const len = tr.querySelector('[data-out=len]'); len.value = px; len.dispatchEvent(new Event('input'));
+    });
+    // 📍 localiser : allume le dernier pixel de la sortie (blanc, reste en bleu léger) sur
+    // le vrai node ; ajuster Pixels (ci-dessous) déplace le repère en direct, un 2e clic arrête
+    let locateTimer = null;
+    const sendLocateUpdate = tr => {
+      if (!locating || locating.ip !== tr.dataset.node || locating.index !== Number(tr.dataset.outrow)) return;
+      const start = Number(tr.querySelector('[data-out=start]').value), len = Number(tr.querySelector('[data-out=len]').value);
+      if (!(len > 0) || !(start >= 0)) return;
+      clearTimeout(locateTimer);
+      locateTimer = setTimeout(() => { post(`/api/node/${encodeURIComponent(locating.ip)}/locate-pixel`, { start, len }).catch(e => toast(e.message, true)); }, 150);
+    };
+    p.querySelectorAll('button[data-locate]').forEach(b => b.onclick = async () => {
+      const tr = b.closest('tr'); const ip = tr.dataset.node, index = Number(tr.dataset.outrow);
+      const wasThis = locating && locating.ip === ip && locating.index === index;
+      if (locating) {
+        const prevBtn = p.querySelector(`tr[data-node="${CSS.escape(locating.ip)}"][data-outrow="${locating.index}"] button[data-locate]`);
+        if (prevBtn) prevBtn.classList.remove('primary');
+        await stopLocating();
+      }
+      if (wasThis) return;
+      const start = Number(tr.querySelector('[data-out=start]').value), len = Number(tr.querySelector('[data-out=len]').value);
+      if (!(len > 0) || !(start >= 0)) { toast('départ / pixels invalides', true); return; }
+      locating = { ip, index };
+      b.classList.add('primary');
+      try { await post(`/api/node/${encodeURIComponent(ip)}/locate-pixel`, { start, len }); toast('sortie repérée : dernier pixel en blanc sur le node — ajuster Pixels pour le déplacer, 📍 pour arrêter'); }
+      catch (e) { toast(e.message, true); locating = null; b.classList.remove('primary'); }
     });
     // ⚡ autopatch: every output starts on a fresh universe ; nodes of a group chain on consecutive universes
     p.querySelectorAll('button[data-autopatch]').forEach(b => b.onclick = () => {
@@ -1199,6 +1235,7 @@
     // the one Save button: outputs block per changed node (backup first), then the node's DMX settings through pending + deploy
     const sb = $('#dmxSave'); if (sb) sb.onclick = async () => {
       const ips = changedNodes(); if (!ips.length) return;
+      await stopLocating();
       const plan = [];
       for (const ip of ips) {
         const n = d.nodes.find(x => x.ip === ip); const rows = rowsOf(ip);
@@ -2114,6 +2151,7 @@
   let currentTab = 'grid';
   function showTab(name) {
     if (!TABS[name]) name = 'grid';
+    if (currentTab === 'dmx' && name !== 'dmx') stopLocating();
     currentTab = name;
     journalOpen = apOpen = fwOpen = pairOpen = snapOpen = setOpen = dmxOpen = optOpen = false;
     for (const [k, t] of Object.entries(TABS)) { $(t.pane).classList.toggle('open', k === name); $(t.btn).classList.toggle('active', k === name); }

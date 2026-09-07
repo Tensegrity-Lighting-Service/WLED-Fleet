@@ -495,6 +495,61 @@ async function identifyNode(ip, ms = 3000) {
   } catch (e) { identifying.delete(ip); throw e; }
 }
 
+// ── Locate pixel: light only the last pixel of an output, rest of it light blue ──
+// For counting a strip's real pixels: commandeers segment 0 for the output's
+// exact start/len, live-override so it shows over any E1.31/DDP stream. Two
+// plain solid-colour segments (0 = light blue, 1 = the single last pixel in
+// white) — WLED's per-LED "i" override looked right on paper but a real
+// round-trip against the emulator showed it has no visible effect (accepted,
+// no error, pixel buffer unchanged), while two segments render exactly as
+// intended (checked pixel-by-pixel via GET /json/live). One call starts
+// (saves segment 0, and segment 1 if the node already had one), later calls
+// with a new `len` just move the marker. A call with no follow-up for
+// LOCATE_TIMEOUT_MS auto-restores, so leaving the tab never strands a node
+// lit up. Nothing is written to flash.
+const locating = new Map(); // ip -> { saved, seg0, seg1, seg1Existed, touchedSeg1, timer }
+const LOCATE_TIMEOUT_MS = 90000;
+async function setLocatePixel(ip, start, len) {
+  len = Math.max(1, Math.min(4096, Math.round(len)));
+  start = Math.max(0, Math.round(start));
+  let session = locating.get(ip);
+  if (!session) {
+    const saved = (await getJson(ip, '/json/state', 3000)).json;
+    const seg0 = (saved.seg || []).find(s => s.id === 0) || (saved.seg || [])[0];
+    if (!seg0) throw new Error('aucun segment sur ce node');
+    const seg1 = (saved.seg || []).find(s => s.id === 1) || null;
+    session = { saved, seg0, seg1, seg1Existed: !!seg1, touchedSeg1: false };
+    locating.set(ip, session);
+  }
+  clearTimeout(session.timer);
+  const last = start + len - 1;
+  const segs = [];
+  if (len > 1) {
+    segs.push({ id: session.seg0.id, start, stop: last, on: true, bri: 255, col: [[48, 96, 255], [0, 0, 0], [0, 0, 0]], fx: 0, sx: 0, frz: false });
+    segs.push({ id: 1, start: last, stop: last + 1, on: true, bri: 255, col: [[255, 255, 255], [0, 0, 0], [0, 0, 0]], fx: 0, sx: 0, frz: false });
+    session.touchedSeg1 = true;
+  } else {
+    segs.push({ id: session.seg0.id, start, stop: last + 1, on: true, bri: 255, col: [[255, 255, 255], [0, 0, 0], [0, 0, 0]], fx: 0, sx: 0, frz: false });
+  }
+  await postJson(ip, '/json/state', { on: true, bri: 255, tt: 0, lor: 1, seg: segs }, 3000);
+  session.timer = setTimeout(() => { stopLocatePixel(ip).catch(() => {}); }, LOCATE_TIMEOUT_MS);
+  return { ok: true };
+}
+async function stopLocatePixel(ip) {
+  const session = locating.get(ip); if (!session) return { ok: true, already: false };
+  clearTimeout(session.timer);
+  locating.delete(ip);
+  const { saved, seg0, seg1, seg1Existed, touchedSeg1 } = session;
+  const back = { ...saved, tt: 0, lor: saved.lor || 0 };
+  delete back.nl; delete back.udpn; delete back.ledmap; delete back.mainseg;
+  const strip = s => { const c = { ...s }; delete c.len; delete c.n; delete c.set; return c; };
+  const segs = [strip(seg0)];
+  if (touchedSeg1) segs.push(seg1Existed ? strip(seg1) : { id: 1, stop: 0 }); // stop:0 removes a segment we created
+  back.seg = segs;
+  await postJson(ip, '/json/state', back, 3000);
+  return { ok: true };
+}
+
 // ── Free, logical IP for a new node ──────────────────────────────────────────
 // Follows the IP block of the most similar existing nodes (by name), skips
 // fleet IPs, the gateway, IPs in `taken` (other candidates of the same
@@ -957,6 +1012,16 @@ const server = http.createServer(async (req, res) => {
       const b = await readBody(req);
       try { return send(res, 200, await identifyNode(decodeURIComponent(m[1]), Math.min(15000, Math.max(500, Number(b.ms) || 3000)))); }
       catch (e) { return send(res, 502, { error: e.message }); }
+    }
+    if ((m = /^\/api\/node\/([^/]+)\/locate-pixel$/.exec(p)) && req.method === 'POST') {
+      const ip = decodeURIComponent(m[1]);
+      const b = await readBody(req);
+      const start = Number(b.start), len = Number(b.len);
+      if (!Number.isFinite(start) || !Number.isFinite(len) || len < 1) return send(res, 400, { error: 'sortie invalide' });
+      try { return send(res, 200, await setLocatePixel(ip, start, len)); } catch (e) { return send(res, 502, { error: e.message }); }
+    }
+    if ((m = /^\/api\/node\/([^/]+)\/locate-pixel$/.exec(p)) && req.method === 'DELETE') {
+      try { return send(res, 200, await stopLocatePixel(decodeURIComponent(m[1]))); } catch (e) { return send(res, 502, { error: e.message }); }
     }
     if (p === '/api/nodes/relocate' && req.method === 'POST') {
       // several IP changes at once (swaps / rotations allowed): write all, reboot all
