@@ -1066,19 +1066,22 @@
         <td class="${unknown ? 'newprof' : ''}"><select data-prof title="${unknown ? 'profil inconnu de la bibliothèque locale : ce type/ordre/pixels ne correspond à aucun profil enregistré ici → ＋ enregistrer cette ligne comme profil pour le retrouver la prochaine fois.' : 'profil de LED : ce qui est branché sur cette sortie ; choisir un profil remplit type, ordre et pixels, et le node s\'en souvient (MQTT client id). Sans choix, Fleet reconnaît un profil quand la ligne y correspond exactement.'}">${profileOptions(pid)}</select></td>
         <td class="muted" title="GPIO de la sortie">${esc(o.pin)}</td>
         <td>${sel('type', LED_TYPES, r.type)}</td>
+        <td><input type="number" data-out="ledma" data-orig="${r.ledma ?? 55}" value="${r.ledma ?? 55}" min="0" style="width:60px" title="mA par LED (Auto Brightness Limiter) : consommation max estimée d'une LED de ce câble, pleine luminosité blanc plein. 55 = valeur WLED par défaut (WS2812 générique) ; mettre la valeur du fabricant si connue."></td>
         <td>${sel('order', COLOR_ORDERS, (r.order || 0) & 0x0f)}</td>
         <td><input type="number" data-out="start" data-orig="${o.start}" value="${o.start}" min="0" title="index du premier pixel de cette sortie dans le node"></td>
         <td><span style="display:inline-flex;align-items:center;gap:4px"><input type="number" data-out="len" data-orig="${o.len}" value="${o.len}" min="1" title="nombre de pixels sur ce câble"><button class="rowbtn" data-calc="1" title="calculer : LEDs par mètre × longueur">📏</button><button class="rowbtn${locating && locating.ip === n.ip && locating.index === i ? ' primary' : ''}" data-locate="1" title="allumer le dernier pixel de cette sortie en blanc (le reste en bleu léger) sur le vrai node, pour compter en changeant Pixels et en regardant où ça s'arrête sur le ruban">📍</button></span></td>
         <td><label class="chip"><input type="checkbox" data-out="rev" data-orig="${r.rev ? 1 : 0}" ${r.rev ? 'checked' : ''}> inversée</label></td>
+        <td><input type="number" data-out="skip" data-orig="${r.skip || 0}" value="${r.skip || 0}" min="0" style="width:55px" title="Skip first LEDs : nombre de LEDs en tête de câble à ignorer (câblées mais non pilotées, ex. avant un connecteur)"></td>
+        <td><label class="chip"><input type="checkbox" data-out="ref" data-orig="${r.ref ? 1 : 0}" ${r.ref ? 'checked' : ''} title="Off Refresh : force un rafraîchissement du signal même à l'extinction (certaines LEDs/récepteurs en ont besoin pour ne pas clignoter ou perdre leur dernière couleur)"> off refresh</label></td>
         <td class="oc-addr"><span class="addr"><b>${esc(o.from || '')}</b> → <b>${esc(o.to || '')}</b></span> <span class="straddle">${uniTxt}</span></td></tr>`;
     };
     const groupTable = gc => {
-      const head = `<thead><tr><th>Node</th><th>Sortie</th><th title="profil de LED : type + ordre + pixels mémorisés sous un nom">Profil</th><th>Pin</th><th>Type</th><th>Ordre</th><th title="index du premier pixel dans le node (0 = premier)">Départ</th><th title="pixels sur ce câble ; 📏 = calculateur">Pixels</th><th></th><th title="univers.canal du premier et du dernier pixel : ce qu'il faut patcher à la console (recalculé en direct)">Adresse console (de → à)</th></tr></thead>`;
+      const head = `<thead><tr><th>Node</th><th>Sortie</th><th title="profil de LED : type + ordre + pixels mémorisés sous un nom">Profil</th><th>Pin</th><th>Type</th><th title="Auto Brightness Limiter : mA par LED à pleine luminosité, pour estimer/limiter la consommation">mA/LED</th><th>Ordre</th><th title="index du premier pixel dans le node (0 = premier)">Départ</th><th title="pixels sur ce câble ; 📏 = calculateur">Pixels</th><th></th><th>Skip</th><th>Off Refresh</th><th title="univers.canal du premier et du dernier pixel : ce qu'il faut patcher à la console (recalculé en direct)">Adresse console (de → à)</th></tr></thead>`;
       const body = gc.nodes.map(n => {
         const pl = n.plan; const rec = nodeRec(n.ip); const rawIns = (rec && rec.cfg && rec.cfg.hw && rec.cfg.hw.led && rec.cfg.hw.led.ins) || [];
-        if (!pl.multi) return `<tr data-node="${esc(n.ip)}">${nodeCell(n, 1)}<td colspan="9" class="muted">mode ${esc(modeName(pl.mode))} : ${esc(pl.note)}</td></tr>`;
+        if (!pl.multi) return `<tr data-node="${esc(n.ip)}">${nodeCell(n, 1)}<td colspan="12" class="muted">mode ${esc(modeName(pl.mode))} : ${esc(pl.note)}</td></tr>`;
         const outs = pl.outputs; const span = Math.max(1, outs.length);
-        if (!outs.length) return `<tr data-node="${esc(n.ip)}">${nodeCell(n, 1)}<td colspan="9" class="muted">aucune sortie déclarée</td></tr>`;
+        if (!outs.length) return `<tr data-node="${esc(n.ip)}">${nodeCell(n, 1)}<td colspan="12" class="muted">aucune sortie déclarée</td></tr>`;
         return outs.map((o, i) => outRow(n, o, rawIns[i] || {}, i, i === 0, span)).join('');
       }).join('');
       const ns = gc.nodes.filter(n => n.plan.multi);
@@ -1244,7 +1247,7 @@
       for (const ip of ips) {
         const n = d.nodes.find(x => x.ip === ip); const rows = rowsOf(ip);
         const outsChanged = rows.some(tr => [...tr.querySelectorAll('[data-out][data-orig]')].some(el => (el.type === 'checkbox' ? (el.checked ? '1' : '0') : String(el.value)) !== String(el.dataset.orig)));
-        const ins = outsChanged ? rows.map(tr => { const pl = n.plan; const o = pl.outputs[Number(tr.dataset.outrow)]; return { pin: o.pin, type: Number(tr.querySelector('[data-out=type]').value), order: Number(tr.querySelector('[data-out=order]').value), start: Number(tr.querySelector('[data-out=start]').value), len: Number(tr.querySelector('[data-out=len]').value), rev: tr.querySelector('[data-out=rev]').checked }; }) : null;
+        const ins = outsChanged ? rows.map(tr => { const pl = n.plan; const o = pl.outputs[Number(tr.dataset.outrow)]; return { pin: o.pin, type: Number(tr.querySelector('[data-out=type]').value), order: Number(tr.querySelector('[data-out=order]').value), start: Number(tr.querySelector('[data-out=start]').value), len: Number(tr.querySelector('[data-out=len]').value), rev: tr.querySelector('[data-out=rev]').checked, skip: Number(tr.querySelector('[data-out=skip]').value) || 0, ledma: Number(tr.querySelector('[data-out=ledma]').value), ref: tr.querySelector('[data-out=ref]').checked }; }) : null;
         const cell = p.querySelector(`[data-nodecell="${CSS.escape(ip)}"]`); const settings = [];
         for (const [id, col] of [['dmxmode', colDmx.mode], ['dmxuni', colDmx.uni], ['dmxaddr', colDmx.addr], ['maxpwr', colDmx.mA]]) { const el = cell && cell.querySelector(`[data-nb="${id}"]`); if (el && el.value !== '' && String(el.value) !== String(el.dataset.orig)) settings.push({ col, value: normalize(col, el.value) }); }
         plan.push({ ip, name: n.name || ip, ins, settings });
@@ -1594,9 +1597,19 @@
       </div>
       <div class="muted" style="margin-top:6px">Rien n'est écrit sur le routeur : lecture seule des radios et des clients.</div>`;
     };
+    // which local NIC the PC uses to reach the antenna (REST + MNDP) : le PC peut
+    // avoir plusieurs cartes (ex. partage de connexion iPhone) et Windows peut en
+    // choisir une autre que celle reliée au kit — on peut forcer la bonne ici.
+    const netIf = (fleet.net && fleet.net.ifaces) || [];
+    const bindHtml = netIf.length ? `<div class="aprow" style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:6px 0">
+        <b>Carte réseau vers l'antenne</b>
+        <button class="rowbtn${d.bindAddress ? '' : ' primary'}" data-bind="" title="laisser Windows choisir (par défaut)">auto</button>
+        ${netIf.map(i => `<button class="rowbtn${d.bindAddress === i.address ? ' primary' : ''}" data-bind="${esc(i.address)}" title="${esc(i.iface)}">${esc(i.iface)} · ${esc(i.address)}</button>`).join('')}
+      </div>
+      <div class="hint" style="margin-bottom:6px">si l'app se connecte au mauvais réseau (ex. partage de connexion d'un téléphone) au lieu de la carte reliée au kit, fixer la carte ici force les requêtes vers l'antenne (et sa découverte) sur elle.</div>` : '';
     const wizBar = `<div class="aprow" style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:6px 0 10px">${wizardButton()}</div>`;
-    if (!d.configured) { const k = keepDetails(p); p.innerHTML = `${disc}${form('Identifiants de l\'antenne')}${wizBar}${renderWizard()}${wizardExtras()}`; k.restore(); wireApForm(); wireApRows(); wireWizard(); return; }
-    if (!d.ok) { const k = keepDetails(p); p.innerHTML = `${disc}${form(`Antenne ${esc(d.host)}`, `Erreur : ${d.error}`)}${wizBar}${renderWizard()}${wizardExtras()}`; k.restore(); wireApForm(); wireApRows(); wireWizard(); return; }
+    if (!d.configured) { const k = keepDetails(p); p.innerHTML = `${bindHtml}${disc}${form('Identifiants de l\'antenne')}${wizBar}${renderWizard()}${wizardExtras()}`; k.restore(); wireApForm(); wireApRows(); wireApBind(); wireWizard(); return; }
+    if (!d.ok) { const k = keepDetails(p); p.innerHTML = `${bindHtml}${disc}${form(`Antenne ${esc(d.host)}`, `Erreur : ${d.error}`)}${wizBar}${renderWizard()}${wizardExtras()}`; k.restore(); wireApForm(); wireApRows(); wireApBind(); wireWizard(); return; }
     const s = d.system || {};
     const tiles = `<div class="tiles">
       <div class="tile" title="modèle de carte MikroTik"><div class="k">Antenne</div><div class="v">${esc(s.board || '')}</div></div>
@@ -1631,10 +1644,10 @@
     const nNodes = d.clients.filter(c => c.isNode).length;
     const head = `<h2>Antenne ${esc(d.host)} <span class="muted" style="text-transform:none;letter-spacing:0">${esc(s.board || '')} · RouterOS ${esc((s.version || '').split(' ')[0])}${radio2g && radio2g.band ? ` · ${esc(radio2g.band)}` : ''} · ${d.clients.length} client${d.clients.length > 1 ? 's' : ''} Wi‑Fi dont ${nNodes} node${nNodes > 1 ? 's' : ''} · relevé ${new Date(d.updatedAt).toLocaleTimeString()}</span></h2>`;
     const more = `<details class="subbox" data-key="apradios"><summary style="cursor:pointer"><b>Radios et clients</b> <span class="muted">— ${d.radios.length} radio${d.radios.length > 1 ? 's' : ''}, ${d.clients.length} client${d.clients.length > 1 ? 's' : ''}</span></summary>${radios}${clients}</details>
-      <details class="subbox" data-key="apsys"><summary style="cursor:pointer"><b>Routeur, antennes et identifiants</b></summary>${tiles}${disc}${form('Ajouter une antenne')}</details>`;
+      <details class="subbox" data-key="apsys"><summary style="cursor:pointer"><b>Routeur, antennes et identifiants</b></summary>${bindHtml}${tiles}${disc}${form('Ajouter une antenne')}</details>`;
     p.innerHTML = `${head}${actions.replace(/<\/div>`?\s*$/, presetHtml + '</div>')}${auditHtml}${envHtml}${wizHtml}${wizardExtras()}${more}`;
     keptAp.restore();
-    wireApForm(); wireApRows(); wireWizard();
+    wireApForm(); wireApRows(); wireApBind(); wireWizard();
     p.querySelectorAll('button[data-chan]').forEach(b => b.onclick = async () => {
       const spec = b.dataset.spec, iface = radio2g ? radio2g.name : 'wifi1';
       const what = b.dataset.chan === 'fixed' ? `fixer ${iface} sur ${spec} MHz (canal ${Math.round((Number(spec) - 2407) / 5)})` : `laisser ${iface} choisir parmi 2412 / 2437 / 2462 MHz (canaux 1 / 6 / 11)`;
@@ -1872,6 +1885,18 @@
       } catch (e) { toast(e.message, true); apLastKey = ''; pollAp(); }
     });
   }
+  function wireApBind() {
+    $('#appanel').querySelectorAll('button[data-bind]').forEach(b => b.onclick = async () => {
+      const address = b.dataset.bind;
+      b.disabled = true;
+      try {
+        const r = await api('/api/ap/bind', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ address }) });
+        toast(address ? `carte réseau vers l'antenne : ${address}` : 'sélection automatique de la carte réseau');
+        if (r.apOk === false) toast(`antenne toujours inaccessible : ${r.apError}`, true);
+      } catch (e) { toast(e.message, true); }
+      apLastKey = ''; pollAp();
+    });
+  }
   let apFormBusy = false;
   function wireApForm() {
     const btn = $('#apSave'); if (!btn) return;
@@ -1891,7 +1916,7 @@
   let apLastKey = '';
   const _renderAp = renderAp;
   renderAp = function () {
-    const d = apData; const k = d ? `${d.configured}|${d.ok}|${d.error}|${(d.saved || []).map(s => s.host + s.active).join(',')}|${d.discovered.length}|${d.lastScan ? d.lastScan.at : 0}|${d.scanning}|${wizData ? `${wizData.state}|${wizData.events}|${wizData.error}|${(wizData.surveys || []).length}|${wizDevices ? wizDevices.length : -1}|${wizBusy}` : ''}` : '';
+    const d = apData; const k = d ? `${d.configured}|${d.ok}|${d.error}|${d.bindAddress}|${(d.saved || []).map(s => s.host + s.active).join(',')}|${d.discovered.length}|${d.lastScan ? d.lastScan.at : 0}|${d.scanning}|${wizData ? `${wizData.state}|${wizData.events}|${wizData.error}|${(wizData.surveys || []).length}|${wizDevices ? wizDevices.length : -1}|${wizBusy}` : ''}` : '';
     // never repaint while the user is typing in the form
     const typing = document.activeElement && ['apHost', 'apUser', 'apPass', 'wzLabel', 'wzPython'].includes(document.activeElement.id);
     if (!d || typing || (!d.ok && k === apLastKey && $('#apSave'))) return;

@@ -18,22 +18,27 @@ const https = require('https');
 const dgram = require('dgram');
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
 
 let CONFIG_FILE = path.join(__dirname, 'ap.json');
 // dev/mock runs keep their credentials apart from the real antenna's ap.json
 function setConfigFile(f) { CONFIG_FILE = path.isAbsolute(f) ? f : path.join(__dirname, f); }
 
 // ── Config: one credential set PER AP, keyed by host ─────────────────────────
-// ap.json = { "active": "192.168.88.1", "interval": 5000,
+// ap.json = { "active": "192.168.88.1", "interval": 5000, "bindAddress": null,
 //             "aps": { "192.168.88.1": { "user": "admin", "pass": "…", "https": false }, … } }
 // (a legacy flat { host, user, pass } file is migrated on load.)
-let store = { active: null, interval: 5000, aps: {} };
-let config = null; // the ACTIVE ap, flattened: { host, user, pass, https, interval }
+// bindAddress: local IPv4 of the PC's NIC to use to reach the antenna, when the
+// PC has several (e.g. an iPhone personal-hotspot adapter that Windows prefers
+// over the card actually wired/associated to the show's MikroTik) — null = let
+// the OS pick (previous, only) behaviour.
+let store = { active: null, interval: 5000, bindAddress: null, aps: {} };
+let config = null; // the ACTIVE ap, flattened: { host, user, pass, https, interval, bindAddress }
 
 function activate() {
   const h = store.active;
   const a = h && store.aps[h];
-  config = a ? { host: h, user: a.user, pass: a.pass || '', https: !!a.https, interval: store.interval || 5000 } : null;
+  config = a ? { host: h, user: a.user, pass: a.pass || '', https: !!a.https, interval: store.interval || 5000, bindAddress: store.bindAddress || null } : null;
   status = { ok: false, error: '', updatedAt: null, system: null, radios: [], clients: [] };
   return config;
 }
@@ -42,8 +47,8 @@ function persist() { fs.writeFileSync(CONFIG_FILE, JSON.stringify(store, null, 2
 function loadConfig(flags = {}) {
   try {
     const raw = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'));
-    if (raw.aps) store = { active: raw.active || null, interval: raw.interval || 5000, aps: raw.aps };
-    else if (raw.host && raw.user) store = { active: raw.host, interval: raw.interval || 5000, aps: { [raw.host]: { user: raw.user, pass: raw.pass || '', https: !!raw.https } } }; // migrate legacy
+    if (raw.aps) store = { active: raw.active || null, interval: raw.interval || 5000, bindAddress: raw.bindAddress || null, aps: raw.aps };
+    else if (raw.host && raw.user) store = { active: raw.host, interval: raw.interval || 5000, bindAddress: null, aps: { [raw.host]: { user: raw.user, pass: raw.pass || '', https: !!raw.https } } }; // migrate legacy
   } catch { /* no file yet */ }
   if (flags.host && flags.user) { // CLI --ap/--ap-user/--ap-pass adds/updates that AP and makes it active
     store.aps[flags.host] = { user: flags.user, pass: flags.pass !== undefined ? flags.pass : (store.aps[flags.host] || {}).pass || '', https: !!(store.aps[flags.host] || {}).https };
@@ -102,18 +107,58 @@ function parseMndp(msg, rinfo) {
   if (r.identity || r.board) discovered.set(rinfo.address, r);
 }
 
+// broadcast address of the local NIC at `addr` (e.g. 192.168.88.23/255.255.255.0
+// -> 192.168.88.255), from os.networkInterfaces() — used to target MNDP
+// discovery at exactly the chosen card instead of every subnet the PC has.
+function ifaceBroadcast(addr) {
+  for (const list of Object.values(os.networkInterfaces())) {
+    for (const a of list) {
+      if (a.family === 'IPv4' && a.address === addr && a.netmask) {
+        const ip = a.address.split('.').map(Number), mask = a.netmask.split('.').map(Number);
+        if (ip.length === 4 && mask.length === 4) return ip.map((o, i) => o | (~mask[i] & 255)).join('.');
+      }
+    }
+  }
+  return null;
+}
+
 let broadcastList = [];
 const setBroadcasts = list => { broadcastList = list; trigger(); };
-const trigger = () => { if (!mndpSocket) return; for (const b of broadcastList) mndpSocket.send(Buffer.from([0, 0, 0, 0]), 5678, b, () => {}); };
+const trigger = () => {
+  if (!mndpSocket) return;
+  // a chosen NIC (store.bindAddress) narrows discovery to just its own subnet,
+  // so a broadcast never goes out (or gets confused with) another interface
+  // such as an iPhone personal-hotspot adapter
+  const targets = store.bindAddress ? [ifaceBroadcast(store.bindAddress)].filter(Boolean) : broadcastList;
+  for (const b of targets) mndpSocket.send(Buffer.from([0, 0, 0, 0]), 5678, b, () => {});
+};
+function openMndp() {
+  if (mndpSocket) { try { mndpSocket.close(); } catch { /* already gone */ } mndpSocket = null; }
+  try {
+    // bound on the chosen NIC only when one is picked (also stops replies
+    // arriving from other interfaces from ever reaching this socket);
+    // otherwise every interface, as before (survives a card change)
+    mndpSocket = dgram.createSocket({ type: 'udp4', reuseAddr: true });
+    mndpSocket.on('message', parseMndp);
+    mndpSocket.on('error', e => { console.log(`MNDP: ${e.message}`); mndpSocket = null; });
+    mndpSocket.bind(5678, store.bindAddress || undefined, () => { mndpSocket.setBroadcast(true); trigger(); });
+  } catch (e) { console.log(`MNDP indisponible: ${e.message}`); }
+}
 function startDiscovery(broadcasts) {
   if (mndpSocket) return;
   broadcastList = broadcasts;
-  try {
-    mndpSocket = dgram.createSocket({ type: 'udp4', reuseAddr: true }); // bound on every interface: survives a card change
-    mndpSocket.on('message', parseMndp);
-    mndpSocket.on('error', e => { console.log(`MNDP: ${e.message}`); mndpSocket = null; });
-    mndpSocket.bind(5678, () => { mndpSocket.setBroadcast(true); trigger(); setInterval(trigger, 30000); });
-  } catch (e) { console.log(`MNDP indisponible: ${e.message}`); }
+  openMndp();
+  setInterval(trigger, 30000);
+}
+// switch which local NIC is used to reach the antenna (REST + MNDP); null/'' = auto (OS default)
+function setBindAddress(addr) {
+  addr = String(addr || '').trim() || null;
+  store.bindAddress = addr;
+  persist();
+  activate();
+  discovered.clear(); // stale entries seen on the interface we're leaving behind
+  openMndp();
+  return addr;
 }
 
 // ── RouterOS REST client ─────────────────────────────────────────────────────
@@ -125,6 +170,7 @@ function rest(method, p, body, timeoutMs = 6000) {
     const payload = body ? Buffer.from(JSON.stringify(body)) : null;
     const req = mod.request({
       host, port: port ? +port : (config.https ? 443 : 80), method, path: '/rest' + p, timeout: timeoutMs, rejectUnauthorized: false,
+      ...(config.bindAddress ? { localAddress: config.bindAddress } : {}), // force the chosen NIC instead of whatever route the OS would pick
       headers: { Authorization: 'Basic ' + Buffer.from(`${config.user}:${config.pass || ''}`).toString('base64'), ...(payload ? { 'Content-Type': 'application/json', 'Content-Length': payload.length } : {}) },
     }, res => {
       let d = ''; res.on('data', c => d += c);
@@ -418,6 +464,7 @@ function view(fleetMacs) {
     configured: !!config,
     host: config ? config.host : null,
     user: config ? config.user : null,
+    bindAddress: store.bindAddress || null,
     saved: savedAps(),
     lastScan, scanning, recentNetworks: recentNetworks(),
     discovered: [...discovered.values()].filter(d => Date.now() - d.seenAt < 5 * 60000),
@@ -426,4 +473,4 @@ function view(fleetMacs) {
   };
 }
 
-module.exports = { setConfigFile, loadConfig, saveConfig, connect, forget, exportStore, importStore, startDiscovery, setBroadcasts, poll, showWifi, forNode, view, scan, scanHistory, setChannel, radioSettings, applyRadio, occupancy, chan2g, SHOW_PRESET_KEYS, config: () => config, rest, status: () => status, lastScan: () => lastScan };
+module.exports = { setConfigFile, loadConfig, saveConfig, connect, forget, exportStore, importStore, startDiscovery, setBroadcasts, setBindAddress, poll, showWifi, forNode, view, scan, scanHistory, setChannel, radioSettings, applyRadio, occupancy, chan2g, SHOW_PRESET_KEYS, config: () => config, rest, status: () => status, lastScan: () => lastScan };

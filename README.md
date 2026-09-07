@@ -254,12 +254,22 @@ consommation estimée reste juste.
   est désactivé, toujours un topic valide sinon, relu à chaque config.
 
 Onglet **Sorties / DMX** (`GET /api/dmx-plan`, `derived.dmx` par node).
-**Éditeur de sorties** par node : pin, type de LED, ordre des couleurs, index
-de départ, longueur, sens, « + sortie », et l'adresse console univers.canal de
-chaque sortie recalculée en direct pendant la saisie. « Enregistrer les
-sorties » renvoie le bloc `hw.led.ins` complet (WLED le reconstruit ; les
-champs non édités d'une sortie existante sont conservés) après une sauvegarde
-automatique de la flotte. Endpoint : `POST /api/node/:ip/outputs {ins}`.
+**Éditeur de sorties** par node : pin, type de LED, **mA/LED** (limite ABL,
+valeur libre comme le « Custom » de WLED), ordre des couleurs, index de
+départ, longueur, sens, **Skip** (LEDs sautées en tête de sortie), **Off
+Refresh**, « + sortie », et l'adresse console univers.canal de chaque sortie
+recalculée en direct pendant la saisie. « Enregistrer les sorties » renvoie le
+bloc `hw.led.ins` complet (WLED le reconstruit ; les champs non édités d'une
+sortie existante sont conservés) après une sauvegarde automatique de la
+flotte. Endpoint : `POST /api/node/:ip/outputs {ins}`.
+- **📍 Repérer le dernier pixel** (à côté du champ Pixels) : allume la sortie
+  en vrai sur le node — dernier pixel en blanc, le reste en bleu léger —
+  pour voir où il tombe physiquement pendant qu'on ajuste le nombre de
+  pixels (les sorties collées après celle-ci sont décalées d'autant, pour ne
+  jamais empiéter dessus ; le sens *inversé* est pris en compte, le marqueur
+  reste le pixel physiquement le plus loin). Un nouvel « Enregistrer » ou un
+  changement d'onglet restaure l'état exact d'avant repérage.
+  Endpoints : `POST`/`DELETE /api/node/:ip/locate-pixel`.
 Dans WLED l'univers d'une sortie **n'est pas un réglage** : il découle du point
 de départ du node (`dmx.uni` / `dmx.addr`) et de la longueur des sorties qui
 précèdent. **≡ 1 univers par sortie** allonge chaque sortie à un multiple de
@@ -535,6 +545,15 @@ jamais de contrôle automatique).
 - **Découverte sans identifiants** : le serveur écoute les annonces MNDP
   (MikroTik Neighbor Discovery, UDP 5678) et affiche identité, carte,
   version RouterOS et IP de chaque MikroTik du réseau.
+- **Carte réseau vers l'antenne** : quand le PC a plusieurs interfaces (ex. un
+  partage de connexion téléphone en plus de la carte reliée au kit), Windows
+  peut router les requêtes et la découverte MNDP par la mauvaise. Le bouton
+  « Carte réseau vers l'antenne » (visible dès qu'une antenne n'est pas
+  joignable, ou replié dans « Routeur, antennes et identifiants » une fois
+  connectée) fixe l'interface locale utilisée pour l'API REST et pour la
+  découverte (broadcast ciblé sur son seul sous-réseau) ; « auto » revient au
+  choix du système. Réglage persisté dans `ap.json` (`bindAddress`).
+  Endpoint : `POST /api/ap/bind {address}`.
 - **Identifiants, un jeu par antenne** : dans le panneau, chaque antenne
   découverte a un bouton « Identifiants… » qui pré-remplit le formulaire
   (IP, utilisateur, mot de passe) ; « Enregistrer et connecter » écrit

@@ -1029,7 +1029,8 @@ const server = http.createServer(async (req, res) => {
         if (!(len > 0 && len <= 4096)) return send(res, 400, { error: `sortie ${i + 1} : longueur invalide` });
         if (!(start >= 0)) return send(res, 400, { error: `sortie ${i + 1} : index de départ invalide` });
         const base = { ...(prevByStart.get(start) || {}) };
-        ins.push({ ...base, pin: pins, type: Number.isFinite(type) ? type : (base.type ?? 22), order: Number.isFinite(order) ? order : (base.order ?? 0), start, len, rev: !!u.rev, skip: Number(u.skip) || 0 });
+        const ledma = Number(u.ledma);
+        ins.push({ ...base, pin: pins, type: Number.isFinite(type) ? type : (base.type ?? 22), order: Number.isFinite(order) ? order : (base.order ?? 0), start, len, rev: !!u.rev, skip: Math.max(0, Number(u.skip) || 0), ledma: Number.isFinite(ledma) && ledma >= 0 ? ledma : (base.ledma ?? 55), ref: !!u.ref });
       }
       try {
         await postJson(ip, '/json/cfg', { hw: { led: { ins } } }, 8000);
@@ -1527,6 +1528,18 @@ const server = http.createServer(async (req, res) => {
       startApPolling();
       const st = await ap.poll(); fleet.forEach(derive);
       return send(res, st.ok ? 200 : 502, { ok: st.ok, error: st.error, host: ap.config().host });
+    }
+    if (p === '/api/ap/bind' && req.method === 'POST') {
+      // which local NIC to use to reach the antenna (REST + MNDP) — e.g. the PC
+      // has an iPhone personal-hotspot adapter that Windows prefers over the
+      // card actually wired/associated to the show's MikroTik
+      if (READONLY) return send(res, 403, { error: 'lecture seule' });
+      const b = await readBody(req);
+      const addr = String(b.address || '').trim();
+      if (addr && !localIfaces().some(i => i.address === addr)) return send(res, 400, { error: 'carte réseau inconnue' });
+      ap.setBindAddress(addr);
+      const st = await ap.poll(); fleet.forEach(derive);
+      return send(res, 200, { ok: true, bindAddress: addr || null, apOk: st.ok, apError: st.error });
     }
     if (p === '/api/ap/connect' && req.method === 'POST') {
       // switch to an AP whose credentials are already saved (no password retyped)
