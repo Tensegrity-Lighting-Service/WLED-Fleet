@@ -1,10 +1,10 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "main-capability",
-  "description": "La fenêtre principale charge la page depuis le serveur local (http://127.0.0.1:8792), pas un fichier embarqué — sans ce fichier, Tauri ne l'accorde AUCUNE permission (par défaut les capacités ne couvrent que le contenu local) : window.__TAURI__.core.invoke() échoue silencieusement, donc check_update/install_update ne font jamais rien (bug constaté 2026-09-07 : la mise à jour automatique ne se déclenchait jamais).",
+  "description": "La fenêtre principale charge la page depuis le serveur local (http://127.0.0.1:8792), pas un fichier embarqué — sans ce fichier, Tauri ne l'accorde AUCUNE permission (par défaut les capacités ne couvrent que le contenu local) : window.__TAURI__.core.invoke() échoue silencieusement, donc check_update/install_update ne font jamais rien (bug constaté 2026-09-07 : la mise à jour automatique ne se déclenchait jamais). `remote.urls` seul ne suffit pas pour NOS commandes (check_update/install_update) : une fenêtre distante applique l'ACL même aux commandes de l'appli (pas seulement celles d'un plugin), il faut leur permission propre — voir AppManifest::commands dans build.rs (bug persistant constaté à nouveau le 2026-09-07, après une v0.6.0 publiée avec le premier correctif incomplet).",
   "windows": ["main"],
   "remote": {
     "urls": ["http://127.0.0.1:8792/*"]
   },
-  "permissions": ["core:default"]
+  "permissions": ["core:default", "allow-check-update", "allow-install-update"]
 }

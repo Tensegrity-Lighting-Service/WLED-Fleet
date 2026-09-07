@@ -75,5 +75,19 @@ fn main() {
     println!("cargo:rustc-env=WF_APP_VERSION={version}");
     println!("cargo:rerun-if-changed=tauri.conf.json");
 
-    tauri_build::build()
+    // Our own #[tauri::command]s (check_update/install_update) are subject to
+    // the same ACL as plugin commands the moment the window is remote (not
+    // `tauri://...`), which ours always is (http://127.0.0.1:8792) — this was
+    // missed by the 2026-09-07 capabilities/default.json fix (that one only
+    // covers built-in "core:*" APIs) and is why check_update kept silently
+    // doing nothing: `.invoke_handler(generate_handler![...])` registers a
+    // command, it does not grant permission to call it. `AppManifest::commands`
+    // autogenerates `allow-check-update` / `allow-install-update` permissions
+    // (identifier = command name, underscores turned to dashes) that
+    // capabilities/default.json can then list — see its `permissions` array.
+    tauri_build::try_build(
+        tauri_build::Attributes::new()
+            .app_manifest(tauri_build::AppManifest::new().commands(&["check_update", "install_update"])),
+    )
+    .expect("échec tauri_build::try_build (permissions app)")
 }
