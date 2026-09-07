@@ -1,0 +1,41 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "WLED Fleet",
+  "version": "0.3.0",
+  "identifier": "eu.bedancer.wledfleet",
+  "build": {
+    "frontendDist": "dist"
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDY2MTlFODZCRUU0NzE1RjgKUldUNEZVZnVhK2daWm1OUDArR2pHNGRMWFZtSE9iRldkcmFkam13d01GSGN3QWZpMmsrb1lOZWMK",
+      "endpoints": [
+        "https://github.com/Tensegrity-Lighting-Service/WLED-Fleet/releases/latest/download/latest.json"
+      ]
+    }
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "label": "main",
+        "title": "WLED Fleet",
+        "url": "http://127.0.0.1:8792/",
+        "width": 1500,
+        "height": 950,
+        "minWidth": 900,
+        "minHeight": 600,
+        "resizable": true,
+        "center": true,
+        "visible": true
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": false,
+    "icon": ["icons/icon.ico", "icons/icon.icns", "icons/icon.png"]
+  }
+}

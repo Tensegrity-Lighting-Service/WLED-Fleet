@@ -1,0 +1,7 @@
+{
+  "host": "192.168.88.1",
+  "user": "admin",
+  "pass": "METTRE-LE-MOT-DE-PASSE-ICI",
+  "https": false,
+  "interval": 5000
+}

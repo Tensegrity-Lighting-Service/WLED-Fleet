@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WLED Fleet</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header>
+  <h1>WLED Fleet</h1>
+  <span id="roBadge" class="badge ro" style="display:none">lecture seule</span>
+  <span class="sub" id="summary">…</span>
+  <span id="netBadge" class="badge" style="text-transform:none;letter-spacing:0"></span>
+  <span class="spacer"></span>
+  <span class="sub"><span class="dot" id="liveDot"></span><span id="liveTxt">connexion…</span></span>
+</header>
+<nav class="tabs" id="tabs">
+  <button id="btnGrid" class="active" title="la grille des nodes : une ligne par node, une colonne par réglage">Grille</button>
+  <button id="btnJournal" title="journal des modifications : chaque relevé est comparé au précédent ; toute différence est consignée avec avant / après et sa source (grille = envoyée d'ici, externe = interface WLED ou autre logiciel, statut = node apparu / disparu, maj = mise à jour firmware). Une modif externe déclenche une alerte et un liseré orange sur la cellule pendant 10 min.">Journal</button>
+  <button id="btnAp" title="antenne Wi‑Fi (MikroTik RouterOS, lecture seule) : radios, canaux, puissance, clients connectés et ce que l'antenne voit de chaque node. Le badge = nombre de clients Wi‑Fi associés.">Antenne</button>
+  <button id="btnOpt" title="préréglages d'optimisation de la liaison radio : côté antenne (plage de canaux, fast roaming, options facultatives) et côté nodes (veille Wi‑Fi, puissance TX, paquets hors séquence), avec l'état réel et les actions">Optimisation</button>
+  <button id="btnDmx" title="sorties LED de chaque node (pin, type, ordre, départ, longueur, sens) et leur adresse console univers.canal calculée en direct ; contenu de chaque univers ; conflits d'univers entre nodes. Dans WLED l'univers d'une sortie n'est pas un réglage : il découle du point de départ du node et de la longueur des sorties précédentes. Le badge = nombre de sorties dont le profil (type/ordre/pixels) n'est pas encore dans la bibliothèque locale de profils LED.">Sorties / DMX</button>
+  <button id="btnFw" title="dépôt de firmwares hors-ligne (catalogue GitHub mémorisé + .bin téléchargés localement) et mise à jour OTA des nodes depuis ce dépôt. Le badge = nombre de nodes qui ont une version plus récente disponible.">Mises à jour</button>
+  <button id="btnPair" title="appairage de nouveaux nodes : le PC se connecte à l'AP du node (WLED-AP, ou réseau ouvert), lui envoie le SSID / mot de passe du show, un nom et une IP fixe, puis revient sur son Wi‑Fi. Le node rejoint la flotte tout seul.">Appairage</button>
+  <button id="btnSnap" title="sauvegardes de la configuration de toute la flotte (cfg.json + presets.json de chaque node), stockées hors ligne sur ce PC : exporter en fichier, importer, comparer avec l'état actuel, restaurer vers les nodes">Sauvegardes</button>
+  <button id="btnSettings" title="réglages de l'application : sous-réseau de la flotte, accès local ou réseau, intervalles, lecture seule, parallélisme OTA. Enregistré dans settings.json, le serveur redémarre.">⚙ Réglages</button>
+  <span class="spacer"></span>
+  <button id="tabDetach" title="ouvrir l'onglet courant seul dans une fenêtre du navigateur (pour l'avoir sur un second écran)">⧉ fenêtre</button>
+  <button id="btnBrowser" title="ouvrir toute l'interface dans le navigateur par défaut de Windows (Chrome, Edge…), par exemple pour l'imprimer, la mettre sur un autre écran ou l'utiliser hors de la fenêtre native">⧉ navigateur</button>
+</nav>
+<div id="tabgrid" class="tabpane open">
+<div class="toolbar">
+  <button id="btnScan" class="primary" title="balaye le(s) sous-réseau(x) en HTTP (/json/info) puis interroge chaque node trouvé sur les autres nodes qu'il connaît. ~6 s par /24. Les nodes déjà connus restent affichés.">Rescanner le réseau</button>
+  <input type="text" id="addIp" placeholder="ajouter une IP…" style="width:150px" title="ajouter un node à la main (IP ou IP:port), utile pour un node sur un autre sous-réseau">
+  <button id="btnAdd" title="ajouter cette IP à la flotte (vérifie que c'est bien un WLED)">+</button>
+  <button id="btnPreset" title="préréglage show pour les nodes : met en attente, sur tous les nodes en ligne (ou la sélection), les valeurs qui aident sous flux E1.31 / DDP : veille Wi‑Fi = non, puissance TX = max, saut des paquets E1.31 hors séquence = oui. Rien n'est envoyé avant Déployer.">★ Préréglage show</button>
+  <button id="btnIdentify" title="identifier la sélection : allume en blanc plein 3 s tous les nodes cochés, puis rétablit leur état. Sans sélection : tous les nodes en ligne.">💡 Identifier</button>
+  <button id="btnPurge" title="retire de la liste tous les nodes hors ligne (lignes grisées). Ils réapparaîtront au prochain scan s'ils répondent à nouveau. Le ✕ en bout de ligne fait la même chose pour un seul node.">Purger hors-ligne</button>
+  <span style="width:8px"></span>
+  <input type="text" id="filter" placeholder="filtrer (nom, ip, …)" style="width:170px" title="n'affiche que les lignes contenant ce texte (nom, IP, MAC, sorties…)">
+  <label class="chip" title="dans chaque colonne, teinte en jaune les cellules qui diffèrent de la valeur majoritaire : repère immédiat d'un node réglé autrement que les autres. Ignore les valeurs naturellement uniques (IP, MAC, univers…) et volatiles (RSSI, FPS…)."><input type="checkbox" id="diffToggle" checked> surligner les écarts</label>
+  <label class="chip" title="cache les nodes qui ne répondent plus"><input type="checkbox" id="hideOffline"> masquer hors-ligne</label>
+  <span class="spacer"></span>
+  <span style="width:8px"></span>
+  <button id="btnDiscard" disabled title="jeter toutes les modifications en attente (cellules bleues) sans rien envoyer">Annuler</button>
+  <button id="btnDeploy" disabled title="envoyer toutes les modifications en attente aux nodes, après récapitulatif et confirmation. Chaque cellule est écrite par un POST partiel sur /json/cfg ou /json/state du node.">Déployer</button>
+  <span style="width:8px"></span>
+  <button id="btnTsv" title="copie la grille (colonnes affichées, lignes filtrées) au format tabulé dans le presse-papier : coller directement dans Excel ou Google Sheets">Copier pour Excel</button>
+  <button id="btnCsv" title="télécharge la grille en CSV (séparateur ;, UTF-8 avec BOM, s'ouvre proprement dans Excel)">Exporter CSV</button>
+</div>
+<div class="toolbar" id="groupBar" style="padding-top:4px;padding-bottom:6px"></div>
+<datalist id="groupList"></datalist>
+<div class="errbox" id="errbox"></div>
+<div class="gridwrap"><table id="grid"><thead></thead><tbody></tbody></table></div>
+</div>
+<div id="optpanel" class="tabpane"></div>
+<div id="dmxpanel" class="tabpane"></div>
+<div id="setpanel" class="tabpane"></div>
+<div id="pairpanel" class="tabpane"></div>
+<div id="snappanel" class="tabpane"></div>
+<div id="appanel" class="tabpane"></div>
+<div id="fwpanel" class="tabpane">
+  <div class="fwcols">
+    <div>
+      <h2>Dépôt hors-ligne <span id="fwRepoInfo" class="muted" style="text-transform:none;letter-spacing:0"></span>
+        <span class="spacer"></span>
+        <span id="fwRelCount" class="muted" style="text-transform:none;letter-spacing:0"></span>
+        <label class="chip" style="text-transform:none;letter-spacing:0" title="par défaut : dernière stable, dernière beta et ce qui est déjà téléchargé ; cocher pour l'historique complet"><input type="checkbox" id="fwAllRel"> toutes les releases</label>
+        <label class="chip" style="text-transform:none;letter-spacing:0" title="par défaut seuls les .bin des plateformes présentes dans la flotte sont listés ; cocher pour voir tous les fichiers de chaque release"><input type="checkbox" id="fwAll"> toutes les plateformes</label>
+        <button id="fwRefresh" title="interroge les releases GitHub de wled/WLED (internet requis) et met à jour le catalogue local firmware/index.json. Ne télécharge aucun .bin : c'est l'étape suivante, à la demande.">Rafraîchir depuis GitHub</button>
+      </h2>
+      <div id="fwErr" class="st-bad" style="display:none;margin-bottom:6px"></div>
+      <table><thead><tr><th title="tag GitHub ; stable = release officielle, beta/nightly = pré-version, local = fichiers ajoutés à la main">Release</th><th>Date</th><th title="un .bin par plateforme ; le nom doit correspondre au champ Plateforme du node">Firmware (plateformes de la flotte)</th><th>Taille</th><th title="✓ hors ligne = fichier présent dans firmware/, flashable sans internet">Dépôt</th><th></th></tr></thead><tbody id="fwRel"></tbody></table>
+      <div style="margin-top:8px" class="muted">Ajouter un .bin à la main (build perso, fork constructeur) : nom attendu <code>WLED_&lt;version&gt;_&lt;plateforme&gt;.bin</code>
+        <input type="file" id="fwFile" accept=".bin" style="font-size:12px"></div>
+    </div>
+    <div>
+      <h2>Flotte ↔ dépôt
+        <span class="spacer"></span>
+        <span style="text-transform:none;letter-spacing:0">cible :</span> <select id="fwTarget" title="release cible : seules celles ayant au moins un .bin déjà téléchargé sont proposées (flash hors ligne uniquement)"></select>
+        <select id="fwParallel" title="nombre de nodes flashés simultanément. En Wi-Fi, les uploads se partagent l'antenne : 1 ou 2 à la fois est plus sûr. En Ethernet, tous d'un coup ne pose pas de problème.">
+          <option value="1">1 à la fois (Wi‑Fi)</option><option value="2">2 à la fois</option><option value="4">4 à la fois</option><option value="32">tous en même temps (Ethernet)</option>
+        </select>
+        <button id="fwFlash" class="primary" disabled>Mettre à jour la sélection</button>
+      </h2>
+      <table><thead><tr><th><input type="checkbox" id="fwSelAll" title="cocher tous les nodes flashables avec la cible"></th><th>Node</th><th title="variante de build du node (info.release) : détermine quel .bin lui convient">Plateforme</th><th title="version actuellement installée">Version</th><th title="dernière stable connue pour cette plateforme ; ● = déjà dans le dépôt">Dernière stable</th><th title="à jour / MAJ à télécharger / MAJ prête / plateforme inconnue ; fork = firmware d'un dépôt non officiel">Statut</th><th title="progression : envoi (octets acceptés par le node), redémarrage, puis vérification de la version">Flash</th></tr></thead><tbody id="fwNodes"></tbody></table>
+      <div id="fwProgress" class="st-info" style="margin-top:6px;font-weight:650"></div>
+      <div class="muted" style="margin-top:6px">Flash uniquement depuis un fichier du dépôt local, en série ou en parallèle selon le sélecteur. Chaque node redémarre (~30 s), sa version est revérifiée ensuite.</div>
+    </div>
+  </div>
+</div>
+<div id="journal" class="tabpane"><table style="width:100%"><thead><tr><th>Heure</th><th>Node</th><th>Réglage</th><th>Avant</th><th>Après</th><th title="grille = envoyé d'ici · externe = interface WLED ou autre logiciel · statut = node apparu / disparu · maj = mise à jour firmware">Source</th></tr></thead><tbody id="journalBody"></tbody></table></div>
+<footer>
+  <span title="Grille : rien n'est envoyé avant Déployer. Vue easy par défaut (IP, adresses, univers, mode et ses options, puissance, état) ; « toutes les colonnes » = vue brute de toute la config, avec la colonne Actions. 💡 à côté de la pastille = identifier le node. Couleur de fond = groupe de colonnes. Sélection de cellules comme dans Excel : clic = une cellule, cliquer-glisser ou Maj+clic = rectangle, Ctrl+clic = ajouter/retirer, flèches et Tab déplacent (Maj+flèches étendent), Échap désélectionne. Édition : Entrée, F2, double-clic ou taper directement sur la cellule active ; Entrée valide et descend d'une ligne, Échap annule. Si plusieurs cellules d'une même colonne sont sélectionnées, valider propose de remplir toute la colonne sélectionnée (même valeur ou incrémental). Les cases à cocher restent la sélection des lignes pour les actions (identifier, préréglage, mise à jour). Groupes (zone, type…) = lignes de la grille en arborescence : ▾ replie / déplie, la case coche tout le groupe, clic droit sur la ligne de groupe = renommer / supprimer / nouveau groupe ; glisser un node sous une ligne de groupe l'y met (colonne Groupe éditable aussi). Le groupe est stocké sur le node lui-même, dans son « Group topic » MQTT (champ natif WLED), donc le node doit répondre pour en changer. Clic droit sur une sélection = Groupe ▸ (Non groupé, les groupes, nouveau groupe), valeur par défaut WLED, retirer de la liste ; dans le vide = nouveau groupe vide, largeurs des colonnes. En-têtes : glisser pour réordonner, bord droit pour redimensionner (double-clic sur le bord = ajuster au contenu), clic pour trier, clic droit = menu (ajuster cette colonne / toutes, largeurs par défaut). Survol d'une cellule = explication du réglage. ⟳ = redémarrage requis après modification.">ⓘ aide : survoler</span>
+  <span class="spacer"></span>
+  <span id="about" class="muted" title="version de l'application et dossier des fichiers"></span>
+  <button id="btnRestart" class="rowbtn" title="relance le serveur avec les fichiers modifiés (server.js, columns.js, …). Disponible quand l'app a été lancée par WLED-Fleet.cmd ; la page se reconnecte seule.">↻ Redémarrer le serveur</button>
+  <span id="lastScan"></span>
+</footer>
+<div id="toast"></div>
+
+<script src="app.js"></script>
+</body>
+</html>

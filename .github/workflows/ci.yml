@@ -1,0 +1,43 @@
+name: CI
+
+# Aucune release ici : les releases sont construites et publiées à la main
+# (desktop/build-release.cmd + gh release create), comme Lumitrack — voir
+# README. Ces jobs valident juste que ça compile / que les tests passent,
+# y compris sous macOS (runner GitHub, Xcode préinstallé) avant même que le
+# code ne soit testé sur un vrai Mac.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  rust-windows:
+    name: Rust (Windows)
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: desktop
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo check --all-targets
+
+  rust-macos:
+    name: Rust (macOS)
+    runs-on: macos-latest
+    defaults:
+      run:
+        working-directory: desktop
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo check --all-targets
+
+  node:
+    name: Node (npm test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - run: npm test
