@@ -19,6 +19,7 @@ wizard-surveys.log
 wizard-live.log
 tools/wizard/wizard-probe.log
 __pycache__/
+tools/python-embed/
 WLED-Fleet.exe
 WLED-Fleet.old.exe
 server-errors.log

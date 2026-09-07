@@ -48,20 +48,57 @@ function loadConfig() {
 function saveConfig(patch) { config = { ...config, ...patch }; try { fs.writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2) + '\n'); } catch { /* read-only dir: keep in RAM */ } return config; }
 
 // ── Python resolution: wizard.json "python", then what Windows / Linux usually have ──
+// On Windows, `python`/`python3` are by default "App Execution Aliases" — tiny
+// stub exes at %LOCALAPPDATA%\Microsoft\WindowsApps\ that, when NO real Python
+// is installed, pop the Microsoft Store page instead of failing cleanly (bug
+// reported 2026-09-07: "des fenêtres d'installation de python qui apparaissent
+// souvent", and WiFiman never working since resolution always dead-ended on
+// python.exe never gets used, `where` only looks the path up — running it
+// resolvePython() with pythonCmd still null retries the same sweep every time).
+// `py -3` (the real, install-time-only launcher.exe) is never one of these
+// stubs, so it's tried first ; python/python3 are only ever RUN after `where`
+// confirms the resolved path isn't a WindowsApps stub, which never happens.
 let pythonCmd = null;   // ['python'] or ['py', '-3'] once found
 let pythonError = '';
+// node tools/prepare-python-embed.js (not run automatically — needs network + a
+// system Python to drive pip) bundles a full, bleak-preinstalled Python next to
+// the app ; when present (always, once desktop/build.rs picks it up into the
+// exe) it's tried FIRST, so WiFiman needs no system Python install at all.
+const BUNDLED_PYTHON = path.join(__dirname, 'tools', 'python-embed', 'python.exe');
 function candidates() {
   const list = [];
+  if (fs.existsSync(BUNDLED_PYTHON)) list.push([BUNDLED_PYTHON]);
   if (config.python) list.push(String(config.python).split(' ').filter(Boolean));
-  list.push(['python'], ['py', '-3'], ['python3']);
+  if (process.platform === 'win32') list.push(['py', '-3'], ['python'], ['python3']);
+  else list.push(['python3'], ['python'], ['py', '-3']);
   return list;
+}
+// `where`/`which` just look a name up on PATH ; unlike running it, this never
+// triggers a Windows App Execution Alias's Store-redirect behaviour.
+function resolveOnPath(name) {
+  return new Promise(resolve => {
+    execFile(process.platform === 'win32' ? 'where' : 'which', [name], { timeout: 4000, windowsHide: true }, (err, out) => {
+      if (err) return resolve(null);
+      resolve(String(out).split(/\r?\n/).map(s => s.trim()).filter(Boolean)[0] || null);
+    });
+  });
+}
+async function isWindowsStoreStub(cmdName) {
+  if (process.platform !== 'win32' || !/^python3?$/.test(cmdName)) return false;
+  const found = await resolveOnPath(cmdName);
+  if (!found) return true; // nothing on PATH at all: treat as unusable, no need to run it
+  if (!/\\WindowsApps\\/i.test(found)) return false; // a real install elsewhere: safe to run
+  try { return fs.statSync(found).size < 500000; } catch { return true; } // the stub is a few KB, a real python.exe is several MB
 }
 function tryPython(cmd) {
   return new Promise(resolve => {
-    execFile(cmd[0], [...cmd.slice(1), '-c', 'import sys; print(sys.version.split()[0])'], { timeout: 8000, windowsHide: true }, (err, out) => {
-      if (err) return resolve(null);
-      const v = String(out).trim();
-      resolve(/^3\.(9|[1-9]\d)/.test(v) ? v : null); // bleak needs 3.9+
+    isWindowsStoreStub(cmd[0]).then(stub => {
+      if (stub) return resolve(null);
+      execFile(cmd[0], [...cmd.slice(1), '-c', 'import sys; print(sys.version.split()[0])'], { timeout: 8000, windowsHide: true }, (err, out) => {
+        if (err) return resolve(null);
+        const v = String(out).trim();
+        resolve(/^3\.(9|[1-9]\d)/.test(v) ? v : null); // bleak needs 3.9+
+      });
     });
   });
 }

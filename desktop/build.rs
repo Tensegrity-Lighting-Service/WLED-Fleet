@@ -15,7 +15,7 @@ const EXCLUDE_FILES: &[&str] = &[
     "wizard-live.log", "server-errors.log", "wizard-probe.log",
 ];
 
-fn copy_app_files(src: &Path, dst: &Path) {
+fn copy_app_files(src: &Path, dst: &Path, top_level: bool) {
     fs::create_dir_all(dst).expect("create embed dir");
     for entry in fs::read_dir(src).expect("read app dir") {
         let entry = entry.expect("dir entry");
@@ -26,11 +26,15 @@ fn copy_app_files(src: &Path, dst: &Path) {
             if EXCLUDE_DIRS.contains(&name.as_ref()) {
                 continue;
             }
-            copy_app_files(&entry.path(), &dst.join(name.as_ref()));
+            copy_app_files(&entry.path(), &dst.join(name.as_ref()), false);
         } else {
-            // .exe (WLED-Fleet.exe / .old.exe next to server.js in a dev checkout)
-            // would otherwise embed a stale copy of the launcher inside itself
-            if EXCLUDE_FILES.contains(&name.as_ref()) || name.starts_with('.') || name.ends_with(".exe") || name.ends_with(".pyc") {
+            if EXCLUDE_FILES.contains(&name.as_ref()) || name.starts_with('.') || name.ends_with(".pyc") {
+                continue;
+            }
+            // WLED-Fleet.exe / .old.exe sit next to server.js in a dev checkout and
+            // would otherwise embed a stale copy of the launcher inside itself — but
+            // python.exe et al (tools/python-embed/, see below) must go through
+            if top_level && name.ends_with(".exe") {
                 continue;
             }
             fs::copy(entry.path(), dst.join(name.as_ref())).expect("copy app file");
@@ -43,11 +47,20 @@ fn main() {
     let src = Path::new(&manifest_dir).join("..");
     let dst = Path::new(&manifest_dir).join("embed");
     let _ = fs::remove_dir_all(&dst);
-    copy_app_files(&src, &dst);
+    copy_app_files(&src, &dst, true);
     println!("cargo:rerun-if-changed={}", src.display());
     println!("cargo:rerun-if-changed={}", src.join("static").display());
     println!("cargo:rerun-if-changed={}", src.join("tools").display());
     println!("cargo:rerun-if-changed={}", src.join("docs").display());
+
+    // tools/python-embed/ (node tools/prepare-python-embed.js — not run automatically,
+    // needs network + a system Python to drive pip) already lands inside embed/tools/
+    // via the walk above ; just tell the developer whether WiFiman will be bundled.
+    if src.join("tools").join("python-embed").join("python.exe").is_file() {
+        println!("cargo:warning=WLED Fleet: Python embarqué trouvé, WiFiman n'aura besoin d'aucun Python système dans ce build.");
+    } else {
+        println!("cargo:warning=WLED Fleet: pas de Python embarqué (node tools/prepare-python-embed.js pour en préparer un) — WiFiman cherchera un Python système comme avant.");
+    }
 
     // single source of truth for the app version = tauri.conf.json, not Cargo.toml
     // (whose own [package].version is internal-only, see the comment in Cargo.toml)

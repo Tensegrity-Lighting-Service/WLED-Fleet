@@ -1,0 +1,10 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "main-capability",
+  "description": "La fenêtre principale charge la page depuis le serveur local (http://127.0.0.1:8792), pas un fichier embarqué — sans ce fichier, Tauri ne l'accorde AUCUNE permission (par défaut les capacités ne couvrent que le contenu local) : window.__TAURI__.core.invoke() échoue silencieusement, donc check_update/install_update ne font jamais rien (bug constaté 2026-09-07 : la mise à jour automatique ne se déclenchait jamais).",
+  "windows": ["main"],
+  "remote": {
+    "urls": ["http://127.0.0.1:8792/*"]
+  },
+  "permissions": ["core:default"]
+}
