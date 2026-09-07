@@ -73,12 +73,14 @@ fn extract_embedded(d: &Dir, dst: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// The app's folder: normally wherever this exe currently sits, self-extracted
-/// there if missing or out of date. `WLED_FLEET_DIR` (dev only) points at a
-/// live source tree instead and skips extraction entirely — the escape hatch
-/// for editing server.js/static/* without losing the changes to a re-extract
-/// on the next build; WLED-Fleet.cmd (console launch) never goes through any
-/// of this, it always runs the folder's own files.
+/// The app's folder: a `WLED-Fleet\` subfolder next to this exe, self-extracted
+/// there if missing or out of date — never loose files dropped straight into
+/// whatever folder (Downloads…) the exe happens to sit in. `WLED_FLEET_DIR`
+/// (dev only) points at a live source tree instead and skips extraction
+/// entirely — the escape hatch for editing server.js/static/* without losing
+/// the changes to a re-extract on the next build; WLED-Fleet.cmd (console
+/// launch) never goes through any of this, it always runs the folder's own
+/// files (wherever that .cmd itself was placed).
 fn ensure_app_dir() -> Option<PathBuf> {
     if let Ok(dir) = std::env::var("WLED_FLEET_DIR") {
         let p = PathBuf::from(dir);
@@ -86,7 +88,7 @@ fn ensure_app_dir() -> Option<PathBuf> {
             return Some(p);
         }
     }
-    let dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
+    let dir = std::env::current_exe().ok()?.parent()?.join("WLED-Fleet");
     let marker = dir.join(".wf-embedded-version");
     let up_to_date = std::fs::read_to_string(&marker).map(|v| v.trim() == APP_VERSION).unwrap_or(false);
     if !up_to_date {
