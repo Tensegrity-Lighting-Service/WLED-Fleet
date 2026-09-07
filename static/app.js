@@ -1134,7 +1134,7 @@
       p.querySelectorAll('.gcf').forEach(el => { const gc = gCards[Number(el.dataset.gi)]; el.hidden = !gc.nodes.some(n => bad.has(n.name || n.ip)); });
     };
     const refreshDirty = () => { const n = changedNodes().length; const b = $('#dmxSave'); if (b) { b.disabled = !n; b.textContent = n ? `Enregistrer les modifications (${n} node${n > 1 ? 's' : ''})` : 'Enregistrer les modifications'; } };
-    p.querySelectorAll('[data-out],[data-nb]').forEach(el => { el.oninput = el.onchange = () => { const tr = el.closest('tr'); if (tr && tr.dataset.node) recompute(tr.dataset.node); refreshDirty(); renderConflicts(); if (tr && (el.dataset.out === 'start' || el.dataset.out === 'len')) sendLocateUpdate(tr); }; });
+    p.querySelectorAll('[data-out],[data-nb]').forEach(el => { el.oninput = el.onchange = () => { const tr = el.closest('tr'); if (tr && tr.dataset.node) recompute(tr.dataset.node); refreshDirty(); renderConflicts(); if (tr && (el.dataset.out === 'len' || el.dataset.out === 'rev')) sendLocateUpdate(tr); }; });
     // "comptée" checkboxes: Fleet-only, saved at once, conflicts recomputed
     p.querySelectorAll('input[data-ignore]').forEach(cb => cb.onchange = async () => {
       const ip = cb.closest('tr').dataset.node;
@@ -1150,15 +1150,19 @@
       const px = await calcBox(b, per, rgbw); if (px == null) return;
       const len = tr.querySelector('[data-out=len]'); len.value = px; len.dispatchEvent(new Event('input'));
     });
-    // 📍 localiser : allume le dernier pixel de la sortie (blanc, reste en bleu léger) sur
-    // le vrai node ; ajuster Pixels (ci-dessous) déplace le repère en direct, un 2e clic arrête
+    // 📍 localiser : allume le dernier pixel de la sortie (blanc, reste en bleu léger) sur le
+    // vrai node ; ajuster Pixels (ci-dessous) déplace le repère en direct — écrit réellement la
+    // longueur sur le node (et décale la sortie suivante si elle est collée, sans trou) le temps
+    // du repérage, sinon dépasser l'ancienne longueur allumait la sortie suivante au lieu de
+    // déplacer le repère (les index au-delà appartiennent physiquement à son fil, pas au nôtre).
+    // Tout est restauré à l'identique à l'arrêt. Un 2e clic sur 📍 arrête.
     let locateTimer = null;
     const sendLocateUpdate = tr => {
       if (!locating || locating.ip !== tr.dataset.node || locating.index !== Number(tr.dataset.outrow)) return;
-      const start = Number(tr.querySelector('[data-out=start]').value), len = Number(tr.querySelector('[data-out=len]').value);
-      if (!(len > 0) || !(start >= 0)) return;
+      const len = Number(tr.querySelector('[data-out=len]').value), rev = tr.querySelector('[data-out=rev]').checked;
+      if (!(len > 0)) return;
       clearTimeout(locateTimer);
-      locateTimer = setTimeout(() => { post(`/api/node/${encodeURIComponent(locating.ip)}/locate-pixel`, { start, len }).catch(e => toast(e.message, true)); }, 150);
+      locateTimer = setTimeout(() => { post(`/api/node/${encodeURIComponent(locating.ip)}/locate-pixel`, { index: locating.index, len, rev }).catch(e => toast(e.message, true)); }, 400);
     };
     p.querySelectorAll('button[data-locate]').forEach(b => b.onclick = async () => {
       const tr = b.closest('tr'); const ip = tr.dataset.node, index = Number(tr.dataset.outrow);
@@ -1169,11 +1173,11 @@
         await stopLocating();
       }
       if (wasThis) return;
-      const start = Number(tr.querySelector('[data-out=start]').value), len = Number(tr.querySelector('[data-out=len]').value);
-      if (!(len > 0) || !(start >= 0)) { toast('départ / pixels invalides', true); return; }
+      const len = Number(tr.querySelector('[data-out=len]').value), rev = tr.querySelector('[data-out=rev]').checked;
+      if (!(len > 0)) { toast('pixels invalide', true); return; }
       locating = { ip, index };
       b.classList.add('primary');
-      try { await post(`/api/node/${encodeURIComponent(ip)}/locate-pixel`, { start, len }); toast('sortie repérée : dernier pixel en blanc sur le node — ajuster Pixels pour le déplacer, 📍 pour arrêter'); }
+      try { await post(`/api/node/${encodeURIComponent(ip)}/locate-pixel`, { index, len, rev }); toast('sortie repérée : dernier pixel en blanc sur le node — ajuster Pixels pour le déplacer (la sortie suivante collée se décale le temps du repérage), 📍 pour arrêter'); }
       catch (e) { toast(e.message, true); locating = null; b.classList.remove('primary'); }
     });
     // ⚡ autopatch: every output starts on a fresh universe ; nodes of a group chain on consecutive universes

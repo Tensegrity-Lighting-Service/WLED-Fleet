@@ -496,40 +496,82 @@ async function identifyNode(ip, ms = 3000) {
 }
 
 // ── Locate pixel: light only the last pixel of an output, rest of it light blue ──
-// For counting a strip's real pixels: commandeers segment 0 for the output's
-// exact start/len, live-override so it shows over any E1.31/DDP stream. Two
-// plain solid-colour segments (0 = light blue, 1 = the single last pixel in
-// white) — WLED's per-LED "i" override looked right on paper but a real
-// round-trip against the emulator showed it has no visible effect (accepted,
-// no error, pixel buffer unchanged), while two segments render exactly as
-// intended (checked pixel-by-pixel via GET /json/live). One call starts
-// (saves segment 0, and segment 1 if the node already had one), later calls
-// with a new `len` just move the marker. A call with no follow-up for
+// For counting a strip's real pixels. Global WLED pixel indices are owned by
+// whichever bus the REAL hw.led.ins config currently says owns them — a purely
+// visual segment override can't show "what if this output had more pixels"
+// once you go past its configured length, because those higher indices are
+// physically wired to the NEXT output's pin, not an extension of this one's
+// (confirmed live: increasing past the boundary lit the next output's strip,
+// not a marker moving down this one). So each length change here really
+// rewrites this output's len in hw.led.ins — and if the next output(s) were
+// immediately adjacent (no gap) in the ORIGINAL layout, their start shifts by
+// the same delta, cascading through the whole glued chain, so nothing
+// overlaps. Restored to the exact original ins array on stop. Same live
+// segment marker as before (0 = light blue, 1 = the single last pixel in
+// white) on top, recoloured after every rewrite — checked pixel-by-pixel via
+// GET /json/live on the emulator. A call with no follow-up for
 // LOCATE_TIMEOUT_MS auto-restores, so leaving the tab never strands a node
-// lit up. Nothing is written to flash.
-const locating = new Map(); // ip -> { saved, seg0, seg1, seg1Existed, touchedSeg1, timer }
+// mid-calibration.
+//
+// `rev` (the output's own "inversée" flag, hw.led.ins[i].rev): WLED remaps
+// pixel index i -> len-1-i for that bus before it ever reaches the driver, so
+// with rev on, WLED index `start` is the strip's physically FARTHEST pixel,
+// not `start+len-1`. The marker must go on whichever index is physically
+// last, so it always lands on the true end of the wire, not just the highest
+// number. (The emulator's /json/live preview doesn't simulate this bus-level
+// remap, so this couldn't be checked pixel-by-pixel like the rest — implemented
+// from WLED's documented rev semantics; flag if the marker ever looks wrong on
+// a reversed output so it can be corrected.)
+const locating = new Map(); // ip -> { savedState, seg0, seg1, seg1Existed, touchedSeg1, savedIns, outIndex, origStart, origLen, timer }
 const LOCATE_TIMEOUT_MS = 90000;
-async function setLocatePixel(ip, start, len) {
+async function setLocatePixel(ip, outIndex, len, rev) {
   len = Math.max(1, Math.min(4096, Math.round(len)));
-  start = Math.max(0, Math.round(start));
+  const rec = fleet.get(ip);
+  if (!rec) throw new Error('node inconnu');
   let session = locating.get(ip);
   if (!session) {
-    const saved = (await getJson(ip, '/json/state', 3000)).json;
-    const seg0 = (saved.seg || []).find(s => s.id === 0) || (saved.seg || [])[0];
+    const ins = rec.cfg && rec.cfg.hw && rec.cfg.hw.led && rec.cfg.hw.led.ins;
+    if (!Array.isArray(ins) || !ins[outIndex]) throw new Error('config des sorties non lue');
+    const savedState = (await getJson(ip, '/json/state', 3000)).json;
+    const seg0 = (savedState.seg || []).find(s => s.id === 0) || (savedState.seg || [])[0];
     if (!seg0) throw new Error('aucun segment sur ce node');
-    const seg1 = (saved.seg || []).find(s => s.id === 1) || null;
-    session = { saved, seg0, seg1, seg1Existed: !!seg1, touchedSeg1: false };
+    const seg1 = (savedState.seg || []).find(s => s.id === 1) || null;
+    session = {
+      savedState, seg0, seg1, seg1Existed: !!seg1, touchedSeg1: false,
+      savedIns: ins.map(b => ({ ...b })), outIndex, origStart: ins[outIndex].start, origLen: ins[outIndex].len,
+    };
     locating.set(ip, session);
   }
   clearTimeout(session.timer);
-  const last = start + len - 1;
+
+  // rewrite this output's real length (and cascade-shift any glued outputs after it)
+  const orig = session.savedIns;
+  const ins = orig.map(b => ({ ...b }));
+  const delta = len - session.origLen;
+  ins[session.outIndex].len = len;
+  if (delta !== 0) {
+    let boundary = orig[session.outIndex].start + orig[session.outIndex].len;
+    for (let i = session.outIndex + 1; i < orig.length; i++) {
+      if (orig[i].start !== boundary) break; // gap in the original layout: the chain stops here
+      ins[i].start = orig[i].start + delta;
+      boundary = orig[i].start + orig[i].len;
+    }
+  }
+  await postJson(ip, '/json/cfg', { hw: { led: { ins } } }, 8000);
+  await new Promise(r => setTimeout(r, 200)); // the bus needs a beat to re-init after a length change
+
+  const start = session.origStart;
   const segs = [];
   if (len > 1) {
-    segs.push({ id: session.seg0.id, start, stop: last, on: true, bri: 255, col: [[48, 96, 255], [0, 0, 0], [0, 0, 0]], fx: 0, sx: 0, frz: false });
-    segs.push({ id: 1, start: last, stop: last + 1, on: true, bri: 255, col: [[255, 255, 255], [0, 0, 0], [0, 0, 0]], fx: 0, sx: 0, frz: false });
+    // rev: the physically last pixel is WLED index `start` instead of `start+len-1`
+    const markerStart = rev ? start : start + len - 1;
+    const restStart = rev ? start + 1 : start;
+    const restStop = rev ? start + len : start + len - 1;
+    segs.push({ id: session.seg0.id, start: restStart, stop: restStop, on: true, bri: 255, col: [[48, 96, 255], [0, 0, 0], [0, 0, 0]], fx: 0, sx: 0, frz: false });
+    segs.push({ id: 1, start: markerStart, stop: markerStart + 1, on: true, bri: 255, col: [[255, 255, 255], [0, 0, 0], [0, 0, 0]], fx: 0, sx: 0, frz: false });
     session.touchedSeg1 = true;
   } else {
-    segs.push({ id: session.seg0.id, start, stop: last + 1, on: true, bri: 255, col: [[255, 255, 255], [0, 0, 0], [0, 0, 0]], fx: 0, sx: 0, frz: false });
+    segs.push({ id: session.seg0.id, start, stop: start + 1, on: true, bri: 255, col: [[255, 255, 255], [0, 0, 0], [0, 0, 0]], fx: 0, sx: 0, frz: false });
   }
   await postJson(ip, '/json/state', { on: true, bri: 255, tt: 0, lor: 1, seg: segs }, 3000);
   session.timer = setTimeout(() => { stopLocatePixel(ip).catch(() => {}); }, LOCATE_TIMEOUT_MS);
@@ -539,14 +581,18 @@ async function stopLocatePixel(ip) {
   const session = locating.get(ip); if (!session) return { ok: true, already: false };
   clearTimeout(session.timer);
   locating.delete(ip);
-  const { saved, seg0, seg1, seg1Existed, touchedSeg1 } = session;
-  const back = { ...saved, tt: 0, lor: saved.lor || 0 };
+  const { savedState, seg0, seg1, seg1Existed, touchedSeg1, savedIns } = session;
+  try { await postJson(ip, '/json/cfg', { hw: { led: { ins: savedIns } } }, 8000); } catch (e) { console.log(`locate-pixel ${ip}: sorties non restaurées (${e.message})`); }
+  await new Promise(r => setTimeout(r, 200));
+  const back = { ...savedState, tt: 0, lor: savedState.lor || 0 };
   delete back.nl; delete back.udpn; delete back.ledmap; delete back.mainseg;
   const strip = s => { const c = { ...s }; delete c.len; delete c.n; delete c.set; return c; };
   const segs = [strip(seg0)];
   if (touchedSeg1) segs.push(seg1Existed ? strip(seg1) : { id: 1, stop: 0 }); // stop:0 removes a segment we created
   back.seg = segs;
   await postJson(ip, '/json/state', back, 3000);
+  const rec = fleet.get(ip);
+  if (rec) { rec.meta.cfgUpdated = 0; pollInfoState(rec, 'grille').catch(() => {}); } // re-sync the fleet's cached cfg with the restored reality
   return { ok: true };
 }
 
@@ -1014,11 +1060,14 @@ const server = http.createServer(async (req, res) => {
       catch (e) { return send(res, 502, { error: e.message }); }
     }
     if ((m = /^\/api\/node\/([^/]+)\/locate-pixel$/.exec(p)) && req.method === 'POST') {
+      // real hw.led.ins length change (see setLocatePixel), always restored on stop —
+      // still refused in lecture seule like any other write to a node's config
+      if (READONLY) return send(res, 403, { error: 'lecture seule' });
       const ip = decodeURIComponent(m[1]);
       const b = await readBody(req);
-      const start = Number(b.start), len = Number(b.len);
-      if (!Number.isFinite(start) || !Number.isFinite(len) || len < 1) return send(res, 400, { error: 'sortie invalide' });
-      try { return send(res, 200, await setLocatePixel(ip, start, len)); } catch (e) { return send(res, 502, { error: e.message }); }
+      const index = Number(b.index), len = Number(b.len);
+      if (!Number.isInteger(index) || index < 0 || !Number.isFinite(len) || len < 1) return send(res, 400, { error: 'sortie invalide' });
+      try { return send(res, 200, await setLocatePixel(ip, index, len, !!b.rev)); } catch (e) { return send(res, 502, { error: e.message }); }
     }
     if ((m = /^\/api\/node\/([^/]+)\/locate-pixel$/.exec(p)) && req.method === 'DELETE') {
       try { return send(res, 200, await stopLocatePixel(decodeURIComponent(m[1]))); } catch (e) { return send(res, 502, { error: e.message }); }
