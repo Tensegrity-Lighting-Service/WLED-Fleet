@@ -11,7 +11,7 @@
   }
   applyTheme(theme);
   document.querySelectorAll('#themeSw button').forEach(b => b.onclick = () => applyTheme(b.dataset.theme));
-  let COLS = [], GROUPS = [], fleet = { nodes: [] }, LED_TYPES = {}, COLOR_ORDERS = {};
+  let COLS = [], GROUPS = [], fleet = { nodes: [] }, LED_TYPES = {}, COLOR_ORDERS = {}, WHITE_SWAPS = {}, WHITE_SWAP_TYPES = [];
   let ledProfilesCache = []; // local library (led-profiles.json), kept in sync for the Sorties/DMX badge and table
   let sortKey = 'name', sortDir = 1, editing = null;
   // manual row order (drag the ⋮⋮ handle): a list of node identities (MAC, else IP), persisted
@@ -141,7 +141,7 @@
     return j;
   }
   async function loadColumns() {
-    const j = await api('/api/columns'); COLS = j.columns; GROUPS = j.groups; LED_TYPES = j.ledTypes || {}; COLOR_ORDERS = j.colorOrders || {}; renderGroupBar(); renderHead();
+    const j = await api('/api/columns'); COLS = j.columns; GROUPS = j.groups; LED_TYPES = j.ledTypes || {}; COLOR_ORDERS = j.colorOrders || {}; WHITE_SWAPS = j.whiteSwaps || {}; WHITE_SWAP_TYPES = j.whiteSwapTypes || []; renderGroupBar(); renderHead();
   }
   // ── LED profiles: local library (led-profiles.json), shared by the Sorties/DMX table and its badge ──
   async function loadLedProfiles() {
@@ -1026,7 +1026,9 @@
     let d; try { [d] = await Promise.all([api('/api/dmx-plan'), loadLedProfiles()]); } catch (e) { p.innerHTML = `<div class="st-bad">${esc(e.message)}</div>`; return; }
     const CPX = { 4: 3, 5: 3, 6: 4 }; // channels per pixel by DMX mode (Multi RGB, Multi DRGB, Multi RGBW)
     const modeName = m => ({ 4: 'Multi RGB', 5: 'Multi DRGB', 6: 'Multi RGBW' })[m] || (COLS.find(c => c.id === 'dmxmode') || { enum: {} }).enum[m] || m;
-    const conflictsHtml = list => list.length ? `<b class="st-bad">✗ Conflit d'univers</b> : ${list.map(c => `univers <b>${c.universe}</b> écouté par ${c.nodes.map(esc).join(' et ')}`).join(' · ')} <span class="muted">— deux nodes sur le même univers affichent les mêmes données : ⚡ Autopatch, ou décaler l'univers de départ de l'un d'eux</span>` : `<span class="muted">aucun conflit d'univers entre nodes</span>`;
+    // conflit = recouvrement AU CANAL PRÈS (voir dmx.js) : deux nodes peuvent partager un
+    // univers à des adresses distinctes, c'est même le seul moyen de tasser des nodes courts
+    const conflictsHtml = list => list.length ? `<b class="st-bad">✗ Canaux en double</b> : ${list.map(c => `<b>${c.universe}.${c.from}</b> → <b>${c.universe}.${c.to}</b> écoutés par ${c.nodes.map(esc).join(' et ')}`).join(' · ')} <span class="muted">— ces canaux pilotent deux nodes à la fois : ⚡ Patcher, ou décaler l'adresse de l'un d'eux</span>` : `<span class="muted">aucun canal écouté par deux nodes</span>`;
     const conflicts = `<div id="dmxConflicts" class="subbox" style="${d.conflicts.length ? 'border-color:var(--bad)' : ''}">${conflictsHtml(d.conflicts)}</div>`;
     // ── cards: one per group (its nodes stacked as if they were one device), ungrouped nodes alone ──
     const order = rows().map(key); const byIp = new Map(d.nodes.map(n => [n.ip, n]));
@@ -1037,64 +1039,87 @@
     const colDmx = { mode: COLS.find(c => c.id === 'dmxmode'), uni: COLS.find(c => c.id === 'dmxuni'), addr: COLS.find(c => c.id === 'dmxaddr'), mA: COLS.find(c => c.id === 'maxpwr') };
     const nodeRec = ip => fleet.nodes.find(x => key(x) === ip);
     const inConflictOf = n => d.conflicts.some(c => c.nodes.includes(n.name || n.ip));
-    const alignedOf = pl => pl.outputs.filter(o => o.len).every(o => o.start % pl.pxPerUni === 0);
+    // index du premier pixel de chaque univers : 0, firstUniPx, +pxPerUni… Le premier
+    // univers en porte moins dès que l'adresse ≠ 1 (134 à l'adresse 109), donc le test
+    // « démarre sur un univers » ne peut pas être un modulo — même calcul que dmx.js.
+    const firstUniPxOf = pl => Math.floor((512 - (pl.addr - 1) - (pl.mode === 5 ? 1 : 0)) / pl.chPerPx);
+    const startsUniverse = (px, pl) => { if (px === 0) return true; const f = firstUniPxOf(pl); return px >= f && (px - f) % pl.pxPerUni === 0; };
+    // « ▲ à cheval » ne concerne QUE les sorties seules qui tombent au milieu d'un univers.
+    // Une sortie chaînée est censée reprendre juste après la précédente : c'est le but,
+    // pas un défaut — la signaler donnait un avertissement permanent sur une tournette.
+    const alignedOf = pl => pl.outputs.every((o, i) => !o.len || i === 0 || chainedTo(pl.outputs, i) || startsUniverse(o.start, pl));
+    // ⛓ une sortie est « chaînée » quand ses pixels reprennent exactement là où s'arrête
+    // celle du dessus : les deux forment alors une seule fixture continue à la console
+    // (tournette int + ext). Rien à mémoriser — c'est le plan de pixels lui-même qui le dit.
+    const chainedTo = (outs, i) => i > 0 && outs[i - 1].len > 0 && outs[i].len > 0 && outs[i].start === outs[i - 1].start + outs[i - 1].len;
     // ── one table per group, node cell spanning its output rows (merged-cell look), one Save button for the tab ──
     const sel = (name, map, cur) => `<select data-out="${name}" data-orig="${cur}">${Object.entries(map).map(([v, l]) => `<option value="${v}" ${Number(v) === Number(cur) ? 'selected' : ''}>${esc(l)}</option>`).join('')}${map[cur] === undefined ? `<option value="${cur}" selected>type ${cur}</option>` : ''}</select>`;
     const nodeCell = (n, span) => {
       const pl = n.plan, rec = nodeRec(n.ip); const cur = c => { const st = pending.get(pkey(n.ip, c.id)); return st ? st.value : (rec ? get(rec, c.path) : undefined); };
       const mode = cur(colDmx.mode), uni = cur(colDmx.uni) ?? pl.uni, addr = cur(colDmx.addr) ?? pl.addr, mA = cur(colDmx.mA) ?? '';
       const inConflict = inConflictOf(n), aligned = pl.multi && alignedOf(pl);
+      // deux lignes, réglages à plat : un node à une seule sortie ne doit pas occuper la
+      // hauteur de huit lignes de tableau (2026-09-08)
       return `<td class="ncell" rowspan="${span}" data-nodecell="${esc(n.ip)}">
-        <div class="ncell-name"><b>${esc(n.name || n.ip)}</b></div>
-        <div class="muted" style="font-size:11px">${esc(n.ip)}${pl.multi ? ` · univers <b>${pl.firstUni}–${pl.lastUni}</b> · ${pl.total} px` : ''}</div>
-        <div class="ncell-st"><span class="st-bad cf" title="un autre node écoute un de ces univers (état des champs à l'écran)" ${inConflict ? '' : 'hidden'}>✗ conflit</span>${pl.multi && !aligned ? ' <span class="st-warn" title="une sortie suivante commence au milieu d\'un univers">▲ à cheval</span>' : ''}${n.live ? ` <span class="st-ok" title="flux temps réel reçu de ${esc(n.lip)}">● ${esc(n.lm)}</span>` : ''}</div>
+        <div class="ncell-name" style="display:flex;align-items:center;gap:6px;flex-wrap:wrap"><b>${esc(n.name || n.ip)}</b>
+          <span class="ncell-st"><span class="st-bad cf" title="un autre node écoute une partie des mêmes canaux (état des champs à l'écran)" ${inConflict ? '' : 'hidden'}>✗ conflit</span>${pl.multi && !aligned ? ' <span class="st-warn" title="une sortie ne commence pas sur un début d\'univers : à la console, une fixture reste à cheval">▲ à cheval</span>' : ''}${n.live ? ` <span class="st-ok" title="flux temps réel reçu de ${esc(n.lip)}">● ${esc(n.lm)}</span>` : ''}</span>
+          <span class="muted" style="font-size:10.5px">${esc(n.ip)}${pl.multi ? ` · ${pl.total} px` : ''}</span></div>
         <div class="ncell-set">
-          <label><span class="lbl">mode</span><select data-nb="dmxmode" data-orig="${esc(String(mode ?? ''))}">${Object.entries(colDmx.mode.enum).map(([v, l]) => `<option value="${v}" ${Number(v) === Number(mode) ? 'selected' : ''}>${esc(l)}</option>`).join('')}</select></label>
-          <label><span class="lbl">univers</span><input type="number" data-nb="dmxuni" data-orig="${esc(String(uni))}" min="1" max="63999" value="${esc(String(uni))}"></label>
-          <label><span class="lbl">adresse</span><input type="number" data-nb="dmxaddr" data-orig="${esc(String(addr))}" min="1" max="512" value="${esc(String(addr))}"></label>
-          <label><span class="lbl">mA max</span><input type="number" data-nb="maxpwr" data-orig="${esc(String(mA))}" min="0" step="50" value="${esc(String(mA))}"></label>
-        </div>${pl.multi && !aligned ? `<button class="rowbtn" data-align="${esc(n.ip)}" title="décale le départ de chaque sortie au début d'un univers (${pl.pxPerUni} px par univers) sans changer son nombre de pixels : les index laissés libres ne pilotent rien. Sauvegarde prise avant.">≡ univers entiers</button>` : ''}</td>`;
+          <select data-nb="dmxmode" data-orig="${esc(String(mode ?? ''))}" title="mode DMX du node">${Object.entries(colDmx.mode.enum).map(([v, l]) => `<option value="${v}" ${Number(v) === Number(mode) ? 'selected' : ''}>${esc(l)}</option>`).join('')}</select>
+          <label title="univers de départ"><span class="lbl">u</span><input type="number" data-nb="dmxuni" data-orig="${esc(String(uni))}" min="1" max="63999" value="${esc(String(uni))}"></label>
+          <label title="adresse de départ dans cet univers : c'est elle qui permet de loger plusieurs nodes courts dans un même univers"><span class="lbl">adr</span><input type="number" data-nb="dmxaddr" data-orig="${esc(String(addr))}" min="1" max="512" value="${esc(String(addr))}"></label>
+          <label title="limite de courant du node (mA)"><span class="lbl">mA</span><input type="number" data-nb="maxpwr" data-orig="${esc(String(mA))}" min="0" step="50" value="${esc(String(mA))}"></label>
+        </div></td>`;
     };
     const profileOptions = cur => `<option value="">profil…</option>${ledProfilesCache.map(pr => `<option value="${esc(pr.id)}" ${pr.id === cur ? 'selected' : ''}>${esc(pr.name)}</option>`).join('')}<option value="__new">＋ enregistrer cette ligne comme profil…</option>${ledProfilesCache.length ? '<option value="__manage">gérer les profils…</option>' : ''}`;
     const outRow = (n, o, r, i, first, span) => {
-      const pl = n.plan; const next = pl.outputs[i + 1];
-      const midNext = next && next.len && pl.multi && ((next.start) % pl.pxPerUni !== 0);
-      const uniTxt = !o.len ? '' : o.universes > 1 ? `<span class="${midNext ? 'st-warn' : 'muted'}" title="${midNext ? 'la sortie suivante commence au milieu d\'un univers : à la console, une fixture continue' : 'cette sortie occupe plusieurs univers'}">${o.universes} univers</span>` : '<span class="st-ok">1 univers</span>';
+      const pl = n.plan;
       const pid = profileIdFor(o, r), unknown = !pid && !o.ignored && o.len;
-      return `<tr data-outrow="${i}" data-node="${esc(n.ip)}" class="${o.ignored ? 'offline' : ''}${first ? ' first' : ''}">${first ? nodeCell(n, span) : ''}
-        <td><label class="chip" title="utilisée = câblée. Décocher une sortie qui existe dans WLED mais n'est pas branchée : grisée, hors conflits. Mémorisé sur le node (marqueur dans son MQTT device topic), rien d'autre n'est écrit."><input type="checkbox" data-ignore="${o.start}" ${o.ignored ? '' : 'checked'}> Sortie ${o.i + 1}</label></td>
+      const linked = chainedTo(pl.outputs, i);
+      const offBoundary = i > 0 && !linked && o.aligned === false; // seule ET au milieu d'un univers
+      const uniTxt = !o.len ? '' : o.universes > 1 ? `<span class="${offBoundary ? 'st-warn' : 'muted'}" title="${offBoundary ? 'sortie seule qui commence au milieu d\'un univers : à la console elle reste à cheval' : 'cette sortie occupe plusieurs univers'}">${o.universes} univers</span>` : '<span class="st-ok">1 univers</span>';
+      const wsw = (r.order || 0) >> 4, hasW = WHITE_SWAP_TYPES.includes(Number(r.type));
+      // la colonne de chaînage passe AVANT la cellule de node (qui porte le rowspan) :
+      // l'ordre doit suivre celui des <th>, sinon tout le tableau glisse d'une colonne
+      return `<tr data-outrow="${i}" data-node="${esc(n.ip)}" class="${o.ignored ? 'offline' : ''}${first ? ' first' : ''}${linked ? ' chained' : ''}">
+        <td class="chaincell${linked ? ' linked' : ''}" data-chain="${i}" title="${i === 0 ? 'première sortie du node : rien au-dessus à quoi la chaîner' : linked ? 'chaînée : ses pixels reprennent juste après ceux de la sortie du dessus, les deux forment une seule fixture continue à la console. Cliquer pour la détacher (elle repartira sur un début d\'univers).' : 'sortie seule. Cliquer pour la chaîner à celle du dessus : ses pixels reprendront juste après, sans trou — le cas de deux sorties d\'un même assemblage (tournette int + ext).'}">${i === 0 ? '' : `<span class="chainmark">${linked ? '⛓' : '⊘'}</span>`}</td>
+        ${first ? nodeCell(n, span) : ''}
+        <td><label class="chip" title="utilisée = câblée. Décocher une sortie qui existe dans WLED mais n'est pas branchée : grisée, et les canaux qu'elle occuperait ne sont plus réservés (hors conflits). Mémorisé sur le node (marqueur dans son MQTT device topic), rien d'autre n'est écrit."><input type="checkbox" data-ignore="${i}" ${o.ignored ? '' : 'checked'}> Sortie ${o.i + 1}</label></td>
         <td class="${unknown ? 'newprof' : ''}"><select data-prof title="${unknown ? 'profil inconnu de la bibliothèque locale : ce type/ordre/pixels ne correspond à aucun profil enregistré ici → ＋ enregistrer cette ligne comme profil pour le retrouver la prochaine fois.' : 'profil de LED : ce qui est branché sur cette sortie ; choisir un profil remplit type, ordre et pixels, et le node s\'en souvient (MQTT client id). Sans choix, Fleet reconnaît un profil quand la ligne y correspond exactement.'}">${profileOptions(pid)}</select></td>
-        <td class="muted" title="GPIO de la sortie">${esc(o.pin)}</td>
+        <td class="muted adv" title="GPIO de la sortie">${esc(o.pin)}</td>
         <td>${sel('type', LED_TYPES, r.type)}</td>
-        <td><input type="number" data-out="ledma" data-orig="${r.ledma ?? 55}" value="${r.ledma ?? 55}" min="0" style="width:60px" title="mA par LED (Auto Brightness Limiter) : consommation max estimée d'une LED de ce câble, pleine luminosité blanc plein. 55 = valeur WLED par défaut (WS2812 générique) ; mettre la valeur du fabricant si connue."></td>
+        <td class="adv"><input type="number" data-out="ledma" data-orig="${r.ledma ?? 55}" value="${r.ledma ?? 55}" min="0" title="mA par LED (Auto Brightness Limiter) : consommation max estimée d'une LED de ce câble, pleine luminosité blanc plein. 55 = valeur WLED par défaut (WS2812 générique) ; mettre la valeur du fabricant si connue."></td>
         <td>${sel('order', COLOR_ORDERS, (r.order || 0) & 0x0f)}</td>
-        <td><input type="number" data-out="start" data-orig="${o.start}" value="${o.start}" min="0" title="index du premier pixel de cette sortie dans le node"></td>
+        <td>${hasW ? sel('wswap', WHITE_SWAPS, wsw) : `<input type="hidden" data-out="wswap" data-orig="${wsw}" value="${wsw}"><span class="muted" title="ce type de LED n'a pas de canal blanc : WLED ne propose l'échange que sur les types numériques RGBW">—</span>`}</td>
+        <td><input type="number" data-out="start" data-orig="${o.start}" value="${o.start}" min="0" title="index du premier pixel de cette sortie dans le node (0 = premier)"></td>
         <td><span style="display:inline-flex;align-items:center;gap:4px"><input type="number" data-out="len" data-orig="${o.len}" value="${o.len}" min="1" title="nombre de pixels sur ce câble"><button class="rowbtn" data-calc="1" title="calculer : LEDs par mètre × longueur">📏</button><button class="rowbtn${locating && locating.ip === n.ip && locating.index === i ? ' primary' : ''}" data-locate="1" title="allumer le dernier pixel de cette sortie en blanc (le reste en bleu léger) sur le vrai node, pour compter en changeant Pixels et en regardant où ça s'arrête sur le ruban">📍</button></span></td>
         <td><label class="chip"><input type="checkbox" data-out="rev" data-orig="${r.rev ? 1 : 0}" ${r.rev ? 'checked' : ''}> inversée</label></td>
-        <td><input type="number" data-out="skip" data-orig="${r.skip || 0}" value="${r.skip || 0}" min="0" style="width:55px" title="Skip first LEDs : nombre de LEDs en tête de câble à ignorer (câblées mais non pilotées, ex. avant un connecteur)"></td>
-        <td><label class="chip"><input type="checkbox" data-out="ref" data-orig="${r.ref ? 1 : 0}" ${r.ref ? 'checked' : ''} title="Off Refresh : force un rafraîchissement du signal même à l'extinction (certaines LEDs/récepteurs en ont besoin pour ne pas clignoter ou perdre leur dernière couleur)"> off refresh</label></td>
+        <td class="adv"><input type="number" data-out="skip" data-orig="${r.skip || 0}" value="${r.skip || 0}" min="0" title="Skip first LEDs : nombre de LEDs en tête de câble à ignorer (câblées mais non pilotées, ex. avant un connecteur)"></td>
+        <td class="adv"><label class="chip"><input type="checkbox" data-out="ref" data-orig="${r.ref ? 1 : 0}" ${r.ref ? 'checked' : ''} title="Off Refresh : force un rafraîchissement du signal même à l'extinction (certaines LEDs/récepteurs en ont besoin pour ne pas clignoter ou perdre leur dernière couleur)"> off refresh</label></td>
         <td class="oc-addr"><span class="addr"><b>${esc(o.from || '')}</b> → <b>${esc(o.to || '')}</b></span> <span class="straddle">${uniTxt}</span></td></tr>`;
     };
     const groupTable = gc => {
-      const head = `<thead><tr><th>Node</th><th>Sortie</th><th title="profil de LED : type + ordre + pixels mémorisés sous un nom">Profil</th><th>Pin</th><th>Type</th><th title="Auto Brightness Limiter : mA par LED à pleine luminosité, pour estimer/limiter la consommation">mA/LED</th><th>Ordre</th><th title="index du premier pixel dans le node (0 = premier)">Départ</th><th title="pixels sur ce câble ; 📏 = calculateur">Pixels</th><th></th><th>Skip</th><th>Off Refresh</th><th title="univers.canal du premier et du dernier pixel : ce qu'il faut patcher à la console (recalculé en direct)">Adresse console (de → à)</th></tr></thead>`;
+      const head = `<thead><tr><th title="chaînage : ⛓ pixels collés à la sortie du dessus (une seule fixture), ⊘ sortie seule"></th><th>Node</th><th>Sortie</th><th title="profil de LED : type + ordre + pixels mémorisés sous un nom">Profil</th><th class="adv">Pin</th><th>Type</th><th class="adv" title="Auto Brightness Limiter : mA par LED à pleine luminosité, pour estimer/limiter la consommation">mA/LED</th><th>Ordre</th><th title="échange du canal blanc (WLED : Swap) — proposé seulement sur les types numériques à canal blanc">Swap W</th><th title="index du premier pixel dans le node (0 = premier)">Départ</th><th title="pixels sur ce câble ; 📏 = calculateur, 📍 = repérer le dernier pixel">Pixels</th><th title="sens de parcours du ruban">Inv.</th><th class="adv">Skip</th><th class="adv">Off Refresh</th><th title="univers.canal du premier et du dernier pixel : ce qu'il faut patcher à la console (recalculé en direct)">Adresse console (de → à)</th></tr></thead>`;
+      const NCOL = 15; // colonnes après la cellule Node
       const body = gc.nodes.map(n => {
         const pl = n.plan; const rec = nodeRec(n.ip); const rawIns = (rec && rec.cfg && rec.cfg.hw && rec.cfg.hw.led && rec.cfg.hw.led.ins) || [];
-        if (!pl.multi) return `<tr data-node="${esc(n.ip)}">${nodeCell(n, 1)}<td colspan="12" class="muted">mode ${esc(modeName(pl.mode))} : ${esc(pl.note)}</td></tr>`;
+        if (!pl.multi) return `<tr data-node="${esc(n.ip)}"><td class="chaincell"></td>${nodeCell(n, 1)}<td colspan="${NCOL - 1}" class="muted">mode ${esc(modeName(pl.mode))} : ${esc(pl.note)}</td></tr>`;
         const outs = pl.outputs; const span = Math.max(1, outs.length);
-        if (!outs.length) return `<tr data-node="${esc(n.ip)}">${nodeCell(n, 1)}<td colspan="12" class="muted">aucune sortie déclarée</td></tr>`;
+        if (!outs.length) return `<tr data-node="${esc(n.ip)}"><td class="chaincell"></td>${nodeCell(n, 1)}<td colspan="${NCOL - 1}" class="muted">aucune sortie déclarée</td></tr>`;
         return outs.map((o, i) => outRow(n, o, rawIns[i] || {}, i, i === 0, span)).join('');
       }).join('');
       const ns = gc.nodes.filter(n => n.plan.multi);
       const minU = ns.length ? Math.min(...ns.map(n => n.plan.firstUni)) : null, maxU = ns.length ? Math.max(...ns.map(n => n.plan.lastUni)) : null;
       const total = ns.reduce((a, n) => a + n.plan.total, 0), conf = ns.some(inConflictOf);
       const gi = gCards.indexOf(gc);
-      const ap = ns.length ? `<button class="rowbtn" data-autopatch="${gi}" title="calcule les départs pour que chaque sortie commence sur un nouvel univers, enchaîne les nodes du groupe sur des univers consécutifs, met l'adresse à 1 et ajuste le mode DMX (RGB / RGBW) au type de LED. Rien n'est écrit : vérifier, puis Enregistrer.">⚡ Autopatch</button>` : '';
-      const title = `<div class="gc-title" style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">${gc.g ? `<b>${esc(gc.g)}</b> <span class="muted">${gc.nodes.length} node${gc.nodes.length > 1 ? 's' : ''}${ns.length ? ` · univers ${minU}–${maxU} · ${total} px` : ''}</span>` : `<span class="muted">node solo</span>`}<span class="st-bad gcf" data-gi="${gi}" ${conf ? '' : 'hidden'}>✗ conflit</span>${ap}</div>`;
-      return `<div class="gtable">${title}<div style="overflow-x:auto"><table class="outs">${head}<tbody>${body}</tbody></table></div></div>`;
+      const ap = ns.length ? `<button class="rowbtn" data-autopatch="${gi}" title="recalcule les départs, les univers et les adresses de ce groupe — et de lui seul. Un récapitulatif node par node s'affiche d'abord : rien n'est modifié tant que tu n'as pas choisi, et rien n'est écrit tant que tu n'as pas cliqué Enregistrer.">⚡ Patcher…</button>` : '';
+      const advBtn = `<button class="rowbtn" data-adv="${gi}" title="afficher / masquer les colonnes de réglage rares : pin, mA/LED, skip, off refresh">⚙</button>`;
+      const summary = `<summary><span class="caret">▸</span> ${gc.g ? `<b>${esc(gc.g)}</b> <span class="muted">${gc.nodes.length} node${gc.nodes.length > 1 ? 's' : ''}${ns.length ? ` · univers ${minU}–${maxU} · ${total} px` : ''}</span>` : `<span class="muted">node solo${ns.length ? ` · univers ${minU}–${maxU} · ${total} px` : ''}</span>`} <span class="st-bad gcf" data-gi="${gi}" ${conf ? '' : 'hidden'}>✗ conflit</span> ${ap}${advBtn}</summary>`;
+      return `<div class="gtable"><details data-key="dmx:${esc(gc.g || ('solo:' + gc.nodes[0].ip))}" open>${summary}<div style="overflow-x:auto"><table class="outs noadv" data-gi="${gi}">${head}<tbody>${body}</tbody></table></div></details></div>`;
     };
     const cards = gCards.map(groupTable).join('');
     const kept = keepDetails(p);
-    p.innerHTML = `<h2>Sorties / DMX <span class="muted" style="text-transform:none;letter-spacing:0" title="En mode Multi, WLED enchaîne les pixels sur des univers consécutifs (170 RGB ou 128 RGBW par univers) à partir de l'univers et de l'adresse de départ du node. L'univers d'une sortie découle donc de la longueur des sorties précédentes. Les sorties existent déjà sur les boîtiers : ici on règle ce qui est branché dessus (profil ou type, ordre, pixels) et les réglages DMX du node. ⚡ Autopatch calcule les départs (une sortie = un nouvel univers, nodes d'un groupe à la suite). Un seul bouton enregistre tout ce qui a changé.">ⓘ</span><span class="spacer"></span><button id="dmxSave" class="primary" disabled title="écrit sur chaque node modifié : ses sorties (bloc complet, sauvegarde prise avant) et ses réglages DMX (via la mise en attente et Déployer)">Enregistrer les modifications</button></h2>
+    p.innerHTML = `<h2>Sorties / DMX <span class="muted" style="text-transform:none;letter-spacing:0" title="En mode Multi, WLED enchaîne les pixels sur des univers consécutifs (170 RGB ou 128 RGBW par univers) à partir de l'univers et de l'adresse de départ du node. L'univers d'une sortie découle donc de la longueur des sorties précédentes. Les sorties existent déjà sur les boîtiers : ici on règle ce qui est branché dessus (profil ou type, ordre, pixels) et les réglages DMX du node. ⛓ chaîne une sortie à celle du dessus (pixels collés = une seule fixture à la console), ⊘ la laisse seule. ⚡ Patcher recalcule un groupe — et lui seul — après t'avoir montré ce qui change. ⚙ déplie les colonnes rares. Un seul bouton enregistre tout ce qui a changé.">ⓘ</span><span class="spacer"></span><button id="dmxSave" class="primary" disabled title="écrit sur chaque node modifié : ses sorties (bloc complet, sauvegarde prise avant) et ses réglages DMX (via la mise en attente et Déployer)">Enregistrer les modifications</button></h2>
       ${conflicts}${cards || '<div class="muted">aucun node avec une config lue</div>'}`;
     kept.restore();
     // live recomputation of universe.address while editing, same arithmetic as the server
@@ -1106,13 +1131,22 @@
       return { ...pl, multi: true, mode, chPerPx: cp, pxPerUni: Math.floor(512 / cp), uni: Number(cell.querySelector('[data-nb=dmxuni]').value) || 1, addr: Number(cell.querySelector('[data-nb=dmxaddr]').value) || 1 };
     };
     const rowsOf = ip => [...p.querySelectorAll(`tr[data-outrow][data-node="${CSS.escape(ip)}"]`)];
-    const recompute = ip => { const pl = livePlan(ip); if (!pl || !pl.multi) return; const loc = locateFn(pl); rowsOf(ip).forEach(tr => {
-      const start = Number(tr.querySelector('[data-out=start]').value), len = Number(tr.querySelector('[data-out=len]').value);
-      if (!(len > 0) || !(start >= 0)) return;
-      const a = loc(start), b = loc(start + len - 1);
-      tr.querySelector('.addr').innerHTML = `<b>${a.u}.${a.ch}</b> → <b>${b.u}.${b.ch + pl.chPerPx - 1}</b>`;
-      tr.querySelector('.straddle').innerHTML = b.u !== a.u ? `<span class="muted">${b.u - a.u + 1} univers</span>` : '<span class="st-ok">1 univers</span>';
-    }); };
+    // valeurs d'une ligne, telles qu'affichées (pas celles du dernier relevé)
+    const rowVals = tr => ({ start: Number(tr.querySelector('[data-out=start]').value), len: Number(tr.querySelector('[data-out=len]').value), used: (() => { const ig = tr.querySelector('input[data-ignore]'); return !ig || ig.checked; })() });
+    const recompute = ip => { const pl = livePlan(ip); if (!pl || !pl.multi) return; const loc = locateFn(pl); const rows = rowsOf(ip);
+      rows.forEach((tr, i) => {
+        const { start, len } = rowVals(tr);
+        // ⛓ l'état de chaînage suit les valeurs à l'écran, pas le dernier relevé
+        const prev = i > 0 ? rowVals(rows[i - 1]) : null;
+        const linked = !!(prev && prev.len > 0 && len > 0 && start === prev.start + prev.len);
+        const cell = tr.querySelector('td.chaincell');
+        if (cell && i > 0) { cell.classList.toggle('linked', linked); cell.innerHTML = `<span class="chainmark">${linked ? '⛓' : '⊘'}</span>`; }
+        tr.classList.toggle('chained', linked);
+        if (!(len > 0) || !(start >= 0)) return;
+        const a = loc(start), b = loc(start + len - 1);
+        tr.querySelector('.addr').innerHTML = `<b>${a.u}.${a.ch}</b> → <b>${b.u}.${b.ch + pl.chPerPx - 1}</b>`;
+        tr.querySelector('.straddle').innerHTML = b.u !== a.u ? `<span class="${startsUniverse(start, pl) ? 'muted' : 'st-warn'}">${b.u - a.u + 1} univers</span>` : '<span class="st-ok">1 univers</span>';
+      }); };
     // dirty tracking: anything that differs from its data-orig enables the one Save button
     const changedNodes = () => {
       const set = new Set();
@@ -1122,13 +1156,45 @@
       });
       return [...set].filter(Boolean);
     };
-    const liveConflicts = () => {
-      const map = new Map();
-      for (const n of d.nodes) {
-        const pl = livePlan(n.ip); if (!pl || !pl.multi) continue; const loc = locateFn(pl);
-        rowsOf(n.ip).forEach(tr => { const ig = tr.querySelector('input[data-ignore]'); if (ig && !ig.checked) return; const start = Number(tr.querySelector('[data-out=start]').value), len = Number(tr.querySelector('[data-out=len]').value); if (!(len > 0) || !(start >= 0)) return; const a = loc(start).u, b = loc(start + len - 1).u; for (let u = a; u <= b; u++) { if (!map.has(u)) map.set(u, new Set()); map.get(u).add(n.name || n.ip); } });
+    // canaux qu'un node réserve vraiment, d'après les champs à l'écran (mêmes règles que
+    // dmx.js côté serveur : une sortie décochée ne réserve rien, et le découpage suit la
+    // capacité réelle du premier univers)
+    const liveOccupancy = ip => {
+      const pl = livePlan(ip); if (!pl || !pl.multi) return [];
+      const loc = locateFn(pl), out = [];
+      for (const tr of rowsOf(ip)) {
+        const { start, len, used } = rowVals(tr);
+        if (!used || !(len > 0) || !(start >= 0)) continue;
+        const a = loc(start), b = loc(start + len - 1);
+        for (let u = a.u; u <= b.u; u++) {
+          const from = u === a.u ? a.ch : 1;
+          // dernier pixel de cette sortie qui tombe dans l'univers u
+          const to = u === b.u ? b.ch + pl.chPerPx - 1 : (() => { let px = start + len - 1; while (px > start && loc(px).u > u) px--; return loc(px).ch + pl.chPerPx - 1; })();
+          out.push({ u, from, to });
+        }
       }
-      return [...map].filter(([, x]) => x.size > 1).map(([universe, x]) => ({ universe, nodes: [...x] })).sort((a, b) => a.universe - b.universe);
+      return out;
+    };
+    const liveConflicts = () => {
+      const byUni = new Map();
+      for (const n of d.nodes) for (const iv of liveOccupancy(n.ip)) {
+        if (!byUni.has(iv.u)) byUni.set(iv.u, []);
+        byUni.get(iv.u).push({ node: n.name || n.ip, from: iv.from, to: iv.to });
+      }
+      const out = [];
+      for (const [u, list] of byUni) {
+        const sorted = [...list].sort((a, b) => a.from - b.from || a.to - b.to);
+        for (let i = 0; i < sorted.length; i++) for (let j = i + 1; j < sorted.length; j++) {
+          const a = sorted[i], b = sorted[j];
+          if (a.node === b.node) continue;
+          if (b.from > a.to) break;
+          const from = b.from, to = Math.min(a.to, b.to);
+          const seen = out.find(c => c.universe === u && c.nodes.includes(a.node) && c.nodes.includes(b.node));
+          if (seen) { seen.from = Math.min(seen.from, from); seen.to = Math.max(seen.to, to); }
+          else out.push({ universe: u, from, to, nodes: [a.node, b.node] });
+        }
+      }
+      return out.sort((a, b) => a.universe - b.universe || a.from - b.from);
     };
     const renderConflicts = () => {
       const list = liveConflicts(); const box = $('#dmxConflicts'); if (box) { box.innerHTML = conflictsHtml(list); box.style.borderColor = list.length ? 'var(--bad)' : ''; }
@@ -1137,12 +1203,33 @@
       p.querySelectorAll('.gcf').forEach(el => { const gc = gCards[Number(el.dataset.gi)]; el.hidden = !gc.nodes.some(n => bad.has(n.name || n.ip)); });
     };
     const refreshDirty = () => { const n = changedNodes().length; const b = $('#dmxSave'); if (b) { b.disabled = !n; b.textContent = n ? `Enregistrer les modifications (${n} node${n > 1 ? 's' : ''})` : 'Enregistrer les modifications'; } };
-    p.querySelectorAll('[data-out],[data-nb]').forEach(el => { el.oninput = el.onchange = () => { const tr = el.closest('tr'); if (tr && tr.dataset.node) recompute(tr.dataset.node); refreshDirty(); renderConflicts(); if (tr && (el.dataset.out === 'len' || el.dataset.out === 'rev')) sendLocateUpdate(tr); }; });
+    // Allonger une sortie doit pousser celles qui lui sont chaînées : sinon la chaîne se
+    // brise en silence et les deux sorties finissent par se recouvrir. On relit la classe
+    // .chained AVANT que recompute() ne la recalcule, donc l'état d'avant l'édition.
+    const pushChained = tr => {
+      const rows = rowsOf(tr.dataset.node), i = rows.indexOf(tr);
+      if (i < 0) return;
+      let boundary = rowVals(tr).start + rowVals(tr).len;
+      for (let j = i + 1; j < rows.length; j++) {
+        if (!rows[j].classList.contains('chained')) break;
+        const el = rows[j].querySelector('[data-out=start]');
+        if (Number(el.value) !== boundary) el.value = String(boundary); // sans redispatch : on descend nous-mêmes
+        boundary += rowVals(rows[j]).len;
+      }
+    };
+    p.querySelectorAll('[data-out],[data-nb]').forEach(el => { el.oninput = el.onchange = () => {
+      const tr = el.closest('tr');
+      if (tr && tr.dataset.node && (el.dataset.out === 'len' || el.dataset.out === 'start')) pushChained(tr);
+      if (tr && tr.dataset.node) recompute(tr.dataset.node);
+      refreshDirty(); renderConflicts();
+      if (tr && (el.dataset.out === 'len' || el.dataset.out === 'rev')) sendLocateUpdate(tr);
+    }; });
     // "comptée" checkboxes: Fleet-only, saved at once, conflicts recomputed
     p.querySelectorAll('input[data-ignore]').forEach(cb => cb.onchange = async () => {
       const ip = cb.closest('tr').dataset.node;
-      const starts = rowsOf(ip).map(tr => tr.querySelector('input[data-ignore]')).filter(x => !x.checked).map(x => Number(x.dataset.ignore));
-      try { const r = await post(`/api/node/${encodeURIComponent(ip)}/outputs-ignore`, { starts }); toast(r.queued ? 'node hors ligne : sera proposé au retour (⏳ sur la ligne)' : (starts.length ? `${starts.length} sortie(s) non utilisée(s), mémorisé sur le node` : 'toutes les sorties utilisées')); }
+      // par POSITION : ⚡ Patcher change les départs, un drapeau par index de départ sautait de ligne
+      const indexes = rowsOf(ip).map(tr => tr.querySelector('input[data-ignore]')).filter(x => !x.checked).map(x => Number(x.dataset.ignore));
+      try { const r = await post(`/api/node/${encodeURIComponent(ip)}/outputs-ignore`, { indexes }); toast(r.queued ? 'node hors ligne : sera proposé au retour (⏳ sur la ligne)' : (indexes.length ? `${indexes.length} sortie(s) non utilisée(s), mémorisé sur le node` : 'toutes les sorties utilisées')); }
       catch (e) { toast(e.message, true); cb.checked = !cb.checked; return; }
       cb.closest('tr').classList.toggle('offline', !cb.checked); renderConflicts(); // in place: the unsaved edits of the page stay
     });
@@ -1183,28 +1270,158 @@
       try { await post(`/api/node/${encodeURIComponent(ip)}/locate-pixel`, { index, len, rev }); toast('sortie repérée : dernier pixel en blanc sur le node — ajuster Pixels pour le déplacer (la sortie suivante collée se décale le temps du repérage), 📍 pour arrêter'); }
       catch (e) { toast(e.message, true); locating = null; b.classList.remove('primary'); }
     });
-    // ⚡ autopatch: every output starts on a fresh universe ; nodes of a group chain on consecutive universes
-    p.querySelectorAll('button[data-autopatch]').forEach(b => b.onclick = () => {
-      const gc = gCards[Number(b.dataset.autopatch)]; let uni = null; const notes = [];
-      for (const n of gc.nodes) {
-        const cell = p.querySelector(`[data-nodecell="${CSS.escape(n.ip)}"]`); const rowsN = rowsOf(n.ip); if (!cell || !rowsN.length) continue;
-        const modeEl = cell.querySelector('[data-nb=dmxmode]'); let mode = Number(modeEl.value);
-        const anyRgbw = rowsN.some(tr => rgbwTypes.includes(Number(tr.querySelector('[data-out=type]').value)));
-        const want = anyRgbw ? 6 : (mode === 5 ? 5 : 4);
-        if (!CPX[mode] || (anyRgbw && mode !== 6) || (!anyRgbw && mode === 6)) { mode = want; modeEl.value = String(mode); notes.push(`${n.name || n.ip} : mode → ${anyRgbw ? 'Multi RGBW' : 'Multi RGB'}`); }
-        const per = Math.floor(512 / CPX[mode]);
-        const uniEl = cell.querySelector('[data-nb=dmxuni]'), addrEl = cell.querySelector('[data-nb=dmxaddr]');
-        if (uni === null) uni = Number(uniEl.value) || 1; else uniEl.value = String(uni);
-        addrEl.value = '1';
-        let start = 0;
-        const used = rowsN.filter(tr => { const ig = tr.querySelector('input[data-ignore]'); return !ig || ig.checked; }), unused = rowsN.filter(tr => !used.includes(tr));
-        for (const tr of used) { const len = Number(tr.querySelector('[data-out=len]').value) || 0; tr.querySelector('[data-out=start]').value = String(start); start += Math.ceil(len / per) * per; }
-        const usedSlots = start / per;
-        for (const tr of unused) { const len = Number(tr.querySelector('[data-out=len]').value) || 0; tr.querySelector('[data-out=start]').value = String(start); start += Math.ceil(len / per) * per; } // parked after the used ones, they drive nothing
-        uni += usedSlots; // the next node starts right after the universes really in use
-        recompute(n.ip);
+    // ⚙ colonnes avancées (pin, mA/LED, skip, off refresh) : repliées par défaut
+    p.querySelectorAll('button[data-adv]').forEach(b => b.onclick = e => {
+      e.preventDefault(); e.stopPropagation(); // dans un <summary> : ne pas replier le groupe
+      const t = p.querySelector(`table.outs[data-gi="${b.dataset.adv}"]`); if (t) t.classList.toggle('noadv');
+    });
+    // ⛓ chaîner / détacher une sortie de celle du dessus. Chaîner = ses pixels reprennent
+    // juste après (une seule fixture continue à la console) ; détacher = elle repart sur un
+    // début d'univers. Rien n'est écrit : ça ne fait que poser le départ, comme à la main.
+    p.querySelectorAll('td.chaincell[data-chain]').forEach(td => td.onclick = () => {
+      const i = Number(td.dataset.chain); if (!i) return;
+      const tr = td.closest('tr'), ip = tr.dataset.node, rows = rowsOf(ip);
+      const pl = livePlan(ip); if (!pl || !pl.multi) return;
+      const prev = rowVals(rows[i - 1]); if (!(prev.len > 0)) return toast('la sortie du dessus n\'a pas de pixels', true);
+      const cur = rowVals(tr);
+      const glued = prev.start + prev.len;
+      let next;
+      if (cur.start === glued) { // détacher : au prochain début d'univers libre après la précédente
+        const f = firstUniPxOf(pl);
+        next = glued <= f ? f : f + Math.ceil((glued - f) / pl.pxPerUni) * pl.pxPerUni;
+        if (next === glued) next = glued + pl.pxPerUni; // déjà pile dessus : on saute un univers
+      } else next = glued;
+      const el = tr.querySelector('[data-out=start]'); el.value = String(next); el.dispatchEvent(new Event('input'));
+      // les suivantes qui étaient collées à celle-ci suivent le mouvement
+      let boundary = cur.start + cur.len, delta = next - cur.start;
+      for (let j = i + 1; j < rows.length; j++) {
+        const v = rowVals(rows[j]); if (v.start !== boundary) break;
+        const e2 = rows[j].querySelector('[data-out=start]'); e2.value = String(v.start + delta); e2.dispatchEvent(new Event('input'));
+        boundary = v.start + v.len;
       }
-      refreshDirty(); renderConflicts(); toast(`autopatch calculé${notes.length ? ' · ' + notes.join(' · ') : ''} — vérifier, puis Enregistrer`);
+    });
+    // ⚡ Patcher : remplace ⚡ Autopatch ET ≡ univers entiers. Ne touche QUE les nodes de sa
+    // carte, montre d'abord ce qui va changer node par node, et n'écrit jamais rien
+    // directement — c'est « Enregistrer les modifications » qui décide.
+    p.querySelectorAll('button[data-autopatch]').forEach(b => b.onclick = async e => {
+      e.preventDefault(); e.stopPropagation(); // dans un <summary>
+      const gc = gCards[Number(b.dataset.autopatch)];
+      const nodesG = gc.nodes.filter(n => p.querySelector(`[data-nodecell="${CSS.escape(n.ip)}"]`) && rowsOf(n.ip).length);
+      if (!nodesG.length) return;
+      // univers occupés par le RESTE de la flotte : l'ancien autopatch avançait à l'aveugle et
+      // pouvait poser le groupe sur les univers d'un autre, qui s'allumaient alors en conflit
+      const mine = new Set(nodesG.map(n => n.ip));
+      const busy = new Map(); // univers -> dernier canal pris par les autres
+      for (const n of d.nodes) { if (mine.has(n.ip)) continue; for (const iv of liveOccupancy(n.ip)) busy.set(iv.u, Math.max(busy.get(iv.u) || 0, iv.to)); }
+
+      const r = b.getBoundingClientRect();
+      const strat = await new Promise(resolve => {
+        let picked = null;
+        menuBox(r.left, r.bottom + 2, [
+          { label: '⚡ Serré — tasser au canal près', help: 'plusieurs nodes courts dans un même univers (4 boules de 36 px), sorties chaînées conservées', act: () => { picked = 'tight'; resolve('tight'); } },
+          { label: '≡ Une sortie = un univers', help: 'chaque sortie démarre sur un univers neuf : confortable pour les grandes lianes', act: () => { picked = 'uni'; resolve('uni'); } },
+        ]);
+        setTimeout(() => { const obs = setInterval(() => { if (!document.querySelector('.pop.menu')) { clearInterval(obs); if (!picked) resolve(null); } }, 120); }, 0);
+      });
+      if (!strat) return;
+
+      // Pose des pixels d'un node : une sortie chaînée reprend juste après la précédente,
+      // une sortie seule repart sur un début d'univers (qui dépend de l'adresse du node,
+      // d'où le paramètre addr). Les sorties décochées sont parquées à la fin : elles ne
+      // pilotent rien et ne doivent pas décaler les autres.
+      const layout = (rowsN, cp, addr) => {
+        const per = Math.floor(512 / cp), firstCap = Math.floor((512 - (addr - 1)) / cp);
+        const nextBoundary = px => px <= firstCap ? firstCap : firstCap + Math.ceil((px - firstCap) / per) * per;
+        const used = rowsN.filter(tr => rowVals(tr).used), unused = rowsN.filter(tr => !rowVals(tr).used);
+        const starts = new Map(); let px = 0;
+        for (let k = 0; k < used.length; k++) {
+          const tr = used[k], v = rowVals(tr);
+          const prev = k > 0 ? rowVals(used[k - 1]) : null;
+          const chained = strat === 'tight' && prev && v.start === prev.start + prev.len;
+          if (k > 0 && !chained) px = nextBoundary(px); // sortie seule (ou stratégie « un univers »)
+          starts.set(tr, px); px += v.len || 0;
+        }
+        let parked = nextBoundary(px);
+        for (const tr of unused) { starts.set(tr, parked); parked += Math.ceil((rowVals(tr).len || 0) / per) * per; }
+        return { starts, px };
+      };
+      // Cherche la première place libre à partir du curseur, en sautant ce que les AUTRES
+      // nodes occupent déjà — l'ancien autopatch avançait sans regarder et pouvait se poser
+      // sur eux. busy = univers -> dernier canal pris.
+      const place = (cursor, px, cp) => {
+        const per = Math.floor(512 / cp);
+        for (let guard = 0; guard < 2000; guard++) {
+          if (busy.has(cursor.u) && cursor.ch <= busy.get(cursor.u)) cursor.ch = busy.get(cursor.u) + 1;
+          if (cursor.ch + cp - 1 > 512) { cursor.u++; cursor.ch = 1; continue; }
+          const firstCap = Math.floor((512 - (cursor.ch - 1)) / cp);
+          const extraU = Math.max(0, Math.ceil((px - firstCap) / per));
+          let clash = false;
+          for (let k = 1; k <= extraU; k++) if (busy.has(cursor.u + k)) { clash = true; break; }
+          if (clash) { cursor.u++; cursor.ch = 1; continue; } // le débordement tomberait sur un autre node
+          const placed = { u: cursor.u, addr: cursor.ch };
+          if (extraU === 0) { cursor.ch += px * cp; }
+          else { const lastPx = px - firstCap - (extraU - 1) * per; cursor.u += extraU; cursor.ch = 1 + lastPx * cp; }
+          if (cursor.ch + cp - 1 > 512) { cursor.u++; cursor.ch = 1; }
+          return placed;
+        }
+        return { u: cursor.u, addr: 1 };
+      };
+
+      // simulation : rien n'est posé dans les champs avant confirmation
+      const sim = [];
+      let cursor = null;
+      for (const n of nodesG) {
+        const cell = p.querySelector(`[data-nodecell="${CSS.escape(n.ip)}"]`), rowsN = rowsOf(n.ip);
+        const modeEl = cell.querySelector('[data-nb=dmxmode]');
+        let mode = Number(modeEl.value);
+        const anyRgbw = rowsN.some(tr => rgbwTypes.includes(Number(tr.querySelector('[data-out=type]').value)));
+        const wantMode = anyRgbw ? 6 : (mode === 5 ? 5 : 4);
+        const modeChanged = !CPX[mode] || (anyRgbw && mode !== 6) || (!anyRgbw && mode === 6);
+        if (modeChanged) mode = wantMode;
+        const cp = CPX[mode];
+        const uniEl = cell.querySelector('[data-nb=dmxuni]'), addrEl = cell.querySelector('[data-nb=dmxaddr]');
+        if (!cursor) cursor = { u: Number(uniEl.value) || 1, ch: 1 }; // le premier node garde son univers
+        if (strat === 'uni' && cursor.ch > 1) { cursor.u++; cursor.ch = 1; }
+
+        // l'adresse dépend de la place trouvée, et les départs dépendent de l'adresse :
+        // deux passes suffisent à converger (la 1re sert juste à estimer la taille)
+        let myAddr = 1, lay = layout(rowsN, cp, 1), placed = null;
+        for (let pass = 0; pass < 2; pass++) {
+          const probe = { ...cursor };
+          placed = place(probe, lay.px, cp);
+          if (placed.addr === myAddr) break;
+          myAddr = placed.addr; lay = layout(rowsN, cp, myAddr);
+        }
+        placed = place(cursor, lay.px, cp); // pose réelle : le curseur avance
+        const starts = layout(rowsN, cp, placed.addr).starts;
+        const myUni = placed.u; myAddr = placed.addr;
+
+        const before = { uni: Number(uniEl.value) || 1, addr: Number(addrEl.value) || 1, mode: Number(modeEl.value) };
+        const startChanges = [...starts].filter(([tr, s]) => s !== rowVals(tr).start).length;
+        sim.push({ n, cell, rowsN, mode, modeChanged, uni: myUni, addr: myAddr, starts, before, startChanges,
+          changed: myUni !== before.uni || myAddr !== before.addr || modeChanged || startChanges > 0 });
+      }
+
+      const touched = sim.filter(s => s.changed);
+      if (!touched.length) return toast('déjà patché : rien à changer dans ce groupe');
+      const lines = touched.map(s => `• ${s.n.name || s.n.ip} : ${[
+        s.uni !== s.before.uni ? `univers ${s.before.uni} → ${s.uni}` : `univers ${s.uni}`,
+        s.addr !== s.before.addr ? `adresse ${s.before.addr} → ${s.addr}` : `adresse ${s.addr}`,
+        s.modeChanged ? `mode → ${modeName(s.mode)}` : '',
+        s.startChanges ? `${s.startChanges} départ(s) de sortie` : '',
+      ].filter(Boolean).join(', ')}`).join('\n');
+      const untouched = sim.length - touched.length;
+      if (!await confirmBox(`⚡ Patcher « ${gc.g || (gc.nodes[0].name || gc.nodes[0].ip)} » — ${strat === 'tight' ? 'serré' : 'une sortie = un univers'}\n\n${touched.length} node(s) modifié(s)${untouched ? `, ${untouched} inchangé(s)` : ''} :\n${lines}\n\nAucun autre groupe n'est touché. Rien n'est écrit maintenant : les champs sont remplis, à toi de vérifier puis d'Enregistrer.`, { tone: 'green', label: 'Remplir les champs' })) return;
+
+      for (const s of touched) {
+        if (s.modeChanged) s.cell.querySelector('[data-nb=dmxmode]').value = String(s.mode);
+        s.cell.querySelector('[data-nb=dmxuni]').value = String(s.uni);
+        s.cell.querySelector('[data-nb=dmxaddr]').value = String(s.addr);
+        for (const [tr, st] of s.starts) tr.querySelector('[data-out=start]').value = String(st);
+        recompute(s.n.ip);
+      }
+      refreshDirty(); renderConflicts();
+      toast(`${touched.length} node(s) recalculé(s) — vérifier, puis Enregistrer`);
     });
     // LED profiles: pick one to fill a row, save a row as a profile, or manage them
     const refreshProfileSelects = async () => {
@@ -1247,7 +1464,9 @@
       for (const ip of ips) {
         const n = d.nodes.find(x => x.ip === ip); const rows = rowsOf(ip);
         const outsChanged = rows.some(tr => [...tr.querySelectorAll('[data-out][data-orig]')].some(el => (el.type === 'checkbox' ? (el.checked ? '1' : '0') : String(el.value)) !== String(el.dataset.orig)));
-        const ins = outsChanged ? rows.map(tr => { const pl = n.plan; const o = pl.outputs[Number(tr.dataset.outrow)]; return { pin: o.pin, type: Number(tr.querySelector('[data-out=type]').value), order: Number(tr.querySelector('[data-out=order]').value), start: Number(tr.querySelector('[data-out=start]').value), len: Number(tr.querySelector('[data-out=len]').value), rev: tr.querySelector('[data-out=rev]').checked, skip: Number(tr.querySelector('[data-out=skip]').value) || 0, ledma: Number(tr.querySelector('[data-out=ledma]').value), ref: tr.querySelector('[data-out=ref]').checked }; }) : null;
+        // order et wswap partent séparément : le serveur recompose l'octet
+        // ((swap << 4) | ordre) sans écraser le quartet qu'on n'édite pas
+        const ins = outsChanged ? rows.map(tr => { const pl = n.plan; const o = pl.outputs[Number(tr.dataset.outrow)]; return { pin: o.pin, type: Number(tr.querySelector('[data-out=type]').value), order: Number(tr.querySelector('[data-out=order]').value), wswap: Number(tr.querySelector('[data-out=wswap]').value) || 0, start: Number(tr.querySelector('[data-out=start]').value), len: Number(tr.querySelector('[data-out=len]').value), rev: tr.querySelector('[data-out=rev]').checked, skip: Number(tr.querySelector('[data-out=skip]').value) || 0, ledma: Number(tr.querySelector('[data-out=ledma]').value), ref: tr.querySelector('[data-out=ref]').checked }; }) : null;
         const cell = p.querySelector(`[data-nodecell="${CSS.escape(ip)}"]`); const settings = [];
         for (const [id, col] of [['dmxmode', colDmx.mode], ['dmxuni', colDmx.uni], ['dmxaddr', colDmx.addr], ['maxpwr', colDmx.mA]]) { const el = cell && cell.querySelector(`[data-nb="${id}"]`); if (el && el.value !== '' && String(el.value) !== String(el.dataset.orig)) settings.push({ col, value: normalize(col, el.value) }); }
         plan.push({ ip, name: n.name || ip, ins, settings });
@@ -1263,18 +1482,10 @@
       if (staged) { updatePendingUI(); renderBody(); await deploy(); }
       setTimeout(renderDmx, 3000);
     };
-    p.querySelectorAll('button[data-align]').forEach(b => b.onclick = async () => {
-      const ip = b.dataset.align; const n = d.nodes.find(x => x.ip === ip); const pl = n.plan;
-      let st = 0; const preview = pl.outputs.filter(o => o.len).map(o => { const slots = Math.ceil(o.len / pl.pxPerUni); const line = `  sortie ${o.i + 1} (pin ${o.pin}) : ${o.len} px, départ ${o.start} → ${st} = univers ${pl.uni + st / pl.pxPerUni}${slots > 1 ? '-' + (pl.uni + st / pl.pxPerUni + slots - 1) : ''}`; st += slots * pl.pxPerUni; return line; }).join('\n');
-      if (!await confirmBox(`Aligner ${n.name || ip} sur « un univers par sortie » ?\n\n${preview}\n\nLe nombre de pixels de chaque sortie ne change pas ; les index laissés libres ne pilotent rien. Une sauvegarde de la flotte est prise avant. Continuer ?`)) return;
-      b.disabled = true; b.textContent = 'alignement…';
-      try {
-        await post('/api/snapshots', { name: `avant alignement ${n.name || ip}` });
-        const r = await post(`/api/node/${encodeURIComponent(ip)}/align-outputs`, {});
-        toast(`${n.name || ip} : ${r.changes.length} sortie(s) alignée(s), ${r.total} px déclarés`);
-      } catch (e) { toast(e.message, true); }
-      setTimeout(renderDmx, 4000);
-    });
+    // (supprimé 2026-09-08) bouton « ≡ univers entiers » : il écrivait sur le node dès la
+    // confirmation, alors que ⚡ Autopatch calculait la même chose sans rien écrire. Le geste
+    // est devenu la stratégie « une sortie = un univers » de ⚡ Patcher, qui passe comme tout
+    // le reste par « Enregistrer les modifications ».
   }
 
   // ── settings panel (settings.json, restart through the launcher) ───────────

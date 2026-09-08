@@ -226,19 +226,31 @@ ses sorties (bloc complet, sauvegarde de la flotte prise avant) et ses réglages
 DMX (via la mise en attente et Déployer, donc journal). Le calculateur **📏** : LEDs par mètre ×
 longueur → pixels, et le nombre d'univers que ça occupe pour ce type de LED
 (170 px RGB, 128 px RGBW par univers). Une sortie sur plusieurs univers est
-normale ; l'avertissement ▲ ne reste que si la sortie suivante commence au
-milieu d'un univers. **« ≡ univers entiers »** (dans la cellule du node quand ce
-n'est pas le cas) décale le *départ* de chaque sortie au début d'un univers sans
-toucher à son nombre de pixels : les index laissés libres (ex. 160-169) ne
-pilotent rien, la sortie suivante commence sur l'univers suivant, et la
-consommation estimée reste juste.
+normale ; l'avertissement ▲ ne reste que pour une sortie **seule** qui démarre
+au milieu d'un univers — une sortie chaînée est censée reprendre juste après la
+précédente, ce n'est pas un défaut.
 
-- **⚡ Autopatch** (par groupe, ou par node solo, les nodes sans groupe étant
-  considérés seuls) : chaque sortie commence sur un nouvel univers, les nodes
-  du groupe s'enchaînent sur des univers consécutifs (le premier garde son
-  univers de départ), adresse 1, et le mode DMX est mis en cohérence avec le
-  type de LED (Multi RGB / Multi RGBW, 170 ou 128 px par univers). Rien n'est
-  écrit : les champs sont remplis, on vérifie, on Enregistre.
+- **⛓ Chaînage** (colonne tout à gauche) : une sortie est *chaînée* quand ses
+  pixels reprennent exactement là où s'arrête celle du dessus. Les deux forment
+  alors **une seule fixture continue** à la console — le cas de deux sorties
+  d'un même assemblage (tournette intérieure + extérieure). ⊘ = sortie seule,
+  qui démarre sur un début d'univers. Un clic bascule l'un vers l'autre, et
+  allonger une sortie pousse celles qui lui sont chaînées. Rien à mémoriser :
+  l'état découle du plan de pixels lui-même.
+- **⚡ Patcher…** (par groupe, ou par node solo) : recalcule départs, univers,
+  adresses et mode DMX (Multi RGB / RGBW selon le type de LED) — **de ce groupe
+  et de lui seul**. Deux stratégies : *serré*, qui tasse au canal près en
+  gardant les chaînes (quatre boules de 36 px dans un univers : adresses 1, 109,
+  217, 325), et *une sortie = un univers*, l'ancien comportement. Les univers
+  déjà occupés par le **reste de la flotte** sont connus et évités. Un
+  récapitulatif node par node s'affiche avant toute modification, et rien n'est
+  écrit tant qu'on n'a pas cliqué Enregistrer.
+- **⚙** déplie les colonnes rares (pin, mA/LED, skip, off refresh) ; l'en-tête
+  d'un groupe se replie d'un clic en gardant son résumé.
+- **Swap W** : l'échange du canal blanc de WLED (aucun / W&B / W&G / W&R /
+  WW&CW), proposé sur les types numériques à canal blanc. Il est rangé dans le
+  quartet haut de `hw.led.ins[].order` — le lire sans le réécrire l'effaçait à
+  chaque enregistrement (corrigé le 2026-09-08).
 - **Profils de LED** (`led-profiles.json`, dans le showfile) : un nom pour ce
   qu'on branche (type, ordre, pixels). Sur une ligne de sortie, choisir le
   profil remplit type, ordre et pixels ; « enregistrer cette ligne comme
@@ -272,14 +284,14 @@ flotte. Endpoint : `POST /api/node/:ip/outputs {ins}`.
   Endpoints : `POST`/`DELETE /api/node/:ip/locate-pixel`.
 Dans WLED l'univers d'une sortie **n'est pas un réglage** : il découle du point
 de départ du node (`dmx.uni` / `dmx.addr`) et de la longueur des sorties qui
-précèdent. **≡ 1 univers par sortie** allonge chaque sortie à un multiple de
-170 px (128 en RGBW) pour qu'une sortie = un univers entier ; les pixels en
-trop n'existent pas physiquement (`POST /api/node/:ip/align-outputs`).
-**Sorties non comptées** (case « sortie N » décochée) : purement visuel dans
-Fleet, rien n'est écrit sur le node. Une sortie qui existe dans WLED mais
-n'est pas câblée est grisée et les univers qu'elle est seule à occuper sont
-exclus de la détection de conflits (mémorisé dans `known-nodes.json`,
-`POST /api/node/:ip/outputs-ignore {starts}`). Le reste de l'onglet : en mode
+précèdent. **Sorties non comptées** (case « sortie N » décochée) : purement
+visuel dans Fleet, rien n'est écrit sur le node. Une sortie qui existe dans WLED
+mais n'est pas câblée est grisée et **ne réserve aucun canal**, donc ne peut pas
+provoquer de conflit — c'est ce qui permet à un autre node d'occuper la place
+qu'elle aurait prise. Les sorties sont repérées par **position** (`{indexes}`,
+0-based) et non par index de départ, sinon ⚡ Patcher, qui renumérote justement
+les départs, faisait sauter le drapeau sur une autre sortie
+(`POST /api/node/:ip/outputs-ignore {indexes}`). Le reste de l'onglet : en mode
 Multi (RGB / DRGB / RGBW), WLED enchaîne les pixels sur des univers
 consécutifs à partir de `dmx.uni` / `dmx.addr`, 170 pixels RGB (510 canaux)
 ou 128 RGBW par univers. Une sortie physique de 160 px ne tombe donc jamais
@@ -287,9 +299,14 @@ sur une frontière d'univers : la 2ᵉ liane commence au canal 481 du premier
 univers et finit au canal 450 du suivant. L'onglet donne, par node, l'adresse
 console (univers.canal) du premier et du dernier pixel de chaque sortie, le
 contenu de chaque univers, le nombre d'univers consommés, et signale les
-**conflits** (deux nodes écoutant le même univers). Règle de patch : une
-fixture continue par node à `uni.addr`, ou chaque sortie exactement à
-l'adresse indiquée ; jamais « un univers par sortie ».
+**conflits**. Un conflit se mesure **au canal près**, pas au numéro d'univers :
+deux nodes qui se partagent un univers à des adresses distinctes (121.109→216 et
+121.217→324) ne se marchent pas dessus, et c'est le seul moyen de loger
+plusieurs nodes courts dans un univers. Comparer les seuls numéros d'univers
+produisait un faux conflit qui interdisait ce patch (corrigé le 2026-09-08 ;
+l'arithmétique vit dans `dmx.js`, couverte par `test/dmx.test.js`). Règle de
+patch : une fixture continue par node à `uni.addr`, ou chaque sortie exactement
+à l'adresse indiquée ; jamais « un univers par sortie ».
 
 ## Identifier, et les trois noms d'un node
 

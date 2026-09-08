@@ -21,6 +21,7 @@ const os = require('os');
 const fs = require('fs');
 const path = require('path');
 const { columns, groups } = require('./columns');
+const dmx = require('./dmx');
 const firmware = require('./firmware');
 const ap = require('./ap');
 const snapshots = require('./snapshots');
@@ -128,11 +129,23 @@ function groupFromCfg(rec) {
 // Unused outputs (Fleet-only flag) are kept on the node too: MQTT device topic « wled/xxxxxx#u2.4 »
 // (outputs 2 and 4 not wired). Read back as start indexes for the DMX plan.
 function deviceTopic(rec) { const t = rec.cfg && rec.cfg.if && rec.cfg.if.mqtt && rec.cfg.if.mqtt.topics ? rec.cfg.if.mqtt.topics.device : undefined; return typeof t === 'string' ? t : null; }
+// Sorties non utilisées : POSITIONS (0-based) dans hw.led.ins, jamais l'index de
+// départ. Le marqueur sur le node est déjà positionnel (#u1.3 = sorties 1 et 3) ;
+// c'est Fleet qui traduisait en index de départ, et ⚡ Autopatch change justement
+// les départs — le drapeau sautait alors sur une autre sortie (corrigé 2026-09-08).
 function ignoredFromCfg(rec) {
   const t = deviceTopic(rec); if (t === null) return null;
   const m = /#u([0-9.]*)$/.exec(t); if (!m) return [];
   const ins = (rec.cfg.hw && rec.cfg.hw.led && rec.cfg.hw.led.ins) || [];
-  return m[1].split('.').filter(Boolean).map(Number).filter(i => i >= 1 && ins[i - 1]).map(i => ins[i - 1].start);
+  return m[1].split('.').filter(Boolean).map(Number).filter(i => i >= 1 && ins[i - 1]).map(i => i - 1);
+}
+// tolère l'ancienne écriture (index de départ) encore présente dans known-nodes.json
+// ou dans une intention hors ligne enregistrée avant la mise à jour
+function normalizeIgnored(list, ins) {
+  return [...new Set((list || []).map(Number).filter(Number.isFinite).map(v => {
+    if (v >= 0 && v < ins.length) return v;              // déjà une position
+    const i = ins.findIndex(b => b.start === v); return i >= 0 ? i : null; // legacy : index de départ
+  }).filter(v => v !== null))].sort((a, b) => a - b);
 }
 function clientId(rec) { const c = rec.cfg && rec.cfg.if && rec.cfg.if.mqtt ? rec.cfg.if.mqtt.cid : undefined; return typeof c === 'string' ? c : null; }
 function profilesFromCfg(rec) {
@@ -162,16 +175,17 @@ async function writeProfiles(rec, ids, source) {
   unqueueOffline(rec, 'outputProfiles');
   return true;
 }
-async function writeIgnored(rec, starts, source) {
+async function writeIgnored(rec, list, source) {
   const t = deviceTopic(rec); if (t === null) throw new Error('config du node non lue');
   const ins = (rec.cfg.hw && rec.cfg.hw.led && rec.cfg.hw.led.ins) || [];
-  const idx = ins.map((b, i) => starts.includes(b.start) ? i + 1 : 0).filter(Boolean);
+  const positions = normalizeIgnored(list, ins);
+  const idx = positions.map(i => i + 1);
   const base = t.replace(/#u[0-9.]*$/, ''); const next = idx.length ? `${base}#u${idx.join('.')}` : base;
   if (next.length > 32) throw new Error('marqueur trop long pour le champ MQTT du node');
-  if (next === t) { unqueueOffline(rec, 'ignoredOutputs'); rec.meta.ignoredOutputs = starts; return false; }
-  if (!rec.meta.online) { queueOffline(rec, 'ignoredOutputs', starts); return 'queued'; }
+  if (next === t) { unqueueOffline(rec, 'ignoredOutputs'); rec.meta.ignoredOutputs = positions; return false; }
+  if (!rec.meta.online) { queueOffline(rec, 'ignoredOutputs', positions); return 'queued'; }
   await postJson(rec.meta.ip, '/json/cfg', { if: { mqtt: { topics: { device: next } } } }, 8000);
-  rec.cfg.if.mqtt.topics.device = next; rec.meta.ignoredOutputs = starts;
+  rec.cfg.if.mqtt.topics.device = next; rec.meta.ignoredOutputs = positions;
   recordChange(rec, 'outputs-unused', t, next, source);
   unqueueOffline(rec, 'ignoredOutputs');
   return true;
@@ -211,7 +225,7 @@ function derive(rec) {
   // an offline-queued edit displays as if already applied, until resolved (apply/discard)
   if (rec.meta.offlineQueue) {
     if (rec.meta.offlineQueue.group !== undefined) rec.meta.group = rec.meta.offlineQueue.group;
-    if (rec.meta.offlineQueue.ignoredOutputs !== undefined) rec.meta.ignoredOutputs = rec.meta.offlineQueue.ignoredOutputs;
+    if (rec.meta.offlineQueue.ignoredOutputs !== undefined) rec.meta.ignoredOutputs = normalizeIgnored(rec.meta.offlineQueue.ignoredOutputs, (cfg && cfg.hw && cfg.hw.led && cfg.hw.led.ins) || []);
     if (rec.meta.offlineQueue.outputProfiles !== undefined) rec.meta.outputProfiles = rec.meta.offlineQueue.outputProfiles;
   }
   const d = {};
@@ -255,44 +269,13 @@ function derive(rec) {
 }
 
 // ── DMX plan ─────────────────────────────────────────────────────────────────
-// WLED "Multi" modes: pixels are taken in order across consecutive universes,
-// 170 RGB (510 ch) or 128 RGBW (512 ch) pixels per universe, starting at
-// dmx.uni / dmx.addr. An output (a physical strip) therefore usually straddles
-// two universes. This computes, per output, the universe.address of its first
-// and last pixel, and per universe what it carries, so the console patch can
-// be derived instead of guessed.
-const DMX_MODES_PX = { 4: 3, 5: 3, 6: 4 }; // Multi RGB, Multi DRGB (1 ch dimmer first), Multi RGBW -> channels per pixel
+// Toute l'arithmétique vit dans dmx.js (testée par test/dmx.test.js) ; ici on ne
+// fait que lui passer ce que le node a dit de lui.
+const DMX_MODES_PX = dmx.MODES_PX;
 function dmxPlan(rec) {
   const cfg = rec.cfg; if (!cfg || !cfg.if || !cfg.if.live || !cfg.hw || !cfg.hw.led) return null;
   const x = cfg.if.live.dmx || {};
-  const mode = Number(x.mode), uni = Number(x.uni) || 1, addr = Number(x.addr) || 1;
-  const chPerPx = DMX_MODES_PX[mode];
-  const ignored = new Set(rec.meta.ignoredOutputs || []);
-  const profs = rec.meta.outputProfiles || [];
-  const outs = (cfg.hw.led.ins || []).map((b, i) => ({ i, profile: profs[i] || null, pin: (b.pin || []).join('/'), start: b.start, len: b.len, rgbw: [30, 31, 41, 44, 88].includes(b.type), ignored: ignored.has(b.start) }));
-  const total = outs.reduce((a, o) => Math.max(a, o.start + o.len), 0);
-  if (!chPerPx) return { mode, uni, addr, total, outputs: outs, multi: false, note: 'mode DMX non « Multi » : pas de mapping pixel par pixel' };
-  const pxPerUni = Math.floor(512 / chPerPx); // 170 RGB / 128 RGBW
-  const hasDimmer = mode === 5;
-  // pixel index -> {universe, channel}: first universe starts at `addr` (and holds fewer pixels), next ones at 1
-  const firstUniPx = Math.floor((512 - (addr - 1) - (hasDimmer ? 1 : 0)) / chPerPx);
-  const locate = px => {
-    if (px < firstUniPx) return { u: uni, ch: addr + (hasDimmer ? 1 : 0) + px * chPerPx };
-    const rest = px - firstUniPx; return { u: uni + 1 + Math.floor(rest / pxPerUni), ch: 1 + (rest % pxPerUni) * chPerPx };
-  };
-  const fmt = l => `${l.u}.${l.ch}`;
-  for (const o of outs) { if (!o.len) continue; const a = locate(o.start), b = locate(o.start + o.len - 1); o.from = fmt(a); o.to = `${b.u}.${b.ch + chPerPx - 1}`; o.universes = b.u - a.u + 1; o.straddles = b.u !== a.u; }
-  const lastU = total ? locate(total - 1).u : uni;
-  const universes = [];
-  for (let u = uni; u <= lastU; u++) {
-    const pxStart = u === uni ? 0 : firstUniPx + (u - uni - 1) * pxPerUni;
-    const pxEnd = Math.min(total, u === uni ? firstUniPx : pxStart + pxPerUni) - 1;
-    const carrying = outs.filter(o => o.len && o.start <= pxEnd && o.start + o.len - 1 >= pxStart);
-    const carries = carrying.map(o => `sortie ${o.i + 1} (pin ${o.pin})${o.ignored ? ' (non comptée)' : ''}`);
-    // a universe fed only by ignored outputs is greyed and excluded from conflict detection
-    universes.push({ u, pxStart, pxEnd, px: pxEnd - pxStart + 1, channels: (pxEnd - pxStart + 1) * chPerPx + (u === uni && hasDimmer ? 1 : 0), carries, ignored: carrying.length > 0 && carrying.every(o => o.ignored) });
-  }
-  return { mode, chPerPx, pxPerUni, uni, addr, total, universesUsed: universes.length, firstUni: uni, lastUni: lastU, outputs: outs, universes, multi: true, hasDimmer };
+  return dmx.plan({ mode: x.mode, uni: x.uni, addr: x.addr, ins: cfg.hw.led.ins || [], ignored: rec.meta.ignoredOutputs || [], profiles: rec.meta.outputProfiles || [] });
 }
 
 // ── Change journal ───────────────────────────────────────────────────────────
@@ -1009,7 +992,7 @@ const server = http.createServer(async (req, res) => {
   let m;
   try {
     if (p === '/api/fleet') return send(res, 200, fleetPayload());
-    if (p === '/api/columns') { const { LED_TYPES, COLOR_ORDERS } = require('./columns'); return send(res, 200, { columns, groups, ledTypes: LED_TYPES, colorOrders: COLOR_ORDERS }); }
+    if (p === '/api/columns') { const { LED_TYPES, COLOR_ORDERS, WHITE_SWAPS, WHITE_SWAP_TYPES } = require('./columns'); return send(res, 200, { columns, groups, ledTypes: LED_TYPES, colorOrders: COLOR_ORDERS, whiteSwaps: WHITE_SWAPS, whiteSwapTypes: WHITE_SWAP_TYPES }); }
     if ((m = /^\/api\/node\/([^/]+)\/outputs$/.exec(p)) && req.method === 'POST') {
       // LED outputs editor: WLED rebuilds hw.led.ins from the payload, so the WHOLE array is sent.
       // Only scalar fields we understand are taken from the UI; anything else on an existing bus is kept.
@@ -1018,8 +1001,7 @@ const server = http.createServer(async (req, res) => {
       if (!rec || !rec.cfg || !rec.cfg.hw || !rec.cfg.hw.led) return send(res, 400, { error: 'config du node pas encore lue' });
       const b = await readBody(req);
       if (!Array.isArray(b.ins) || !b.ins.length) return send(res, 400, { error: 'liste de sorties vide' });
-      // previous buses by their start index: an edited row keeps the unknown fields of the bus it replaces
-      const prevByStart = new Map((rec.cfg.hw.led.ins || []).map(e => [e.start, e]));
+      const prevIns = rec.cfg.hw.led.ins || [];
       const ins = [];
       for (let i = 0; i < b.ins.length; i++) {
         const u = b.ins[i];
@@ -1028,9 +1010,17 @@ const server = http.createServer(async (req, res) => {
         const len = Number(u.len), start = Number(u.start), type = Number(u.type), order = Number(u.order);
         if (!(len > 0 && len <= 4096)) return send(res, 400, { error: `sortie ${i + 1} : longueur invalide` });
         if (!(start >= 0)) return send(res, 400, { error: `sortie ${i + 1} : index de départ invalide` });
-        const base = { ...(prevByStart.get(start) || {}) };
+        // une ligne éditée hérite des champs inconnus du bus qu'elle remplace : par POSITION,
+        // pas par index de départ — ⚡ Patcher renumérote les départs, et prevByStart faisait
+        // alors hériter la ligne des réglages d'UNE AUTRE sortie (corrigé 2026-09-08).
+        const base = { ...(prevIns[i] || {}) };
         const ledma = Number(u.ledma);
-        ins.push({ ...base, pin: pins, type: Number.isFinite(type) ? type : (base.type ?? 22), order: Number.isFinite(order) ? order : (base.order ?? 0), start, len, rev: !!u.rev, skip: Math.max(0, Number(u.skip) || 0), ledma: Number.isFinite(ledma) && ledma >= 0 ? ledma : (base.ledma ?? 55), ref: !!u.ref });
+        // hw.led.ins[].order = (échange du blanc << 4) | ordre des couleurs : ne réécrire que
+        // le quartet qu'on connaît, sinon le swap réglé dans WLED est effacé à chaque save.
+        const wswap = Number(u.wswap);
+        const lowNib = Number.isFinite(order) ? (order & 0x0f) : ((base.order ?? 0) & 0x0f);
+        const highNib = Number.isFinite(wswap) ? (wswap & 0x0f) : (((base.order ?? 0) >> 4) & 0x0f);
+        ins.push({ ...base, pin: pins, type: Number.isFinite(type) ? type : (base.type ?? 22), order: (highNib << 4) | lowNib, start, len, rev: !!u.rev, skip: Math.max(0, Number(u.skip) || 0), ledma: Number.isFinite(ledma) && ledma >= 0 ? ledma : (base.ledma ?? 55), ref: !!u.ref });
       }
       try {
         await postJson(ip, '/json/cfg', { hw: { led: { ins } } }, 8000);
@@ -1196,26 +1186,12 @@ const server = http.createServer(async (req, res) => {
       if (restart) setTimeout(() => process.exit(RESTART_EXIT_CODE), 800);
       return;
     }
-    if ((m = /^\/api\/node\/([^/]+)\/align-outputs$/.exec(p)) && req.method === 'POST') {
-      // "one universe per output": move the START of every output to the next universe boundary
-      // (170 RGB / 128 RGBW) and keep its real LED count. The pixel indexes left in the gap belong
-      // to no output: WLED drives nothing there, power estimates stay right. The whole hw.led.ins
-      // array is re-sent (WLED rebuilds it from the payload) with only start changed.
-      if (READONLY) return send(res, 403, { error: 'lecture seule' });
-      const ip = decodeURIComponent(m[1]); const rec = fleet.get(ip);
-      if (!rec || !rec.cfg || !rec.derived.dmx || !rec.derived.dmx.multi) return send(res, 400, { error: 'node sans config lue ou pas en mode Multi' });
-      const plan = rec.derived.dmx; const per = plan.pxPerUni;
-      if (plan.addr !== 1) return send(res, 400, { error: `adresse DMX de départ ${plan.addr} : doit être 1 pour aligner un univers par sortie` });
-      const ins = rec.cfg.hw.led.ins.map(b => ({ ...b }));
-      let start = 0; const changes = [];
-      for (const b of ins) { if (!b.len) continue; const slots = Math.ceil(b.len / per); const uniFrom = plan.uni + start / per; changes.push(`pin ${(b.pin || []).join('/')} : ${b.len} px, départ ${b.start} → ${start} (univers ${uniFrom}${slots > 1 ? '-' + (uniFrom + slots - 1) : ''})`); b.start = start; start += slots * per; }
-      try {
-        await postJson(ip, '/json/cfg', { hw: { led: { ins } } }, 8000);
-        recordChange(rec, 'outputs', rec.derived.outputs, changes.join(' | '), 'grille');
-        rec.meta.cfgUpdated = 0; await pollInfoState(rec, 'grille');
-        return send(res, 200, { ok: true, changes, total: start });
-      } catch (e) { return send(res, 502, { error: e.message }); }
-    }
+    // (supprimé 2026-09-08) POST /api/node/:ip/align-outputs — « ≡ univers entiers ».
+    // Il écrivait sur le node dès la confirmation alors que ⚡ Autopatch, qui calculait la
+    // même chose, se contentait de remplir les champs : deux chemins pour un seul geste,
+    // dont un qui court-circuitait « Enregistrer les modifications ». Tout passe désormais
+    // par ⚡ Patcher côté page (stratégie « une sortie = un univers »), donc par le bouton
+    // Enregistrer, avec le récapitulatif des nodes touchés avant écriture.
     if (p === '/api/led-profiles' && req.method === 'GET') return send(res, 200, { profiles: ledProfiles });
     if (p === '/api/led-profiles' && req.method === 'POST') { const b = await readBody(req); try { return send(res, 200, { ok: true, profile: upsertProfile(b), profiles: ledProfiles }); } catch (e) { return send(res, 400, { error: e.message }); } }
     if ((m = /^\/api\/led-profiles\/([^/]+)$/.exec(p)) && req.method === 'DELETE') { const name = decodeURIComponent(m[1]); ledProfiles = ledProfiles.filter(x => x.name !== name); saveProfiles(); return send(res, 200, { ok: true, profiles: ledProfiles }); }
@@ -1262,13 +1238,14 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, { ok: true, profiles: rec.meta.outputProfiles, queued: r === 'queued' });
     }
     if ((m = /^\/api\/node\/([^/]+)\/outputs-ignore$/.exec(p)) && req.method === 'POST') {
-      // Fleet-only flag: outputs (by start index) that exist in WLED but are not physically used;
-      // their universes are greyed and excluded from conflict detection. Nothing is written to the node.
+      // Fleet-only flag: outputs (by POSITION in hw.led.ins) that exist in WLED but are not
+      // physically used; the channels they'd occupy are not reserved, so they never raise a
+      // conflict. `starts` (ancienne écriture par index de départ) est encore accepté.
       const ip = decodeURIComponent(m[1]); const rec = fleet.get(ip);
       if (!rec) return send(res, 404, { error: 'node inconnu' });
       const b = await readBody(req);
-      const starts = (Array.isArray(b.starts) ? b.starts : []).map(Number).filter(Number.isFinite);
-      let r; try { r = await writeIgnored(rec, starts, 'grille'); } catch (e) { return send(res, rec.meta.online ? 502 : 409, { error: e.message }); }
+      const list = (Array.isArray(b.indexes) ? b.indexes : Array.isArray(b.starts) ? b.starts : []).map(Number).filter(Number.isFinite);
+      let r; try { r = await writeIgnored(rec, list, 'grille'); } catch (e) { return send(res, rec.meta.online ? 502 : 409, { error: e.message }); }
       derive(rec); saveKnown();
       return send(res, 200, { ok: true, ignored: rec.meta.ignoredOutputs, queued: r === 'queued' });
     }
@@ -1286,13 +1263,11 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, { ok: true, group: rec.meta.group, ignored: rec.meta.ignoredOutputs, profiles: rec.meta.outputProfiles });
     }
     if (p === '/api/dmx-plan' && req.method === 'GET') {
-      // fleet-wide plan + universe conflicts between nodes
+      // plan de toute la flotte + conflits entre nodes, au canal près (voir dmx.js)
       const nodes = [...fleet.values()].filter(r => r.derived && r.derived.dmx).map(r => ({ ip: r.meta.ip, name: r.info && r.info.name, group: r.meta.group || '', online: r.meta.online, live: r.info && r.info.live, lm: r.info && r.info.lm, lip: r.info && r.info.lip, plan: r.derived.dmx }));
-      // conflicts only among universes that carry at least one counted (non-ignored) output
-      const byUni = new Map();
-      for (const n of nodes) for (const u of (n.plan.universes || [])) { if (u.ignored) continue; if (!byUni.has(u.u)) byUni.set(u.u, []); byUni.get(u.u).push(n.name || n.ip); }
-      const conflicts = [...byUni.entries()].filter(([, l]) => l.length > 1).map(([u, l]) => ({ universe: u, nodes: l }));
-      return send(res, 200, { nodes: nodes.sort((a, b) => (a.plan.uni || 0) - (b.plan.uni || 0)), conflicts, universesInUse: [...byUni.keys()].sort((a, b) => a - b) });
+      const conflicts = dmx.conflicts(nodes.map(n => ({ name: n.name || n.ip, plan: n.plan })));
+      const inUse = [...new Set(nodes.flatMap(n => (n.plan.occupancy || []).map(iv => iv.u)))].sort((a, b) => a - b);
+      return send(res, 200, { nodes: nodes.sort((a, b) => (a.plan.uni || 0) - (b.plan.uni || 0)), conflicts, universesInUse: inUse });
     }
     if (p === '/api/nodes/purge' && req.method === 'POST') {
       const b = await readBody(req);

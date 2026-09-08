@@ -40,6 +40,16 @@ const LED_TYPES = {
 
 const COLOR_ORDERS = { 0: 'GRB', 1: 'RGB', 2: 'BRG', 3: 'RBG', 4: 'BGR', 5: 'GBR' };
 
+// Échange du canal blanc (WLED : « Swap » dans LED Settings). Rangé dans le QUARTET
+// HAUT du même octet que l'ordre des couleurs — hw.led.ins[i].order vaut
+// (swap << 4) | ordre, cf. settings_leds.htm : (v.order>>4) & 0x0F. Fleet ne lisait
+// que le quartet bas et réécrivait l'octet entier : le swap réglé sur le node était
+// effacé à la première sauvegarde (corrigé 2026-09-08).
+const WHITE_SWAPS = { 0: 'aucun', 1: 'W & B', 2: 'W & G', 3: 'W & R', 4: 'WW & CW' };
+// types numériques à canal blanc : WLED n'affiche le sélecteur que pour ceux-là
+// (isDig(t) && hasW(t)) et remet le swap à 0 sur les autres.
+const WHITE_SWAP_TYPES = [28, 29, 30, 31, 32, 34];
+
 const ETH_TYPES = {
   0: 'None', 1: 'WT32-ETH01', 2: 'ESP32-POE', 3: 'WESP32', 4: 'QuinLED-ESP32',
   5: 'TwilightLord', 6: 'ESP3DEUXQuattro', 7: 'ESP32Deux', 8: 'KIT-VE',
@@ -260,4 +270,4 @@ const columns = [
 
 const groups = [...new Set(columns.map(c => c.group))];
 
-module.exports = { columns, groups, LED_TYPES, COLOR_ORDERS, DMX_MODES };
+module.exports = { columns, groups, LED_TYPES, COLOR_ORDERS, WHITE_SWAPS, WHITE_SWAP_TYPES, DMX_MODES };

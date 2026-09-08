@@ -132,10 +132,27 @@
   .sig i{display:block;height:100%}
   .fwcols{display:grid;grid-template-columns:1fr 1fr;gap:18px}
   .gtable{margin:0 0 12px} .gtable .gc-title{padding:6px 2px;font-size:13px}
+  /* groupes repliables : le résumé reste lisible une fois fermé */
+  .gtable>details>summary{list-style:none;cursor:pointer;padding:6px 2px;border-radius:6px} .gtable>details>summary::-webkit-details-marker{display:none}
+  .gtable>details>summary:hover{background:var(--panel2)} .gtable>details>summary .caret{display:inline-block;width:12px;color:var(--muted);transition:transform .12s} .gtable>details[open]>summary .caret{transform:rotate(90deg)}
   table.outs{width:100%} table.outs th{white-space:nowrap} table.outs td{vertical-align:middle;white-space:nowrap} table.outs tr.first td{border-top:2px solid var(--line2)} table.outs tr.offline td:not(.ncell){opacity:.55}
-  table.outs td.ncell{vertical-align:top;background:var(--panel2);min-width:230px;border-right:2px solid var(--line2);white-space:normal} .ncell-name{font-size:13px} .ncell-st{font-size:11px;margin:2px 0}
-  .ncell-set{display:flex;flex-direction:column;gap:4px;margin:6px 0} .ncell-set label{display:flex;justify-content:space-between;align-items:center;gap:6px;font-size:12px} .ncell-set .lbl{color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.04em} .ncell-set input,.ncell-set select{width:118px;height:24px;padding:0 6px;font:inherit}
-  table.outs input,table.outs select{height:26px;padding:0 6px;font:inherit} table.outs [data-out=type]{min-width:150px} table.outs [data-out=order]{min-width:80px} table.outs [data-out=start],table.outs [data-out=len]{width:70px}
+  /* largeur fixe : chaque groupe est un tableau à part, sans ça les cellules de node
+     ne s'alignent pas d'un groupe à l'autre */
+  table.outs td.ncell{vertical-align:middle;background:var(--panel2);width:268px;min-width:268px;border-right:2px solid var(--line2);white-space:normal}
+  table.outs th{padding-right:10px} table.outs select[data-prof]{max-width:154px} .ncell-name{font-size:13px} .ncell-st{font-size:11px}
+  /* réglages communs du node : à plat sur une ligne, plus empilés avec une colonne
+     d'étiquettes — c'est ce qui rendait la ligne d'un node à une seule sortie
+     aussi haute que huit (2026-09-08) */
+  .ncell-set{display:flex;flex-wrap:wrap;align-items:center;gap:4px 6px;margin:3px 0 0} .ncell-set label{display:inline-flex;align-items:center;gap:3px;font-size:12px}
+  .ncell-set .lbl{color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.04em}
+  .ncell-set input,.ncell-set select{height:22px;padding:0 4px;font:inherit;font-size:12px} .ncell-set [data-nb=dmxmode]{width:104px} .ncell-set [data-nb=dmxuni]{width:50px} .ncell-set [data-nb=dmxaddr]{width:50px} .ncell-set [data-nb=maxpwr]{width:56px}
+  table.outs input,table.outs select{height:24px;padding:0 5px;font:inherit} table.outs [data-out=type]{min-width:132px} table.outs [data-out=order]{min-width:74px} table.outs [data-out=wswap]{min-width:76px} table.outs [data-out=start],table.outs [data-out=len]{width:58px} table.outs [data-out=ledma],table.outs [data-out=skip]{width:52px}
+  /* colonnes avancées : masquées tant que ⚙ n'est pas coché */
+  table.outs.noadv th.adv,table.outs.noadv td.adv{display:none}
+  /* chaînage : ⛓ = pixels collés à la sortie du dessus (une seule fixture), ⊘ = sortie seule */
+  table.outs td.chaincell{width:26px;text-align:center;padding:0 2px;cursor:pointer;color:var(--muted);user-select:none} table.outs td.chaincell:hover{background:var(--chip)}
+  table.outs td.chaincell.linked{color:var(--info)} table.outs tr.chained td.oc-addr .addr{opacity:.72}
+  .chainmark{font-size:13px;line-height:1}
   .dmxcols{display:grid;grid-template-columns:minmax(230px,1fr) minmax(0,3fr);gap:14px;margin-top:8px} @media(max-width:1000px){.dmxcols{grid-template-columns:1fr}}
   table.outs th{white-space:nowrap} table.outs input,table.outs select{height:26px;padding:0 6px;font:inherit} table.outs [data-out=pin]{width:60px} table.outs [data-out=type]{min-width:150px} table.outs [data-out=order]{min-width:80px} table.outs [data-out=start],table.outs [data-out=len]{width:70px} @media(max-width:1100px){.fwcols{grid-template-columns:1fr}}
   .tag{font-size:10px;font-weight:650;padding:1px 6px;border-radius:10px;text-transform:uppercase}
