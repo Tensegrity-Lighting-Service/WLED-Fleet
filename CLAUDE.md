@@ -126,6 +126,12 @@ La version vit à **quatre** endroits, qui doivent rester identiques :
 `desktop/embed/package.json`. En manquer un donne une app qui se croit à une
 version et s'annonce à une autre.
 
+**Réutiliser un numéro déjà installé ne répare rien.** Le shell n'extrait son
+app embarquée que si `.wf-embedded-version` diffère de la version courante
+(`ensure_app_dir()`, `desktop/src/main.rs`). Réinstaller le même numéro laisse
+donc l'ancien code extrait en place, y compris s'il est cassé. Un correctif qui
+doit atteindre une installation existante prend un nouveau numéro — toujours.
+
 Un cinquième suit tout seul, mais seulement au prochain `cargo build` :
 `desktop/Cargo.lock`. Le mettre à jour dans le même commit évite de découvrir
 l'écart en pleine compilation de release — c'est ce qui a valu un commit de
