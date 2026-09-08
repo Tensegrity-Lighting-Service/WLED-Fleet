@@ -6,6 +6,11 @@
 // live state. Files live in snapshots/<id>.json and are plain JSON, so they
 // can be exported, mailed, versioned, and imported on another machine.
 //
+// Et depuis le 2026-09-08, /fleet.json : les métadonnées que Fleet dépose sur le
+// node (produit, Fixture ID, ordre). Le backup natif de WLED, comme cette
+// sauvegarde avant ce jour, ne couvre que cfg.json et presets.json — restaurer
+// aurait donc silencieusement perdu les fixtures.
+//
 // Restore uses the same mechanism as WLED's own Security > Backup & Restore
 // page: the file is uploaded to the node's filesystem through POST /upload
 // (multipart, field "data", filename "/cfg.json" or "/presets.json"), then the
@@ -17,6 +22,7 @@ const fs = require('fs');
 const path = require('path');
 const http = require('http');
 const { dataFile, codeFile, DATA_DIR, CODE_DIR } = require('./paths');
+const metadata = require('./metadata');
 
 const DIR = dataFile('snapshots');
 const safeId = s => String(s || '').replace(/[^\w.-]+/g, '_').slice(0, 80);
@@ -50,9 +56,13 @@ async function capture(name, recs, getJson) {
   for (const rec of recs) {
     if (!rec.meta.online || !rec.info) continue;
     const ip = rec.meta.ip;
-    const entry = { ip, mac: rec.info.mac, name: rec.info.name, ver: rec.info.ver, release: rec.info.release, state: rec.state, cfg: null, presets: null, error: '' };
+    const entry = { ip, mac: rec.info.mac, name: rec.info.name, ver: rec.info.ver, release: rec.info.release, state: rec.state, cfg: null, presets: null, fleet: null, error: '' };
     try { entry.cfg = (await getJson(ip, '/json/cfg', 5000)).json; } catch (e) { entry.error += `cfg: ${e.message} `; }
     try { entry.presets = (await getJson(ip, '/presets.json', 5000)).json; } catch (e) { entry.error += `presets: ${e.message} `; }
+    // Les métadonnées Fleet (produit, fixture, ordre) vivent dans un fichier à part
+    // du système de fichiers du node : ni le backup natif de WLED ni cette
+    // sauvegarde ne les voyaient. Un node absent du fichier n'est pas une erreur.
+    try { entry.fleet = (await getJson(ip, metadata.FILE, 5000)).json; } catch { /* pas de métadonnées sur ce node */ }
     nodes.push(entry);
   }
   const id = `${new Date(createdAt).toISOString().replace(/[:.]/g, '-').slice(0, 19)}_${safeId(name || 'flotte')}`;
@@ -134,6 +144,7 @@ async function restore(snap, targets, what, reboot, recs, postJson, onProgress =
     if (!rec || !rec.meta.online) { r.error = 'node hors ligne / introuvable'; results.push(r); onProgress(r); continue; }
     try {
       if (what.presets && entry.presets) { await uploadFile(r.ip, '/presets.json', entry.presets); r.done.push('presets.json'); }
+      if (what.fleet !== false && entry.fleet) { await uploadFile(r.ip, metadata.FILE, entry.fleet); r.done.push(metadata.FILE); }
       if (what.cfg && entry.cfg) {
         // never push the Wi-Fi/Ethernet block of another machine by accident: keep the node's own network settings
         const cfg = JSON.parse(JSON.stringify(entry.cfg));

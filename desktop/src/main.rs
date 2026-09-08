@@ -193,16 +193,43 @@ struct UpdateInfo {
     notes: Option<String>,
 }
 
+// ── Canaux de mise à jour ───────────────────────────────────────────────────
+// « stable » suit les versions publiées, « beta » suit une préversion à tag
+// FIXE dont on remplace les fichiers à chaque build. Le tag ne bouge pas, donc
+// l'URL non plus, et l'application n'a rien à découvrir.
+//
+// GitHub distingue les deux tout seul : /releases/latest/download/ ne résout
+// JAMAIS vers une préversion. Le canal stable ne peut donc pas attraper une
+// beta par accident, même si elle est plus récente — ce qui est exactement la
+// garantie qu'on veut.
+//
+// Le canal est choisi à l'exécution et non compilé dans tauri.conf.json :
+// changer de canal ne doit pas demander de réinstaller.
+const STABLE_URL: &str =
+    "https://github.com/Tensegrity-Lighting-Service/WLED-Fleet/releases/latest/download/latest.json";
+const BETA_URL: &str =
+    "https://github.com/Tensegrity-Lighting-Service/WLED-Fleet/releases/download/beta/latest.json";
+
+fn updater_for(app: &tauri::AppHandle, channel: Option<&str>) -> Result<tauri_plugin_updater::Updater, String> {
+    let url = if channel == Some("beta") { BETA_URL } else { STABLE_URL };
+    let parsed = url.parse().map_err(|e| format!("URL de mise à jour invalide : {e}"))?;
+    app.updater_builder()
+        .endpoints(vec![parsed])
+        .map_err(|e| e.to_string())?
+        .build()
+        .map_err(|e| e.to_string())
+}
+
 #[tauri::command]
-async fn check_update(app: tauri::AppHandle) -> Result<Option<UpdateInfo>, String> {
-    let updater = app.updater().map_err(|e| e.to_string())?;
+async fn check_update(app: tauri::AppHandle, channel: Option<String>) -> Result<Option<UpdateInfo>, String> {
+    let updater = updater_for(&app, channel.as_deref())?;
     let found = updater.check().await.map_err(|e| e.to_string())?;
     Ok(found.map(|u| UpdateInfo { version: u.version, notes: u.body }))
 }
 
 #[tauri::command]
-async fn install_update(app: tauri::AppHandle) -> Result<(), String> {
-    let updater = app.updater().map_err(|e| e.to_string())?;
+async fn install_update(app: tauri::AppHandle, channel: Option<String>) -> Result<(), String> {
+    let updater = updater_for(&app, channel.as_deref())?;
     let update = updater.check().await.map_err(|e| e.to_string())?.ok_or("aucune mise à jour disponible")?;
     update.download_and_install(|_, _| {}, || {}).await.map_err(|e| e.to_string())?;
     // l'installeur relance l'app ; on ferme proprement (RunEvent::Exit arrête node)

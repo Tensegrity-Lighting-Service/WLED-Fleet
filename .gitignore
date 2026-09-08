@@ -25,3 +25,5 @@ WLED-Fleet.exe
 WLED-Fleet.old.exe
 /WLED-Fleet/
 server-errors.log
+github.json
+github-dev.json

@@ -22,6 +22,9 @@ const fs = require('fs');
 const path = require('path');
 const { columns, groups } = require('./columns');
 const dmx = require('./dmx');
+const metadata = require('./metadata');
+const library = require('./library');
+const github = require('./github');
 const firmware = require('./firmware');
 const ap = require('./ap');
 const snapshots = require('./snapshots');
@@ -276,7 +279,21 @@ const DMX_MODES_PX = dmx.MODES_PX;
 function dmxPlan(rec) {
   const cfg = rec.cfg; if (!cfg || !cfg.if || !cfg.if.live || !cfg.hw || !cfg.hw.led) return null;
   const x = cfg.if.live.dmx || {};
-  return dmx.plan({ mode: x.mode, uni: x.uni, addr: x.addr, ins: cfg.hw.led.ins || [], ignored: rec.meta.ignoredOutputs || [], profiles: rec.meta.outputProfiles || [] });
+  // ce que le node dit de lui-même, remis à plat par position
+  const byPos = [];
+  for (const o of (rec.meta.nodeMeta && rec.meta.nodeMeta.outputs) || []) byPos[o.i] = o;
+  const plan = dmx.plan({ mode: x.mode, uni: x.uni, addr: x.addr, ins: cfg.hw.led.ins || [], ignored: rec.meta.ignoredOutputs || [], profiles: rec.meta.outputProfiles || [], meta: byPos });
+  // Ce que chaque sortie a de différent de la fiche qu'elle revendique. Calculé
+  // ici et non dans l'interface : c'est une information du modèle, un satellite
+  // doit y avoir accès aussi. Le node fait foi — l'écart est constaté, jamais
+  // corrigé d'autorité.
+  const ins = cfg.hw.led.ins || [];
+  for (const o of plan.outputs) {
+    const prod = library.resolve(libraryStore, o.profile);
+    o.deviation = prod ? library.deviations(prod, ins[o.i] || {}) : null;
+    o.productLabel = prod ? library.label(prod) : null;
+  }
+  return plan;
 }
 
 // ── Change journal ───────────────────────────────────────────────────────────
@@ -399,6 +416,8 @@ async function otaWorker() {
         }
         rec.meta.cfgUpdated = 0; // force cfg re-read
         await pollInfoState(rec, 'maj');
+        // le node est revenu : s'il a perdu ses métadonnées Fleet en route, on les repose
+        if (ok) await restoreNodeMeta(rec, 'maj');
         o.status = ok ? 'done' : 'timeout'; o.to = rec.info && rec.info.ver; o.at = Date.now();
         // the version change itself is journaled by pollInfoState(rec, 'maj') above
         console.log(`OTA ${ip}: ${o.status} ${o.from} -> ${o.to}`);
@@ -416,8 +435,91 @@ async function pollCfg(rec, source = 'externe') {
   const c = await getJson(rec.meta.ip, '/json/cfg', 4000);
   rec.cfg = c.json;
   rec.meta.cfgUpdated = Date.now();
+  // Les métadonnées Fleet vivent dans un fichier du node (voir metadata.js).
+  // On les relit avec la config et on en garde une copie : c'est elle qui
+  // permet de les remettre si le node revient nu d'une mise à jour, et
+  // d'afficher les fixtures d'un node hors ligne.
+  try {
+    const m = await metadata.read(rec.meta.ip, 3000);
+    rec.meta.nodeMeta = m;
+    if (m.outputs.length || m.group) rec.meta.nodeMetaSeen = m; // dernière copie NON VIDE, c'est elle qu'on restaure
+    // la bibliothèque embarquée n'est lue que si le node a des marqueurs : un
+    // node nu n'a rien à décrire, inutile de lui demander un second fichier
+    if (m.outputs.some(o => o.product)) {
+      const slice = library.parseNodeSlice(await metadata.readFile(rec.meta.ip, library.NODE_FILE, 3000));
+      if (slice) rec.meta.nodeLib = slice;
+    }
+  } catch { /* le node ne répond pas sur ce point : on garde la copie précédente */ }
   derive(rec);
   if (before) diffSnapshot(rec, before, source);
+}
+
+// Après une mise à jour, si le node revient sans ses métadonnées alors qu'on en
+// avait une copie, on les repose. Le cas se produit quand le système de fichiers
+// a été reformaté — WLED le fait au démarrage si le montage échoue
+// (wled.cpp: WLED_FS.begin(true) sur ESP32), typiquement après un changement de
+// schéma de partitions. Une mise à jour normale n'écrit que la partition
+// applicative et n'y touche pas ; ce filet ne sert donc que dans le mauvais cas,
+// mais c'est précisément là qu'on serait content de l'avoir.
+// Fusionne ce que la grille envoie dans le /fleet.json du node, sans jamais
+// jeter ce qu'on n'a pas édité : les clés d'une version plus récente, la note,
+// le groupe. `ins` sert à réenregistrer le GPIO de chaque sortie, qui permettra
+// plus tard de repérer un réordonnancement fait en dehors de Fleet.
+async function writeNodeMeta(rec, list, ins) {
+  const cur = metadata.parse(rec.meta.nodeMeta || metadata.empty());
+  const byPos = new Map(cur.outputs.map(o => [o.i, o]));
+  for (const u of list) {
+    const i = Number(u.i); if (!Number.isInteger(i) || i < 0) continue;
+    const prev = byPos.get(i) || { i };
+    byPos.set(i, { ...prev, i,
+      pin: ((ins[i] || {}).pin || []).join('/') || prev.pin || null,
+      // `undefined` = « la grille n'a pas d'avis » ; `null` = « efface »
+      ...(u.product === undefined ? {} : { product: u.product }),
+      ...(u.prev === undefined ? {} : { prev: u.prev }),
+      ...(u.fixture === undefined ? {} : { fixture: u.fixture }),
+      ...(u.instance === undefined ? {} : { instance: u.instance }),
+    });
+  }
+  const next = metadata.parse({ ...cur, outputs: [...byPos.values()].sort((a, b) => a.i - b.i) });
+  await metadata.write(rec.meta.ip, next, 8000);
+  rec.meta.nodeMeta = next;
+  if (!metadata.isEmpty(next)) rec.meta.nodeMetaSeen = next;
+  await writeNodeLibrary(rec, next);
+  derive(rec);
+}
+
+// La fiche complète des produits que ce node cite, posée à côté de ses
+// marqueurs. Écrite dans le même geste, sinon elle décrit un état que les
+// marqueurs ne désignent plus. L'échec n'est pas fatal : le node reste
+// exploitable avec ses seuls marqueurs, il est juste moins autonome.
+async function writeNodeLibrary(rec, meta) {
+  const markers = (meta.outputs || []).map(o => o.product).filter(Boolean);
+  const slice = library.nodeSlice(libraryStore, markers);
+  if (!slice.products.length) return;         // rien à décrire : ne pas encombrer le LittleFS
+  try {
+    await metadata.writeFile(rec.meta.ip, library.NODE_FILE, slice, 8000);
+    rec.meta.nodeLib = slice;
+  } catch (e) {
+    console.log(`${rec.meta.ip}: bibliothèque embarquée non écrite (${e.message})`);
+  }
+}
+
+async function restoreNodeMeta(rec, reason = 'maj') {
+  const saved = rec.meta.nodeMetaSeen;
+  if (!saved || metadata.isEmpty(saved)) return null;
+  let now;
+  try { now = await metadata.read(rec.meta.ip, 3000); } catch { return null; }
+  if (!metadata.isEmpty(now)) return null;                    // toujours là : rien à faire
+  try {
+    await metadata.write(rec.meta.ip, saved, 8000);
+    rec.meta.nodeMeta = saved;
+    recordChange(rec, 'fleet-meta', 'perdues', 'restaurées depuis la copie de Fleet', reason);
+    console.log(`${rec.meta.ip}: métadonnées Fleet restaurées après ${reason}`);
+    return true;
+  } catch (e) {
+    console.log(`${rec.meta.ip}: restauration des métadonnées impossible (${e.message})`);
+    return false;
+  }
 }
 
 let polling = false;
@@ -864,25 +966,276 @@ async function scan() {
 // known-nodes.json keeps, for every node, the LAST KNOWN info/state/cfg and
 // when it was last seen: a node that is off (or on another site) still shows
 // its whole row, greyed, with "vu il y a", instead of an empty line.
-const knownEntries = () => [...fleet.values()].map(r => ({ ip: r.meta.ip, lastSeen: r.meta.lastSeen, info: r.info, state: r.state, cfg: r.cfg, ignoredOutputs: r.meta.ignoredOutputs || [], group: r.meta.group || '', offlineQueue: r.meta.offlineQueue || null }));
+const knownEntries = () => [...fleet.values()].map(r => ({ ip: r.meta.ip, lastSeen: r.meta.lastSeen, info: r.info, state: r.state, cfg: r.cfg, ignoredOutputs: r.meta.ignoredOutputs || [], group: r.meta.group || '', offlineQueue: r.meta.offlineQueue || null, nodeMeta: r.meta.nodeMetaSeen || null }));
 let declaredGroups = []; // Fleet-only group names, kept even when no node is in them
-// LED profiles: what gets plugged on an output (type, colour order, pixels), reusable from the Sorties tab
+// ── Bibliothèque de produits LED ─────────────────────────────────────────────
+// Le fichier reste 'led-profiles.json' : il est migré en place au chargement
+// (tableau nu = v1, identifiants courts = v2). Chaque produit reçoit un uuid,
+// et son ancien identifiant court est CONSERVÉ comme `legacyId` — les nodes
+// déjà patchés continuent donc de désigner le bon produit sans être réécrits.
 const PROFILES_FILE = dataFile('led-profiles.json');
-let ledProfiles = [];
-const newProfileId = () => { const used = new Set(ledProfiles.map(x => x.id)); for (let n = 10; n < 1296; n++) { const id = n.toString(36).padStart(2, '0'); if (!used.has(id)) return id; } throw new Error('trop de profils'); };
-function loadProfiles() {
-  try { ledProfiles = JSON.parse(fs.readFileSync(PROFILES_FILE, 'utf8')).filter(x => x && x.name); } catch { ledProfiles = []; }
-  let fix = false; for (const x of ledProfiles) if (!x.id || !/^[0-9a-z]{2}$/.test(x.id)) { x.id = newProfileId(); fix = true; } if (fix) saveProfiles();
+let libraryStore = { products: [] };
+function loadLibrary() {
+  let raw = null;
+  try { raw = JSON.parse(fs.readFileSync(PROFILES_FILE, 'utf8')); } catch { /* pas encore de fichier */ }
+  const was = raw && raw.formatVersion;
+  libraryStore = library.migrate(raw);
+  if (libraryStore.products.length && was !== library.FORMAT_VERSION) {
+    saveLibrary();
+    console.log(`bibliothèque : ${libraryStore.products.length} produit(s) migré(s) en v${library.FORMAT_VERSION}, anciens identifiants conservés`);
+  }
 }
-function saveProfiles() { try { fs.writeFileSync(PROFILES_FILE, JSON.stringify(ledProfiles, null, 2)); } catch { /* ignore */ } }
-function upsertProfile(b) {
-  const name = String(b.name || '').trim().slice(0, 40); if (!name) throw new Error('nom vide');
-  const prof = { name, type: Number(b.type), order: Number(b.order) || 0, len: Math.max(0, Number(b.len) || 0), perM: Number(b.perM) || null, note: String(b.note || '').slice(0, 80) };
-  if (!Number.isFinite(prof.type)) throw new Error('type de LED manquant');
-  const i = ledProfiles.findIndex(x => x.name.toLowerCase() === name.toLowerCase()); if (i >= 0) { prof.id = ledProfiles[i].id; ledProfiles[i] = prof; } else { prof.id = newProfileId(); ledProfiles.push(prof); }
-  ledProfiles.sort((a, c) => a.name.localeCompare(c.name)); saveProfiles(); return prof;
+// écriture atomique : un plantage en cours d'écriture ne doit pas laisser un
+// catalogue tronqué là où l'ancien code écrivait directement par-dessus
+function saveLibrary() {
+  try {
+    const tmp = PROFILES_FILE + '.part';
+    fs.writeFileSync(tmp, JSON.stringify(libraryStore, null, 2));
+    fs.renameSync(tmp, PROFILES_FILE);
+  } catch { /* ignore */ }
 }
-loadProfiles();
+loadLibrary();
+// ── Dépôt partagé de la bibliothèque ────────────────────────────────────────
+// Le jeton d'écriture vit dans son propre fichier, JAMAIS dans le showfile ni
+// dans l'archive publiée : c'est un secret d'une autre classe que les mots de
+// passe d'antenne, il donne accès en écriture à un dépôt.
+//
+// Deux façons de s'authentifier :
+//
+//   'gh'    on demande son jeton à GitHub CLI À CHAQUE USAGE. Rien de sensible
+//           n'est stocké par Fleet — le secret reste dans le trousseau de
+//           l'OS, là où gh l'a mis, et révoquer la session gh suffit à couper
+//           l'accès. C'est le mode à préférer quand gh est installé.
+//   'token' un jeton saisi à la main, écrit dans ce fichier. Nécessaire quand
+//           gh n'est pas là, mais le secret est alors en clair sur le disque.
+const GITHUB_FILE = dataFile(FIXED_IPS.length ? 'github-dev.json' : 'github.json');
+let ghConf = { repo: '', token: '', source: 'gh', login: '', branch: 'main', lastSyncAt: 0, lastError: '' };
+// La connexion est FAITE UNE FOIS. Le fichier vit dans le dossier de données
+// (Documents\WLED Fleet), pas à côté du code : il survit donc aussi bien à un
+// redémarrage qu'à une mise à jour de l'application, qui remplace le code.
+// Un jeton d'OAuth App n'expire pas de lui-même ; on ne redemande la connexion
+// que si GitHub finit par le refuser.
+function loadGithub() {
+  try {
+    const raw = JSON.parse(fs.readFileSync(GITHUB_FILE, 'utf8'));
+    ghConf = { ...ghConf, ...raw, token: unprotect(raw.token) };
+  } catch { /* pas encore configuré */ }
+}
+function saveGithub() {
+  try {
+    const t = GITHUB_FILE + '.part';
+    fs.writeFileSync(t, JSON.stringify({ ...ghConf, token: protect(ghConf.token) }, null, 2));
+    fs.renameSync(t, GITHUB_FILE);
+  } catch { /* ignore */ }
+}
+
+// ── L'application GitHub, et comment elle se met à jour ────────────────────
+// Le `client_id` d'une OAuth App n'est pas un secret : il voyage avec
+// l'application, c'est prévu. Il est donc compilé dans l'installeur — aucune
+// dépendance extérieure à installer pour se connecter.
+//
+// Mais un client_id peut devoir changer sans qu'on republie tout le monde :
+// application recréée, organisation renommée, portée revue. Fleet va donc lire
+// périodiquement `github-app.json` dans son propre dépôt public, et retient ce
+// qu'il y trouve. Le dépôt public est déjà la source de ses mises à jour ; ça
+// n'ajoute pas de point de confiance.
+//
+// L'ordre est : ce qu'on a appris en ligne, sinon la valeur compilée. Une
+// panne de réseau ne peut donc pas empêcher de se connecter.
+const DEFAULT_CLIENT_ID = '';        // renseigné à la création de l'OAuth App
+const APP_MANIFEST = { repo: 'Tensegrity-Lighting-Service/WLED-Fleet', path: 'github-app.json' };
+const APP_MANIFEST_INTERVAL = 24 * 60 * 60 * 1000;
+const ghClientId = () => ghConf.clientId || DEFAULT_CLIENT_ID;
+
+async function refreshGithubApp() {
+  try {
+    const r = await github.request('GET', `/repos/${APP_MANIFEST.repo}/contents/${APP_MANIFEST.path}`, {});
+    if (r.error) return;                                   // absent : on garde ce qu'on a
+    const doc = JSON.parse(Buffer.from(r.json.content || '', 'base64').toString('utf8'));
+    const id = String(doc.clientId || '').trim();
+    if (id && id !== ghConf.clientId) {
+      ghConf.clientId = id; saveGithub();
+      console.log(`application GitHub : client_id mis à jour depuis ${APP_MANIFEST.repo}`);
+    }
+  } catch { /* réseau, JSON abîmé : la valeur compilée reste utilisable */ }
+}
+
+// ── Le jeton au repos ───────────────────────────────────────────────────────
+// Sous Windows, DPAPI chiffre pour le compte utilisateur courant : le fichier
+// recopié ailleurs ne se déchiffre pas. C'est un composant du système, pas une
+// dépendance à installer. Si ça échoue (autre OS, PowerShell verrouillé), on
+// retombe sur du clair plutôt que de perdre la connexion.
+const DPAPI_PREFIX = 'dpapi:';
+function protect(secret) {
+  if (process.platform !== 'win32' || !secret) return secret;
+  try {
+    const out = execFileSync('powershell', ['-NoProfile', '-NonInteractive', '-Command',
+      `ConvertTo-SecureString -String $input -AsPlainText -Force | ConvertFrom-SecureString`],
+    { input: secret, encoding: 'utf8', timeout: 10000 }).trim();
+    return out ? DPAPI_PREFIX + out : secret;
+  } catch { return secret; }
+}
+function unprotect(stored) {
+  if (typeof stored !== 'string' || !stored.startsWith(DPAPI_PREFIX)) return stored || '';
+  try {
+    return execFileSync('powershell', ['-NoProfile', '-NonInteractive', '-Command',
+      `$s = $input | ConvertTo-SecureString; [Runtime.InteropServices.Marshal]::PtrToStringAuto([Runtime.InteropServices.Marshal]::SecureStringToBSTR($s))`],
+    { input: stored.slice(DPAPI_PREFIX.length), encoding: 'utf8', timeout: 10000 }).trim();
+  } catch { return ''; }        // chiffré pour un autre compte : inutilisable, pas fatal
+}
+
+// ── Le jeton, demandé à GitHub CLI plutôt que stocké ────────────────────────
+// `gh auth token` lit le trousseau de l'OS. On l'interroge à chaque
+// synchronisation : Fleet n'écrit alors aucun secret sur le disque, et le
+// jeton suit la session gh — s'y déconnecter coupe l'accès sans avoir à
+// nettoyer quoi que ce soit ici.
+//
+// Court cache : une synchronisation enchaîne plusieurs requêtes, et lancer un
+// processus par requête serait inutilement lent.
+const { execFileSync } = require('child_process');
+let ghCliCache = { token: '', at: 0 };
+function ghCliToken() {
+  if (ghCliCache.token && Date.now() - ghCliCache.at < 60000) return ghCliCache.token;
+  const token = execFileSync('gh', ['auth', 'token'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 10000 }).trim();
+  if (!token) throw new Error('GitHub CLI n\'a pas rendu de jeton');
+  ghCliCache = { token, at: Date.now() };
+  return token;
+}
+// Le jeton effectif, quelle que soit la source. Ne JAMAIS le renvoyer par l'API.
+function ghToken() {
+  if (ghConf.source === 'gh') {
+    try { return ghCliToken(); }
+    catch { throw new Error('GitHub CLI indisponible ou déconnecté — lancer « gh auth login », ou se connecter depuis l\'onglet Bibliothèque'); }
+  }
+  return ghConf.token || '';
+}
+const ghHasAuth = () => (ghConf.source === 'gh' ? ghCliAvailable() : !!ghConf.token);
+function ghCliAvailable() {
+  try { return !!execFileSync('gh', ['auth', 'token'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 8000 }).trim(); }
+  catch { return false; }
+}
+
+// ── Connexion GitHub, en une fois ───────────────────────────────────────────
+// Une seule connexion en cours à la fois : le code affiché n'a de sens que
+// pour la demande qui l'a produit.
+let ghDevice = null;
+function ghLoggedIn(token, login, source) {
+  ghConf.source = source; ghConf.token = source === 'gh' ? '' : token;
+  ghConf.login = login || ''; ghConf.lastError = ''; ghDevice = null;
+  saveGithub(); startAutoSync();
+}
+// Au démarrage : vérifier que le jeton gardé est toujours accepté. Un jeton
+// révoqué doit se voir tout de suite, pas au premier essai de publication.
+async function checkGithubAuth() {
+  if (!ghConf.token && ghConf.source !== 'gh') return;
+  try { const me = await github.whoami(ghToken()); ghConf.login = me.login; ghConf.lastError = ''; saveGithub(); }
+  catch (e) {
+    // 401 = jeton révoqué ou expiré : on l'oublie, il ne servira plus
+    if (/jeton/i.test(e.message)) { ghConf.token = ''; ghConf.login = ''; ghConf.lastError = 'connexion GitHub expirée — se reconnecter'; saveGithub(); }
+  }
+}
+
+// Ce que l'interface a le droit de voir : de quoi savoir si c'est configuré et
+// reconnaître le jeton, jamais le jeton.
+const githubView = () => ({
+  repo: ghConf.repo, branch: ghConf.branch || 'main',
+  source: ghConf.source || 'gh', login: ghConf.login || '',
+  hasToken: ghHasAuth(), tail: ghConf.source === 'token' && ghConf.token ? `…${ghConf.token.slice(-4)}` : '',
+  lastSyncAt: ghConf.lastSyncAt || 0, lastError: ghConf.lastError || '',
+  auto: ghConf.auto !== false, autoBusy: ghBusy,
+  pending: libraryStore.products.filter(p => p.dirty && !p.retired).length,
+});
+
+// ── Synchronisation automatique ─────────────────────────────────────────────
+// Tant que Fleet reste un outil interne, tenir le catalogue à jour à la main
+// est une corvée qu'on oublie — et un catalogue oublié fait des marqueurs qui
+// ne résolvent plus. On tire au démarrage puis régulièrement, et on publie ce
+// qui a changé ici.
+//
+// C'est acceptable UNIQUEMENT parce que la publication ne peut rien écraser :
+// sur collision, la version en ligne devient la base et la nôtre repart
+// au-dessus (voir github.js). Sans cette garantie, une publication automatique
+// serait le meilleur moyen d'effacer le travail d'un collègue en silence.
+//
+// À revoir le jour où le logiciel sort d'ici : un utilisateur qui ne connaît
+// pas le dépôt ne doit pas y publier sans l'avoir demandé.
+const AUTO_SYNC_INTERVAL = 10 * 60 * 1000;
+let ghBusy = false, ghAutoTimer = null;
+
+async function autoSync(reason = 'périodique') {
+  if (READONLY || ghBusy) return;
+  if (!ghConf.repo || ghConf.auto === false) return;
+  ghBusy = true;
+  try {
+    const r = await github.pull(ghConf.repo, libraryStore, { token: ghToken(), branch: ghConf.branch });
+    let n = 0;
+    for (const remote of r.fetched) {
+      const mine = library.resolve(libraryStore, remote.uid);
+      if (!mine) { libraryStore.products.push(library.normProduct({ ...remote, dirty: false })); n++; continue; }
+      // ce qui est modifié ici et pas encore publié n'est jamais écrasé par le
+      // dépôt : la publication juste après saura se replacer au-dessus
+      if (mine.dirty && library.substance(mine) !== library.substance(remote)) continue;
+      Object.assign(mine, library.normProduct({ ...remote, dirty: false })); n++;
+    }
+    let pushed = 0;
+    if (ghHasAuth()) {
+      for (const prod of libraryStore.products.filter(x => x.dirty && !x.retired)) {
+        const res = await github.publish(ghConf.repo, prod, { token: ghToken(), branch: ghConf.branch });
+        Object.assign(prod, library.normProduct({ ...res.product, origin: 'library', dirty: false }), { blobSha: res.sha || null });
+        if (res.action !== 'skip' && res.action !== 'adopt') pushed++;
+      }
+    }
+    libraryStore = library.normStore(libraryStore);
+    ghConf.lastSyncAt = Date.now(); ghConf.lastError = '';
+    saveGithub(); if (n || pushed) saveLibrary();
+    if (n || pushed) console.log(`bibliothèque (${reason}) : ${n} repris du dépôt, ${pushed} publié(s)`);
+  } catch (e) {
+    ghConf.lastError = e.message; saveGithub();
+    console.log(`bibliothèque (${reason}) : ${e.message}`);
+  } finally { ghBusy = false; }
+}
+// après une modification locale : laisser le temps d'enchaîner plusieurs
+// enregistrements avant d'aller voir GitHub, sinon on commite trois fois pour
+// une seule séance d'édition
+let ghSoon = null;
+const autoSyncSoon = () => {
+  if (READONLY || !ghConf.repo || ghConf.auto === false) return;
+  clearTimeout(ghSoon); ghSoon = setTimeout(() => autoSync('après édition'), 5000);
+};
+function startAutoSync() {
+  clearInterval(ghAutoTimer);
+  if (!ghConf.repo || ghConf.auto === false) return;
+  setTimeout(() => autoSync('démarrage'), 3000);
+  ghAutoTimer = setInterval(() => autoSync('périodique'), AUTO_SYNC_INTERVAL);
+}
+// forme attendue par l'ancien point d'entrée et par les anciens showfiles
+const legacyProfiles = () => libraryStore.products.filter(p => !p.retired).map(p => ({
+  id: p.uid, name: library.label(p), type: p.led.type, order: p.led.order,
+  len: (p.presets.find(x => x.default) || p.presets[0] || {}).px || 0,
+  perM: p.led.perM, note: p.ref.note,
+}));
+// quelles sorties de la flotte utilisent quel produit — sert au badge, au
+// panneau « utilisé par » de l'éditeur, et au garde-fou avant de retirer.
+// Indexé par uid : un node encore marqué à l'ancien identifiant court est
+// résolu ici, donc il compte bien dans les usages du produit.
+function productUsage() {
+  const by = {};
+  for (const rec of fleet.values()) {
+    const meta = rec.meta.nodeMeta; if (!meta) continue;
+    const ins = (rec.cfg && rec.cfg.hw && rec.cfg.hw.led && rec.cfg.hw.led.ins) || [];
+    for (const o of meta.outputs) {
+      if (!o.product) continue;
+      const p = library.resolve(libraryStore, o.product);
+      const key = p ? p.uid : o.product;                   // marqueur inconnu : gardé tel quel, jamais effacé
+      (by[key] = by[key] || []).push({
+        ip: rec.meta.ip, name: (rec.info && rec.info.name) || rec.meta.ip, index: o.i,
+        len: (ins[o.i] || {}).len || 0,
+        rev: o.prev, revState: library.revState(p, o.prev),
+      });
+    }
+  }
+  return by;
+}
 const allGroups = () => [...new Set([...declaredGroups, ...[...fleet.values()].map(r => r.meta.group || '').filter(Boolean)])].sort((a, b) => a.localeCompare(b));
 function saveKnown() {
   if (FIXED_IPS.length) return;
@@ -898,6 +1251,9 @@ function loadKnown() {
     if (e.offlineQueue && typeof e.offlineQueue === 'object') r.meta.offlineQueue = e.offlineQueue; // edits made while this node was unreachable, not yet resolved
     if (e.info) { r.info = e.info; r.state = e.state || null; r.cfg = e.cfg || null; r.meta.lastSeen = e.lastSeen || null; r.meta.fails = 2; derive(r); }
     if (Array.isArray(e.ignoredOutputs)) r.meta.ignoredOutputs = e.ignoredOutputs; // Fleet-only: outputs not counted in the DMX plan
+    // dernière copie connue des métadonnées du node : sert à les afficher hors
+    // ligne, et à les remettre si le node revient nu d'une mise à jour
+    if (e.nodeMeta) { r.meta.nodeMetaSeen = metadata.parse(e.nodeMeta); r.meta.nodeMeta = r.meta.nodeMetaSeen; }
     if (typeof e.group === 'string' && e.group) r.meta.group = e.group; // Fleet-only: node group (zone, type…)
     if (r.meta.offlineQueue) { // offlineQueue overrides the two legacy fallbacks above too
       if (r.meta.offlineQueue.group !== undefined) r.meta.group = r.meta.offlineQueue.group;
@@ -1041,8 +1397,19 @@ const server = http.createServer(async (req, res) => {
   const p = url.pathname;
   let m;
   try {
+    // @api État complet de la flotte : un objet par node avec info, state,
+    // cfg, les colonnes dérivées et les métadonnées Fleet. C'est la lecture
+    // principale, celle que la grille rafraîchit en boucle.
     if (p === '/api/fleet') return send(res, 200, fleetPayload());
-    if (p === '/api/columns') { const { LED_TYPES, COLOR_ORDERS, WHITE_SWAPS, WHITE_SWAP_TYPES } = require('./columns'); return send(res, 200, { columns, groups, ledTypes: LED_TYPES, colorOrders: COLOR_ORDERS, whiteSwaps: WHITE_SWAPS, whiteSwapTypes: WHITE_SWAP_TYPES }); }
+    // @api Vocabulaire de l'application : définition des colonnes, groupes
+    // déclarés, et les tables WLED (types de LED, ordres des couleurs,
+    // échanges du blanc, types à canal blanc, consommations par pixel
+    // courantes, et les bornes du firmware pour les champs de courant).
+    if (p === '/api/columns') { const { LED_TYPES, COLOR_ORDERS, WHITE_SWAPS, WHITE_SWAP_TYPES, LED_MA_PRESETS, LED_MA_MAX, PSU_MA_MIN, PSU_MA_MAX, MA_FOR_ESP } = require('./columns'); return send(res, 200, { columns, groups, ledTypes: LED_TYPES, colorOrders: COLOR_ORDERS, whiteSwaps: WHITE_SWAPS, whiteSwapTypes: WHITE_SWAP_TYPES, ledMaPresets: LED_MA_PRESETS, ledMaMax: LED_MA_MAX, psuMaMin: PSU_MA_MIN, psuMaMax: PSU_MA_MAX, maForEsp: MA_FOR_ESP }); }
+    // @api Écrit les sorties LED du node. Le bloc hw.led.ins est renvoyé
+    // ENTIER — WLED le reconstruit — et les champs non gérés par Fleet sont
+    // hérités par position. Accepte un tableau `meta` optionnel, écrit dans
+    // /fleet.json APRÈS les réglages.
     if ((m = /^\/api\/node\/([^/]+)\/outputs$/.exec(p)) && req.method === 'POST') {
       // LED outputs editor: WLED rebuilds hw.led.ins from the payload, so the WHOLE array is sent.
       // Only scalar fields we understand are taken from the UI; anything else on an existing bus is kept.
@@ -1064,21 +1431,42 @@ const server = http.createServer(async (req, res) => {
         // pas par index de départ — ⚡ Patcher renumérote les départs, et prevByStart faisait
         // alors hériter la ligne des réglages d'UNE AUTRE sortie (corrigé 2026-09-08).
         const base = { ...(prevIns[i] || {}) };
-        const ledma = Number(u.ledma);
+        // borné à 255 : le firmware relit ce champ dans un uint8_t
+        // (cfg.cpp:241), donc 5000 ne serait pas refusé mais tronqué en
+        // silence, et l'ABL freinerait d'après un chiffre inventé. Rien ne le
+        // bornait jusqu'ici, ni ici ni dans l'interface.
+        const ledma = Math.min(255, Number(u.ledma));
         // hw.led.ins[].order = (échange du blanc << 4) | ordre des couleurs : ne réécrire que
         // le quartet qu'on connaît, sinon le swap réglé dans WLED est effacé à chaque save.
         const wswap = Number(u.wswap);
         const lowNib = Number.isFinite(order) ? (order & 0x0f) : ((base.order ?? 0) & 0x0f);
         const highNib = Number.isFinite(wswap) ? (wswap & 0x0f) : (((base.order ?? 0) >> 4) & 0x0f);
-        ins.push({ ...base, pin: pins, type: Number.isFinite(type) ? type : (base.type ?? 22), order: (highNib << 4) | lowNib, start, len, rev: !!u.rev, skip: Math.max(0, Number(u.skip) || 0), ledma: Number.isFinite(ledma) && ledma >= 0 ? ledma : (base.ledma ?? 55), ref: !!u.ref });
+        // Limite de courant PAR SORTIE. Elle n'agit que si la limite globale du
+        // node vaut 0 — les deux régimes s'excluent (bus_manager.cpp:1449). WLED
+        // l'expose par la case « Use per-output limiter », qui n'est pas stockée :
+        // cocher revient à soumettre maxpwr global = 0 (settings_leds.htm:164).
+        const omax = Number(u.omax);
+        ins.push({ ...base, pin: pins, type: Number.isFinite(type) ? type : (base.type ?? 22), order: (highNib << 4) | lowNib, start, len, rev: !!u.rev, skip: Math.max(0, Number(u.skip) || 0), ledma: Number.isFinite(ledma) && ledma >= 0 ? ledma : (base.ledma ?? 55), ref: !!u.ref,
+          ...(Number.isFinite(omax) && omax >= 0 ? { maxpwr: Math.min(65000, Math.round(omax)) } : {}) });
       }
       try {
         await postJson(ip, '/json/cfg', { hw: { led: { ins } } }, 8000);
         recordChange(rec, 'outputs', rec.derived.outputs, ins.map(x => `${x.pin.join('/')}:${x.start}+${x.len}`).join(' | '), 'grille');
+        // Les métadonnées Fleet APRÈS les réglages, jamais avant : si l'écriture
+        // du fichier échoue, le node porte des réglages sans marqueur — gênant
+        // mais honnête. Dans l'autre sens il revendiquerait un produit dont il
+        // n'a pas les réglages, ce qui est un mensonge durable.
+        let metaWarn = '';
+        if (Array.isArray(b.meta)) {
+          try { await writeNodeMeta(rec, b.meta, ins); }
+          catch (e) { metaWarn = `réglages écrits, mais métadonnées non enregistrées : ${e.message}`; }
+        }
         rec.meta.cfgUpdated = 0; await pollInfoState(rec, 'grille');
-        return send(res, 200, { ok: true, outputs: rec.derived.outputs, total: rec.info && rec.info.leds && rec.info.leds.count });
+        return send(res, 200, { ok: true, outputs: rec.derived.outputs, total: rec.info && rec.info.leds && rec.info.leds.count, warn: metaWarn });
       } catch (e) { return send(res, 502, { error: e.message }); }
     }
+    // @api Aligne le nom mDNS et le SSID du point d'accès du node sur son nom
+    // (ou sur un nouveau nom). Demande un redémarrage du node.
     if ((m = /^\/api\/node\/([^/]+)\/unify$/.exec(p)) && req.method === 'POST') {
       // align mDNS and AP SSID on the node's name (or on a new name if given); reboot needed for both
       if (READONLY) return send(res, 403, { error: 'lecture seule' });
@@ -1095,11 +1483,16 @@ const server = http.createServer(async (req, res) => {
         return send(res, 200, { ok: true, name, mdns: cfg.id.mdns, ap: name, rebooted: !!b.reboot });
       } catch (e) { return send(res, 502, { error: e.message }); }
     }
+    // @api Fait clignoter le node quelques secondes pour le repérer
+    // physiquement, puis remet son état d'origine.
     if ((m = /^\/api\/node\/([^/]+)\/identify$/.exec(p)) && req.method === 'POST') {
       const b = await readBody(req);
       try { return send(res, 200, await identifyNode(decodeURIComponent(m[1]), Math.min(15000, Math.max(500, Number(b.ms) || 3000)))); }
       catch (e) { return send(res, 502, { error: e.message }); }
     }
+    // @api Repérage d'un pixel : allonge temporairement la sortie à son
+    // maximum et éclaire trois zones (avant, marqueur, après) pour compter
+    // sur le ruban. La longueur d'origine est toujours rétablie à l'arrêt.
     if ((m = /^\/api\/node\/([^/]+)\/locate-pixel$/.exec(p)) && req.method === 'POST') {
       // real hw.led.ins length change (see setLocatePixel), always restored on stop —
       // still refused in lecture seule like any other write to a node's config
@@ -1111,20 +1504,29 @@ const server = http.createServer(async (req, res) => {
       const opts = { hi: b.hi, lo: b.lo, over: b.over, bri: b.bri, probe: b.probe };
       try { return send(res, 200, await setLocatePixel(ip, index, len, !!b.rev, opts)); } catch (e) { return send(res, 502, { error: e.message }); }
     }
+    // @api Arrête le repérage et rétablit la longueur et l'état d'origine de
+    // la sortie.
     if ((m = /^\/api\/node\/([^/]+)\/locate-pixel$/.exec(p)) && req.method === 'DELETE') {
       try { return send(res, 200, await stopLocatePixel(decodeURIComponent(m[1]))); } catch (e) { return send(res, 502, { error: e.message }); }
     }
+    // @api Change l'adresse IP de plusieurs nodes d'un coup, échanges et
+    // rotations compris : toutes les écritures d'abord, tous les redémarrages
+    // ensuite.
     if (p === '/api/nodes/relocate' && req.method === 'POST') {
       // several IP changes at once (swaps / rotations allowed): write all, reboot all
       const b = await readBody(req);
       if (!Array.isArray(b.moves) || !b.moves.length) return send(res, 400, { error: 'aucun déplacement' });
       try { return send(res, 200, await relocateBatch(b.moves)); } catch (e) { return send(res, 400, { error: e.message }); }
     }
+    // @api Change l'adresse IP fixe d'un node, puis le redémarre.
     if ((m = /^\/api\/node\/([^/]+)\/relocate$/.exec(p)) && req.method === 'POST') {
       const b = await readBody(req);
       try { return send(res, 200, await relocateNode(decodeURIComponent(m[1]), b)); }
       catch (e) { return send(res, 400, { error: e.message }); }
     }
+    // @api Réglages du serveur : le fichier settings.json, les valeurs
+    // effectives (sous-réseaux, écoute, intervalles, lecture seule) et l'état
+    // réseau du poste.
     if (p === '/api/settings' && req.method === 'GET') {
       return send(res, 200, {
         file: SETTINGS_FILE, settings,
@@ -1132,6 +1534,8 @@ const server = http.createServer(async (req, res) => {
         net: netStatus(), launcher: !!process.env.WLED_FLEET_LAUNCHER,
       });
     }
+    // @api Valide et écrit settings.json, puis redémarre le serveur par le
+    // lanceur pour que tout soit relu.
     if (p === '/api/settings' && req.method === 'POST') {
       // validate, write settings.json, restart through the launcher so everything is re-read
       const b = await readBody(req);
@@ -1154,6 +1558,8 @@ const server = http.createServer(async (req, res) => {
       if (restart) { console.log('réglages modifiés, redémarrage'); setTimeout(() => process.exit(RESTART_EXIT_CODE), 300); }
       return;
     }
+    // @api Ouvre une URL dans le navigateur du système. La fenêtre native ne
+    // sait pas ouvrir d'onglet elle-même.
     if (p === '/api/open' && req.method === 'POST') {
       // open a URL in the system's default browser (the native window's WebView cannot):
       // this page itself, a tab in its own window, or a node's WLED UI
@@ -1165,7 +1571,11 @@ const server = http.createServer(async (req, res) => {
         return send(res, 200, { ok: true, url: u });
       } catch (e) { return send(res, 500, { error: e.message }); }
     }
+    // @api Version de l'application, version de Node, dossiers de code et de
+    // données, PID et temps de fonctionnement.
     if (p === '/api/about') return send(res, 200, { version: APP_VERSION, node: process.version, dir: CODE_DIR, dataDir: DATA_DIR, settingsFile: SETTINGS_FILE, settings, launcher: !!process.env.WLED_FLEET_LAUNCHER, pid: process.pid, uptime: Math.round(process.uptime()) });
+    // @api Redémarre le serveur pour relire les fichiers source. Refusé si le
+    // serveur n'a pas été lancé par le lanceur.
     if (p === '/api/restart' && req.method === 'POST') {
       // reload edited source files: exit with the code the launcher restarts on
       if (!process.env.WLED_FLEET_LAUNCHER) return send(res, 409, { error: 'serveur lancé sans WLED-Fleet.cmd : le relancer à la main' });
@@ -1179,12 +1589,19 @@ const server = http.createServer(async (req, res) => {
     // passwords, node list, config backups, firmware catalogue, optional journal),
     // optionally encrypted with a passphrase (scrypt + AES-256-GCM). The UI adds
     // its own column layout before saving the file.
+    // @api Exporte un showfile : groupes, sorties non câblées, bibliothèque
+    // de produits, métadonnées des nodes, réglages retenus. Jamais de
+    // secrets.
     if (p === '/api/showfile' && req.method === 'POST') {
       const b = await readBody(req);
       const inc = b.include || {};
       const doc = {
         format: 'wledfleet-showfile', formatVersion: 1, app: APP_VERSION, exportedAt: new Date().toISOString(),
-        settings, antennas: ap.exportStore(), knownNodes: knownEntries(), groups: declaredGroups, ledProfiles,
+        // `library` porte le catalogue complet (avec ses identifiants) ;
+        // `ledProfiles` reste pour qu'une version antérieure sache encore lire
+        // ce showfile.
+        settings, antennas: ap.exportStore(), knownNodes: knownEntries(), groups: declaredGroups,
+        library: libraryStore, ledProfiles: legacyProfiles(),
         snapshots: snapshots.list().map(s => { try { return snapshots.load(s.id); } catch { return null; } }).filter(Boolean),
         firmwareIndex: (() => { try { return JSON.parse(fs.readFileSync(dataFile('firmware', 'index.json'), 'utf8')); } catch { return null; } })(),
         journal: inc.journal ? changes.slice(-2000) : undefined,
@@ -1203,6 +1620,9 @@ const server = http.createServer(async (req, res) => {
       recordChangeFleet(`showfile exporté (${b.passphrase ? 'chiffré' : 'en clair'}, ${doc.snapshots.length} sauvegarde(s), ${doc.knownNodes.length} node(s))`);
       return send(res, 200, out);
     }
+    // @api Importe un showfile. Les identifiants de produits sont conservés
+    // tels quels, sinon les marqueurs déjà posés sur les nodes désigneraient
+    // autre chose.
     if (p === '/api/showfile/import' && req.method === 'POST') {
       if (READONLY) return send(res, 403, { error: 'lecture seule' });
       const b = await readBody(req);
@@ -1224,7 +1644,16 @@ const server = http.createServer(async (req, res) => {
       if (what.antennas && doc.antennas) { ap.importStore(doc.antennas); startApPolling(); done.push(`${Object.keys(doc.antennas.aps || {}).length} antenne(s)`); }
       if (what.nodes && Array.isArray(doc.knownNodes)) {
         if (Array.isArray(doc.groups)) declaredGroups = [...new Set([...declaredGroups, ...doc.groups.filter(g => typeof g === 'string' && g)])];
-        if (Array.isArray(doc.ledProfiles)) { for (const x of doc.ledProfiles) { try { upsertProfile(x); } catch { /* skip */ } } }
+        // La bibliothèque est fusionnée en HONORANT les identifiants. C'est la
+        // régression que ça corrige : l'ancien import passait par upsertProfile,
+        // qui ignorait l'id reçu et en réattribuait un — les nodes du showfile
+        // gardaient alors des marqueurs qui, sur ce poste, désignaient un autre
+        // produit.
+        const incoming = doc.library ? library.normStore(doc.library).products : library.migrate(doc.ledProfiles || []).products;
+        for (const p of incoming) {
+          try { libraryStore = library.upsert(libraryStore, p).store; } catch { /* produit illisible : ignoré */ }
+        }
+        if (incoming.length) { saveLibrary(); done.push(`${incoming.length} produit(s) LED`); }
         for (const e of doc.knownNodes) { const ip = typeof e === 'string' ? e : e.ip; if (!ip) continue; const r = addNode(ip); if (e.info && !r.info) { r.info = e.info; r.state = e.state || null; r.cfg = e.cfg || null; r.meta.lastSeen = e.lastSeen || null; r.meta.fails = 2; } if (typeof e.group === 'string' && e.group) r.meta.group = e.group; if (Array.isArray(e.ignoredOutputs)) r.meta.ignoredOutputs = e.ignoredOutputs; derive(r); }
         saveKnown(); pollAll(); done.push(`${doc.knownNodes.length} node(s)`);
       }
@@ -1243,9 +1672,239 @@ const server = http.createServer(async (req, res) => {
     // dont un qui court-circuitait « Enregistrer les modifications ». Tout passe désormais
     // par ⚡ Patcher côté page (stratégie « une sortie = un univers »), donc par le bouton
     // Enregistrer, avec le récapitulatif des nodes touchés avant écriture.
-    if (p === '/api/led-profiles' && req.method === 'GET') return send(res, 200, { profiles: ledProfiles });
-    if (p === '/api/led-profiles' && req.method === 'POST') { const b = await readBody(req); try { return send(res, 200, { ok: true, profile: upsertProfile(b), profiles: ledProfiles }); } catch (e) { return send(res, 400, { error: e.message }); } }
-    if ((m = /^\/api\/led-profiles\/([^/]+)$/.exec(p)) && req.method === 'DELETE') { const name = decodeURIComponent(m[1]); ledProfiles = ledProfiles.filter(x => x.name !== name); saveProfiles(); return send(res, 200, { ok: true, profiles: ledProfiles }); }
+    // ── Bibliothèque de produits LED ──────────────────────────────────────
+    // Remplace /api/led-profiles : identité structurée, tous les réglages du
+    // produit, plusieurs longueurs types, et des identifiants qui ne bougent
+    // plus (voir library.js).
+    // @api Catalogue de produits LED, avec pour chaque produit le relevé des
+    // sorties qui l'utilisent et l'état de leur révision (à jour, en retard,
+    // en avance, inconnue).
+    if (p === '/api/library' && req.method === 'GET') {
+      const { LED_TYPES, COLOR_ORDERS, WHITE_SWAPS, WHITE_SWAP_TYPES, LED_MA_PRESETS, LED_MA_MAX, PSU_MA_MIN, PSU_MA_MAX, MA_FOR_ESP } = require('./columns');
+      return send(res, 200, { ...libraryStore, usage: productUsage(), ledTypes: LED_TYPES, colorOrders: COLOR_ORDERS, whiteSwaps: WHITE_SWAPS, whiteSwapTypes: WHITE_SWAP_TYPES, ledMaPresets: LED_MA_PRESETS, ledMaMax: LED_MA_MAX, psuMaMin: PSU_MA_MIN, psuMaMax: PSU_MA_MAX, maForEsp: MA_FOR_ESP, readonly: READONLY });
+    }
+    // @api Crée ou met à jour un produit. L'uid est frappé à la création et
+    // ne change jamais ; la révision monte quand les réglages changent, pas
+    // quand le nom change.
+    if (p === '/api/library/product' && req.method === 'POST') {
+      if (READONLY) return send(res, 403, { error: 'lecture seule' }); // manquait sur /api/led-profiles
+      const b = await readBody(req);
+      try { const r = library.upsert(libraryStore, { ...b, updatedBy: ghConf.login || b.updatedBy || '' }); libraryStore = r.store; saveLibrary(); autoSyncSoon(); return send(res, 200, { ok: true, product: r.product, ...libraryStore }); }
+      catch (e) { return send(res, 400, { error: e.message }); }
+    }
+    // @api Retire un produit. Il est marqué retiré — jamais effacé — dès
+    // qu'une sortie de la flotte le référence, pour que son marqueur garde un
+    // sens.
+    if ((m = /^\/api\/library\/product\/([0-9a-z][0-9a-z-]{1,39})$/.exec(p)) && req.method === 'DELETE') {
+      if (READONLY) return send(res, 403, { error: 'lecture seule' });
+      // par identifiant, pas par nom : l'ancien DELETE indexait par nom sensible
+      // à la casse alors que l'upsert dédoublonnait sans casse
+      try {
+        const prod = library.resolve(libraryStore, m[1]);
+        // un produit qu'aucune sortie n'utilise et qui n'a jamais été publié
+        // peut disparaître pour de bon ; les autres sont seulement marqués
+        // retirés, sinon les marqueurs déjà posés ne désignent plus rien
+        const purge = prod ? !(productUsage()[prod.uid] || []).length : false;
+        libraryStore = library.retire(libraryStore, m[1], { purge });
+        saveLibrary();
+        return send(res, 200, { ok: true, purged: purge, ...libraryStore });
+      } catch (e) { return send(res, 400, { error: e.message }); }
+    }
+    // compatibilité : l'ancien point d'entrée, le temps qu'un showfile ancien passe
+    // @api État du dépôt partagé : quel dépôt, quelle branche, si un jeton est
+    // enregistré (ses 4 derniers caractères seulement, JAMAIS le jeton), la
+    // dernière synchronisation et le nombre de produits pas encore publiés.
+    if (p === '/api/library/remote' && req.method === 'GET') return send(res, 200, githubView());
+    // @api Enregistre le dépôt partagé, la branche, et la façon de
+    // s'authentifier. Un jeton saisi à la main n'est jamais renvoyé ensuite ;
+    // envoyer une chaîne vide l'efface.
+    if (p === '/api/library/remote' && req.method === 'POST') {
+      if (READONLY) return send(res, 403, { error: 'lecture seule' });
+      const b = await readBody(req);
+      if (b.repo !== undefined) ghConf.repo = String(b.repo || '').trim().replace(/^https?:\/\/github\.com\//, '').replace(/\.git$/, '');
+      if (b.branch !== undefined) ghConf.branch = String(b.branch || 'main').trim() || 'main';
+      if (b.source !== undefined) ghConf.source = b.source === 'token' ? 'token' : 'gh';
+      if (b.token !== undefined) { ghConf.token = String(b.token || '').trim(); if (ghConf.token) ghConf.source = 'token'; }
+      if (b.auto !== undefined) ghConf.auto = !!b.auto;
+      if (ghConf.repo && !/^[\w.-]+\/[\w.-]+$/.test(ghConf.repo)) return send(res, 400, { error: 'dépôt attendu sous la forme « proprietaire/depot »' });
+      ghConf.lastError = ''; saveGithub(); startAutoSync();
+      return send(res, 200, githubView());
+    }
+    // @api Démarre la connexion GitHub. Renvoie un code court et l'adresse où
+    // le saisir : c'est le « device flow », qui ne demande aucun logiciel
+    // extérieur ni aucun secret embarqué. La connexion est ensuite gardée, y
+    // compris après une mise à jour de l'application.
+    if (p === '/api/library/login/start' && req.method === 'POST') {
+      if (READONLY) return send(res, 403, { error: 'lecture seule' });
+      try {
+        const d = await github.deviceStart(ghClientId());
+        ghDevice = { ...d, startedAt: Date.now() };
+        return send(res, 200, { userCode: d.userCode, url: d.url, expiresIn: d.expiresIn, interval: d.interval });
+      } catch (e) { return send(res, 502, { error: e.message }); }
+    }
+    // @api Interroge l'avancement de la connexion. Répond `pending` tant que le
+    // code n'a pas été validé sur github.com — ce n'est pas une erreur, c'est
+    // l'attente normale.
+    if (p === '/api/library/login/poll' && req.method === 'POST') {
+      if (!ghDevice) return send(res, 409, { error: 'aucune connexion en cours' });
+      try {
+        const r = await github.devicePoll(ghClientId(), ghDevice.deviceCode);
+        if (r.pending) return send(res, 200, { pending: true, ...(r.slowDown ? { interval: r.slowDown } : {}) });
+        const me = await github.whoami(r.token);
+        ghLoggedIn(r.token, me.login, 'device');
+        return send(res, 200, { ok: true, ...githubView() });
+      } catch (e) { ghDevice = null; return send(res, 502, { error: e.message }); }
+    }
+    // @api Se déconnecte : le jeton gardé est effacé. Le dépôt et les réglages
+    // restent, seule l'identité s'en va.
+    if (p === '/api/library/logout' && req.method === 'POST') {
+      if (READONLY) return send(res, 403, { error: 'lecture seule' });
+      ghConf.token = ''; ghConf.login = ''; ghConf.lastError = ''; ghDevice = null;
+      saveGithub(); return send(res, 200, githubView());
+    }
+    // @api Se connecte par GitHub CLI, quand il est installé : Fleet lui
+    // demande son jeton au moment de s'en servir et n'en stocke aucun. Voie
+    // secondaire — la connexion normale ne dépend d'aucun logiciel extérieur.
+    if (p === '/api/library/login/cli' && req.method === 'POST') {
+      if (READONLY) return send(res, 403, { error: 'lecture seule' });
+      try {
+        const me = await github.whoami(ghCliToken());
+        ghLoggedIn('', me.login, 'gh');
+        return send(res, 200, { ok: true, ...githubView() });
+      } catch (e) {
+        return send(res, 409, { error: `${e.message}. Installer GitHub CLI (https://cli.github.com) puis lancer « gh auth login », ou utiliser la connexion normale.` });
+      }
+    }
+    // @api Tire le dépôt partagé (jamais destructif). Un produit modifié
+    // localement et pas encore publié n'est PAS écrasé : il est signalé comme
+    // divergent, à publier — c'est la publication qui saura se replacer
+    // au-dessus de la version en ligne.
+    if (p === '/api/library/pull' && req.method === 'POST') {
+      if (READONLY) return send(res, 403, { error: 'lecture seule' });
+      if (!ghConf.repo) return send(res, 400, { error: 'aucun dépôt partagé configuré' });
+      try {
+        const r = await github.pull(ghConf.repo, libraryStore, { token: ghToken(), branch: ghConf.branch });
+        const added = [], updated = [], kept = [];
+        for (const remote of r.fetched) {
+          const mine = library.resolve(libraryStore, remote.uid);
+          if (!mine) { libraryStore.products.push(library.normProduct({ ...remote, dirty: false })); added.push(library.label(remote)); continue; }
+          // un produit retouché ici et pas encore publié ne se fait pas écraser
+          // par le dépôt : ce serait perdre le travail local sans un mot
+          if (mine.dirty && library.substance(mine) !== library.substance(remote)) { kept.push(library.label(mine)); continue; }
+          Object.assign(mine, library.normProduct({ ...remote, dirty: false }));
+          updated.push(library.label(remote));
+        }
+        libraryStore = library.normStore(libraryStore);
+        ghConf.lastSyncAt = Date.now(); ghConf.lastError = ''; saveGithub(); saveLibrary();
+        if (added.length || updated.length) recordChangeFleet(`bibliothèque : ${added.length} produit(s) ajouté(s), ${updated.length} mis à jour depuis ${ghConf.repo}`);
+        return send(res, 200, { ok: true, added, updated, kept, unchanged: r.unchanged.length, ...githubView() });
+      } catch (e) { ghConf.lastError = e.message; saveGithub(); return send(res, 502, { error: e.message }); }
+    }
+    // @api Publie vers le dépôt partagé : un produit si `uid` est donné, sinon
+    // tous ceux qui ont changé localement. Rien n'est jamais écrasé — sur
+    // collision, la version en ligne devient la base et la nôtre repart
+    // au-dessus, de sorte qu'aucun numéro de révision ne désigne deux contenus.
+    if (p === '/api/library/publish' && req.method === 'POST') {
+      if (READONLY) return send(res, 403, { error: 'lecture seule' });
+      if (!ghConf.repo) return send(res, 400, { error: 'aucun dépôt partagé configuré' });
+      if (!ghHasAuth()) return send(res, 400, { error: 'pas connecté à GitHub : la publication demande un droit d\'écriture' });
+      const b = await readBody(req);
+      const todo = b.uid ? [library.resolve(libraryStore, b.uid)].filter(Boolean)
+        : libraryStore.products.filter(x => x.dirty && !x.retired);
+      if (!todo.length) return send(res, 200, { ok: true, done: [], note: 'rien à publier' });
+      const done = [], failed = [];
+      for (const prod of todo) {
+        try {
+          const r = await github.publish(ghConf.repo, prod, { token: ghToken(), branch: ghConf.branch });
+          // ce que le dépôt a accepté fait foi : on s'aligne dessus, y compris
+          // quand notre révision a été replacée au-dessus d'une autre
+          Object.assign(prod, library.normProduct({ ...r.product, origin: 'library', dirty: false }), { blobSha: r.sha || null });
+          done.push({ uid: prod.uid, label: library.label(prod), action: r.action, rev: prod.rev });
+        } catch (e) { failed.push({ uid: prod.uid, label: library.label(prod), error: e.message }); }
+      }
+      libraryStore = library.normStore(libraryStore);
+      ghConf.lastSyncAt = Date.now(); ghConf.lastError = failed.length ? failed[0].error : ''; saveGithub(); saveLibrary();
+      const rebased = done.filter(x => x.action === 'rebase');
+      if (done.length) recordChangeFleet(`bibliothèque : ${done.length} produit(s) publié(s) vers ${ghConf.repo}${rebased.length ? `, dont ${rebased.length} replacé(s) au-dessus d'une version en ligne` : ''}`);
+      return send(res, failed.length && !done.length ? 502 : 200, { ok: !failed.length, done, failed, ...githubView() });
+    }
+    // @api Ce que les nodes portent de la bibliothèque : chaque node cite les
+    // produits de ses sorties, avec leur fiche complète et leur révision. Le
+    // rapprochement dit, produit par produit, si le node est à jour, en retard,
+    // en avance, inconnu de ce poste, ou divergent — même révision, réglages
+    // différents, deux postes hors ligne ayant fait monter le même numéro.
+    if (p === '/api/library/nodes' && req.method === 'GET') {
+      const nodes = [];
+      for (const rec of fleet.values()) {
+        const slice = rec.meta.nodeLib; if (!slice) continue;
+        const items = library.compareNodeSlice(libraryStore, slice).filter(x => x.state !== 'same');
+        if (items.length) nodes.push({ ip: rec.meta.ip, name: (rec.info && rec.info.name) || rec.meta.ip, online: !!rec.meta.online, savedAt: slice.savedAt, items });
+      }
+      return send(res, 200, { nodes });
+    }
+    // @api Récupère dans le catalogue local un produit porté par un node —
+    // celui d'un node revenu d'ailleurs, ou d'un poste dont la bibliothèque
+    // était en avance. Jamais automatique : recopier sans demander effacerait
+    // silencieusement la version locale.
+    if (p === '/api/library/adopt' && req.method === 'POST') {
+      if (READONLY) return send(res, 403, { error: 'lecture seule' });
+      const b = await readBody(req);
+      const rec = fleet.get(String(b.ip || '')); if (!rec) return send(res, 404, { error: 'node inconnu' });
+      const slice = rec.meta.nodeLib; if (!slice) return send(res, 404, { error: 'ce node ne porte pas de bibliothèque' });
+      const np = slice.products.find(x => x.uid === b.uid);
+      if (!np) return send(res, 404, { error: 'produit absent de la copie de ce node' });
+      try {
+        // l'uid ET la révision sont repris tels quels : adopter, ce n'est pas
+        // créer une version de plus, c'est se mettre au niveau du node
+        const mine = library.resolve(libraryStore, np.uid);
+        const r = library.upsert(libraryStore, { ...np, rev: Math.max(np.rev, mine ? mine.rev : 0) });
+        // upsert incrémente quand les réglages diffèrent : on remet la révision
+        // du node, sinon ce poste repartirait aussitôt « en avance » sur lui
+        r.product.rev = np.rev;
+        libraryStore = r.store; saveLibrary();
+        recordChangeFleet(`produit « ${library.label(np)} » (rev ${np.rev}) repris depuis ${(rec.info && rec.info.name) || rec.meta.ip}`);
+        return send(res, 200, { ok: true, product: r.product });
+      } catch (e) { return send(res, 400, { error: e.message }); }
+    }
+    // @api Ancienne forme du catalogue, à plat. Conservée le temps qu'un
+    // showfile ancien passe ; utiliser /api/library.
+    if (p === '/api/led-profiles' && req.method === 'GET') return send(res, 200, { profiles: legacyProfiles() });
+
+    // ── Métadonnées d'un node (/fleet.json) ───────────────────────────────
+    // @api Métadonnées Fleet lues sur le node (/fleet.json), et la dernière
+    // copie non vide qu'en a gardée Fleet.
+    if ((m = /^\/api\/node\/([^/]+)\/meta$/.exec(p)) && req.method === 'GET') {
+      const rec = fleet.get(decodeURIComponent(m[1])); if (!rec) return send(res, 404, { error: 'node inconnu' });
+      return send(res, 200, { meta: rec.meta.nodeMeta || metadata.empty(), saved: rec.meta.nodeMetaSeen || null });
+    }
+    // écrire seulement les métadonnées, sans toucher aux sorties : c'est le cas
+    // quand on n'a changé qu'un numéro de fixture. Renvoyer tout hw.led.ins
+    // ferait reconstruire les bus par WLED pour rien.
+    // @api Écrit les métadonnées Fleet du node sans toucher à sa
+    // configuration LED. Fusionne : les clés inconnues et les sorties non
+    // citées sont conservées.
+    if ((m = /^\/api\/node\/([^/]+)\/meta$/.exec(p)) && req.method === 'POST') {
+      if (READONLY) return send(res, 403, { error: 'lecture seule' });
+      const ip = decodeURIComponent(m[1]); const rec = fleet.get(ip);
+      if (!rec) return send(res, 404, { error: 'node inconnu' });
+      if (!rec.meta.online) return send(res, 409, { error: 'node hors ligne' });
+      const b = await readBody(req);
+      if (!Array.isArray(b.outputs)) return send(res, 400, { error: 'liste de sorties attendue' });
+      const ins = (rec.cfg && rec.cfg.hw && rec.cfg.hw.led && rec.cfg.hw.led.ins) || [];
+      try { await writeNodeMeta(rec, b.outputs, ins); return send(res, 200, { ok: true, meta: rec.meta.nodeMeta }); }
+      catch (e) { return send(res, 502, { error: e.message }); }
+    }
+    // @api Repose les métadonnées sur un node revenu nu, à partir de la copie
+    // gardée par Fleet. Ne fait rien si le node a encore les siennes.
+    if ((m = /^\/api\/node\/([^/]+)\/meta\/restore$/.exec(p)) && req.method === 'POST') {
+      if (READONLY) return send(res, 403, { error: 'lecture seule' });
+      const rec = fleet.get(decodeURIComponent(m[1])); if (!rec) return send(res, 404, { error: 'node inconnu' });
+      if (!rec.meta.online) return send(res, 409, { error: 'node hors ligne' });
+      const r = await restoreNodeMeta(rec, 'grille');
+      return send(res, 200, { ok: r !== false, restored: r === true, reason: r === null ? 'rien à restaurer (le node a déjà ses métadonnées, ou Fleet n\'en a pas de copie)' : '' });
+    }
+    // @api Déclare un groupe, éventuellement vide, ou en renomme un — le
+    // groupe est le topic MQTT de groupe, écrit sur chaque node concerné.
     if (p === '/api/groups' && req.method === 'POST') { // declare a group (may stay empty), or rename one
       const b = await readBody(req);
       const name = String(b.name || '').trim().slice(0, 40); if (!name) return send(res, 400, { error: 'nom vide' });
@@ -1259,6 +1918,7 @@ const server = http.createServer(async (req, res) => {
       if (!declaredGroups.includes(name)) declaredGroups.push(name);
       saveKnown(); return send(res, 200, { ok: true, groups: allGroups(), renamed: n, skipped });
     }
+    // @api Oublie un groupe : ses nodes redeviennent sans groupe.
     if ((m = /^\/api\/groups\/([^/]+)$/.exec(p)) && req.method === 'DELETE') { // forget a group: its nodes become ungrouped
       const name = decodeURIComponent(m[1]); let n = 0; const skipped = [];
       for (const r of fleet.values()) if ((r.meta.group || '') === name) { try { await writeGroup(r, '', 'grille'); n++; } catch { skipped.push((r.info && r.info.name) || r.meta.ip); } }
@@ -1267,6 +1927,8 @@ const server = http.createServer(async (req, res) => {
       recordChangeFleet(`groupe « ${name} » supprimé (${n} node(s) sans groupe)`);
       saveKnown(); return send(res, 200, { ok: true, groups: allGroups(), ungrouped: n });
     }
+    // @api Change le groupe d'un node. C'est un champ WLED natif (topic MQTT
+    // de groupe), écrit sur le node et recopié dans son enregistrement.
     if ((m = /^\/api\/node\/([^/]+)\/group$/.exec(p)) && req.method === 'POST') {
       // Group = the node's MQTT group topic (native WLED field). Written on the node, mirrored in meta.group.
       const ip = decodeURIComponent(m[1]); const rec = fleet.get(ip);
@@ -1278,6 +1940,9 @@ const server = http.createServer(async (req, res) => {
       saveKnown();
       return send(res, 200, { ok: true, group: next, queued: !!(r && r.queued) });
     }
+    // @api Ancien marqueur de produit par sortie, écrit dans le client id
+    // MQTT. Conservé pour les nodes anciens ; les nouveaux passent par
+    // /api/node/:ip/meta.
     if ((m = /^\/api\/node\/([^/]+)\/output-profile$/.exec(p)) && req.method === 'POST') {
       // remember which LED profile is plugged on output `index` (0-based) : written on the node (MQTT client id suffix)
       const ip = decodeURIComponent(m[1]); const rec = fleet.get(ip);
@@ -1288,6 +1953,9 @@ const server = http.createServer(async (req, res) => {
       derive(rec); saveKnown();
       return send(res, 200, { ok: true, profiles: rec.meta.outputProfiles, queued: r === 'queued' });
     }
+    // @api Déclare, par POSITION dans hw.led.ins, les sorties qui existent
+    // dans WLED mais ne sont pas câblées. Elles ne réservent aucun canal et
+    // ne peuvent donc pas créer de conflit.
     if ((m = /^\/api\/node\/([^/]+)\/outputs-ignore$/.exec(p)) && req.method === 'POST') {
       // Fleet-only flag: outputs (by POSITION in hw.led.ins) that exist in WLED but are not
       // physically used; the channels they'd occupy are not reserved, so they never raise a
@@ -1300,6 +1968,8 @@ const server = http.createServer(async (req, res) => {
       derive(rec); saveKnown();
       return send(res, 200, { ok: true, ignored: rec.meta.ignoredOutputs, queued: r === 'queued' });
     }
+    // @api Applique à un node redevenu joignable les écritures mises en
+    // attente pendant son absence.
     if ((m = /^\/api\/node\/([^/]+)\/offline-queue\/apply$/.exec(p)) && req.method === 'POST') {
       if (READONLY) return send(res, 403, { error: 'lecture seule' });
       const ip = decodeURIComponent(m[1]); const rec = fleet.get(ip);
@@ -1307,12 +1977,16 @@ const server = http.createServer(async (req, res) => {
       try { return send(res, 200, { ok: true, ...(await applyOfflineQueue(rec)) }); }
       catch (e) { return send(res, rec.meta.online ? 502 : 409, { error: e.message }); }
     }
+    // @api Abandonne les écritures en attente pour ce node.
     if ((m = /^\/api\/node\/([^/]+)\/offline-queue\/discard$/.exec(p)) && req.method === 'POST') {
       const ip = decodeURIComponent(m[1]); const rec = fleet.get(ip);
       if (!rec) return send(res, 404, { error: 'node inconnu' });
       discardOfflineQueue(rec);
       return send(res, 200, { ok: true, group: rec.meta.group, ignored: rec.meta.ignoredOutputs, profiles: rec.meta.outputProfiles });
     }
+    // @api Plan DMX de toute la flotte : pour chaque sortie l'univers et le
+    // canal de son premier et de son dernier pixel, plus les conflits entre
+    // nodes, détectés au canal près.
     if (p === '/api/dmx-plan' && req.method === 'GET') {
       // plan de toute la flotte + conflits entre nodes, au canal près (voir dmx.js)
       const nodes = [...fleet.values()].filter(r => r.derived && r.derived.dmx).map(r => ({ ip: r.meta.ip, name: r.info && r.info.name, group: r.meta.group || '', online: r.meta.online, live: r.info && r.info.live, lm: r.info && r.info.lm, lip: r.info && r.info.lip, plan: r.derived.dmx }));
@@ -1320,21 +1994,29 @@ const server = http.createServer(async (req, res) => {
       const inUse = [...new Set(nodes.flatMap(n => (n.plan.occupancy || []).map(iv => iv.u)))].sort((a, b) => a - b);
       return send(res, 200, { nodes: nodes.sort((a, b) => (a.plan.uni || 0) - (b.plan.uni || 0)), conflicts, universesInUse: inUse });
     }
+    // @api Oublie les nodes vus pour la dernière fois il y a plus de N
+    // heures.
     if (p === '/api/nodes/purge' && req.method === 'POST') {
       const b = await readBody(req);
       return send(res, 200, { removed: purgeOffline(Number(b.olderThanH) || 0) });
     }
+    // @api Liste des sauvegardes de flotte.
     if (p === '/api/snapshots' && req.method === 'GET') return send(res, 200, { snapshots: snapshots.list() });
+    // @api Prend une sauvegarde de la flotte : config, presets et fichiers
+    // Fleet de chaque node joignable.
     if (p === '/api/snapshots' && req.method === 'POST') {
       const { name } = await readBody(req);
       const r = await snapshots.capture(name, [...fleet.values()], getJson);
       recordChangeFleet(`sauvegarde « ${r.name} » : ${r.nodes} node(s)`);
       return send(res, 200, r);
     }
+    // @api Importe un fichier de sauvegarde produit ailleurs.
     if (p === '/api/snapshots/import' && req.method === 'POST') {
       const name = String(req.headers['x-filename'] || 'import.json');
       try { return send(res, 200, snapshots.importFile(await readRaw(req), name)); } catch (e) { return send(res, 400, { error: e.message }); }
     }
+    // @api GET lit une sauvegarde (`?download=1` pour la télécharger), DELETE
+    // la supprime.
     if ((m = /^\/api\/snapshots\/([^/]+)$/.exec(p))) {
       const id = decodeURIComponent(m[1]);
       if (req.method === 'GET') {
@@ -1344,10 +2026,13 @@ const server = http.createServer(async (req, res) => {
       }
       if (req.method === 'DELETE') { snapshots.remove(id); return send(res, 200, { ok: true }); }
     }
+    // @api Compare une sauvegarde à l'état actuel de la flotte, colonne par
+    // colonne.
     if ((m = /^\/api\/snapshots\/([^/]+)\/diff$/.exec(p)) && req.method === 'GET') {
       try { return send(res, 200, { nodes: snapshots.diff(snapshots.load(decodeURIComponent(m[1])), [...fleet.values()], columns) }); }
       catch (e) { return send(res, 404, { error: e.message }); }
     }
+    // @api Restaure tout ou partie d'une sauvegarde sur les nodes choisis.
     if ((m = /^\/api\/snapshots\/([^/]+)\/restore$/.exec(p)) && req.method === 'POST') {
       if (READONLY) return send(res, 403, { error: 'lecture seule' });
       const { targets, what, reboot } = await readBody(req);
@@ -1359,6 +2044,9 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, { results });
     }
     // ── access point ──
+    // @api Vue de l'antenne : radios, clients associés, historique de scan,
+    // et les constats qui demandent de croiser l'antenne avec la config des
+    // nodes.
     if (p === '/api/ap' && req.method === 'GET') {
       const v = ap.view([...fleet.values()].map(r => r.info && r.info.mac).filter(Boolean));
       // fleet-level findings that need both sides (antenna + node config)
@@ -1374,34 +2062,52 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, v);
     }
     // ── WiFiman Wizard: mobile RF probe over BLE (wizard.js + tools/wizard/wizard_bridge.py) ──
+    // @api État de la sonde WiFi Bluetooth (WiFiman) et sa dernière lecture,
+    // rapprochée du dernier scan de l'antenne.
     if (p === '/api/wizard' && req.method === 'GET') return send(res, 200, wizard.view(ap.lastScan()));
+    // @api Liste les sondes Bluetooth à portée.
     if (p === '/api/wizard/devices' && req.method === 'GET') {
       try { return send(res, 200, { devices: await wizard.devices(Math.min(20, Math.max(2, Number(url.searchParams.get('timeout')) || 6))) }); }
       catch (e) { return send(res, 502, { error: e.message }); }
     }
+    // @api Se connecte à une sonde WiFi Bluetooth.
     if (p === '/api/wizard/connect' && req.method === 'POST') {
       const b = await readBody(req);
       try { return send(res, 200, await wizard.start({ address: b.address, mock: !!b.mock, raw: !!b.raw })); }
       catch (e) { return send(res, 400, { error: e.message }); }
     }
+    // @api Coupe la liaison avec la sonde.
     if (p === '/api/wizard/disconnect' && req.method === 'POST') return send(res, 200, { stopped: wizard.stop() });
+    // @api Connecte ou déconnecte la sonde — le bouton unique du panneau.
     if (p === '/api/wizard/toggle' && req.method === 'POST') { // the one WiFiman button
       try { return send(res, 200, await wizard.toggle()); } catch (e) { return send(res, 400, { error: e.message, ...wizard.status() }); }
     }
+    // @api Installe les dépendances de la sonde (bleak, et Python si absent).
     if (p === '/api/wizard/install' && req.method === 'POST') { // pip install bleak (and Python via winget if missing)
       try { return send(res, 200, await wizard.install()); } catch (e) { return send(res, 400, { error: e.message, ...wizard.status().deps }); }
     }
+    // @api État des dépendances de la sonde. `?force=1` refait la
+    // vérification.
     if (p === '/api/wizard/deps' && req.method === 'GET') return send(res, 200, await wizard.deps(url.searchParams.get('force') === '1'));
+    // @api Enregistre un relevé de site à l'endroit courant, sous un libellé.
     if (p === '/api/wizard/survey' && req.method === 'POST') {
       const b = await readBody(req);
       try { return send(res, 200, wizard.survey(b.label, { nearNode: b.nearNode })); }
       catch (e) { return send(res, 400, { error: e.message }); }
     }
+    // @api Supprime un relevé de site, désigné par son horodatage.
     if (p === '/api/wizard/survey' && req.method === 'DELETE') { const b = await readBody(req); return send(res, 200, { left: wizard.removeSurvey(b.at) }); }
+    // @api Les N derniers relevés de site.
     if (p === '/api/wizard/surveys' && req.method === 'GET') return send(res, 200, { surveys: wizard.surveys(Number(url.searchParams.get('n')) || 100) });
+    // @api Historique des mesures en direct de la sonde.
     if (p === '/api/wizard/live' && req.method === 'GET') return send(res, 200, { live: wizard.liveHistory(Number(url.searchParams.get('n')) || 720) });
+    // @api Cascade des canaux 2,4 GHz sur les N dernières lectures.
     if (p === '/api/wizard/waterfall' && req.method === 'GET') return send(res, 200, wizard.waterfall(Math.min(720, Number(url.searchParams.get('n')) || 360)));
+    // @api Déclare près de quel node se trouve la sonde, pour rapporter ses
+    // mesures à ce point.
     if (p === '/api/wizard/near' && req.method === 'POST') { const b = await readBody(req); return send(res, 200, { nearNode: wizard.setNear(b.mac) }); }
+    // @api Réglages de la sonde : activation, connexion automatique, chemin
+    // de Python.
     if (p === '/api/wizard/config' && req.method === 'POST') {
       const b = await readBody(req); const patch = {};
       if (b.enabled !== undefined) patch.enabled = !!b.enabled;
@@ -1413,6 +2119,9 @@ const server = http.createServer(async (req, res) => {
       else if (b.enabled === true && c.autoconnect && c.address && !wizard.status().running) wizard.start({ address: c.address }).catch(e => console.log(`wizard: ${e.message}`));
       return send(res, 200, { config: c, ...wizard.status() });
     }
+    // @api Lance un scan des canaux sur une radio de l'antenne. Perturbant
+    // par nature — la radio quitte son canal quelques secondes — donc jamais
+    // automatique.
     if (p === '/api/ap/scan' && req.method === 'POST') {
       // disruptive on purpose (radio leaves its channel for a few seconds); only on explicit user click
       if (READONLY) return send(res, 403, { error: 'lecture seule' });
@@ -1420,6 +2129,7 @@ const server = http.createServer(async (req, res) => {
       try { return send(res, 200, await ap.scan(b.iface || 'wifi1', Math.min(15, Math.max(2, Number(b.duration) || 5)))); }
       catch (e) { return send(res, 502, { error: e.message }); }
     }
+    // @api Historique des scans de canaux.
     if (p === '/api/ap/scans' && req.method === 'GET') return send(res, 200, { scans: ap.scanHistory() });
     // ── show preset for the antenna: current values vs recommended, apply the ticked ones ──
     const SHOW_PRESET = [
@@ -1432,6 +2142,8 @@ const server = http.createServer(async (req, res) => {
       { key: 'channel.width', want: '20mhz', why: '20 MHz : l\'ESP32 ne fait pas mieux, le 40 MHz double l\'exposition aux voisins' },
       { key: 'configuration.multicast-enhance', want: 'enabled', why: 'multicast converti en unicast acquitté (mDNS, E1.31 multicast, découverte WLED)' },
     ];
+    // @api Réglages recommandés pour une radio en configuration show,
+    // comparés aux valeurs actuelles.
     if (p === '/api/ap/preset' && req.method === 'GET') {
       const iface = url.searchParams.get('iface') || 'wifi1';
       try {
@@ -1441,6 +2153,7 @@ const server = http.createServer(async (req, res) => {
         return send(res, 200, { iface, items });
       } catch (e) { return send(res, 502, { error: e.message }); }
     }
+    // @api Applique les réglages recommandés cochés sur la radio.
     if (p === '/api/ap/preset' && req.method === 'POST') {
       if (READONLY) return send(res, 403, { error: 'lecture seule' });
       const b = await readBody(req);
@@ -1452,6 +2165,8 @@ const server = http.createServer(async (req, res) => {
         return send(res, 200, r);
       } catch (e) { return send(res, 502, { error: e.message }); }
     }
+    // @api Écrit le plan de canaux d'une radio de l'antenne, sur confirmation
+    // explicite.
     if (p === '/api/ap/channel' && req.method === 'POST') {
       // FIRST and only write to the router: channel plan of one radio, on explicit user confirmation
       if (READONLY) return send(res, 403, { error: 'lecture seule' });
@@ -1464,6 +2179,9 @@ const server = http.createServer(async (req, res) => {
       } catch (e) { return send(res, 502, { error: e.message }); }
     }
     // ── pairing of new nodes through the PC's Wi-Fi card ──
+    // @api Réseaux WiFi vus par la carte du poste, avec l'état de
+    // l'association. Les points d'accès WLED balisent lentement : ceux déjà
+    // vus sont mémorisés pour ne pas disparaître d'un scan à l'autre.
     if (p === '/api/pair/networks' && req.method === 'GET') {
       try {
         const fresh = await provision.wlanNetworks(url.searchParams.get('deep') === '1', url.searchParams.get('refresh') !== '0'); const st = await provision.wlanState();
@@ -1515,10 +2233,16 @@ const server = http.createServer(async (req, res) => {
         return send(res, 200, { networks: nets, pc: st, apScanAt: apScan ? apScan.at : null, show, apConfigured: !!ap.config() });
       } catch (e) { return send(res, 500, { error: `carte Wi‑Fi du PC : ${e.message}` }); }
     }
+    // @api Propose un nom et une adresse pour un node repéré par le SSID de
+    // son point d'accès.
     if (p === '/api/pair/suggest' && req.method === 'GET') {
       return send(res, 200, await suggestFor(String(url.searchParams.get('ssid') || ''), new Set()));
     }
+    // @api État du travail d'appairage en cours.
     if (p === '/api/pair/status' && req.method === 'GET') return send(res, 200, { job: provision.status() });
+    // @api Appaire un node : le poste rejoint son point d'accès, écrit le
+    // réseau du show (SSID et clé venus de l'antenne), puis revient.
+    // /api/pair/test fait le même trajet sans rien écrire.
     if ((p === '/api/pair' || p === '/api/pair/test') && req.method === 'POST') {
       if (READONLY) return send(res, 403, { error: 'lecture seule' });
       const b = await readBody(req);
@@ -1541,12 +2265,16 @@ const server = http.createServer(async (req, res) => {
         return send(res, 202, { job: j });
       } catch (e) { return send(res, 400, { error: e.message }); }
     }
+    // @api Lecture brute de RouterOS pour les audits. GET seulement, et
+    // limité aux arbres interface, system, ip et routing.
     if (p === '/api/ap/raw' && req.method === 'GET') {
       // read-only passthrough to RouterOS (GET only, wifi/system/interface trees) for audits
       const rp = String(url.searchParams.get('path') || '');
       if (!/^\/(interface|system|ip\/(address|dhcp-server|neighbor)|routing)(\/|$)/.test(rp) || /\/(set|add|remove|enable|disable|scan|reset|reboot|upgrade)(\/|$)/.test(rp)) return send(res, 400, { error: 'chemin non autorisé (lecture seule)' });
       try { return send(res, 200, await ap.rest('GET', rp)); } catch (e) { return send(res, 502, { error: e.message }); }
     }
+    // @api Enregistre les identifiants de l'antenne saisis dans le panneau,
+    // puis interroge l'antenne aussitôt.
     if (p === '/api/ap/config' && req.method === 'POST') {
       // credentials typed by the user in the Antenne panel -> ap.json, then poll right away
       if (READONLY) return send(res, 403, { error: 'lecture seule' });
@@ -1555,6 +2283,8 @@ const server = http.createServer(async (req, res) => {
       const st = await ap.poll(); fleet.forEach(derive);
       return send(res, st.ok ? 200 : 502, { ok: st.ok, error: st.error, host: ap.config().host });
     }
+    // @api Choisit la carte réseau locale par laquelle joindre l'antenne
+    // (REST et MNDP), quand Windows en préfère une autre.
     if (p === '/api/ap/bind' && req.method === 'POST') {
       // which local NIC to use to reach the antenna (REST + MNDP) — e.g. the PC
       // has an iPhone personal-hotspot adapter that Windows prefers over the
@@ -1567,6 +2297,8 @@ const server = http.createServer(async (req, res) => {
       const st = await ap.poll(); fleet.forEach(derive);
       return send(res, 200, { ok: true, bindAddress: addr || null, apOk: st.ok, apError: st.error });
     }
+    // @api Bascule sur une antenne dont les identifiants sont déjà
+    // enregistrés.
     if (p === '/api/ap/connect' && req.method === 'POST') {
       // switch to an AP whose credentials are already saved (no password retyped)
       if (READONLY) return send(res, 403, { error: 'lecture seule' });
@@ -1576,6 +2308,7 @@ const server = http.createServer(async (req, res) => {
       const st = await ap.poll(); fleet.forEach(derive);
       return send(res, st.ok ? 200 : 502, { ok: st.ok, error: st.error, host: ap.config().host });
     }
+    // @api Oublie une antenne et ses identifiants.
     if (p === '/api/ap/forget' && req.method === 'POST') {
       if (READONLY) return send(res, 403, { error: 'lecture seule' });
       const b = await readBody(req);
@@ -1583,6 +2316,8 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, { ok: true });
     }
     // ── firmware repository ──
+    // @api Dépôt de firmwares : catalogue GitHub mémorisé, fichiers .bin déjà
+    // téléchargés, et les plateformes réellement présentes dans la flotte.
     if (p === '/api/firmware' && req.method === 'GET') {
       const all = url.searchParams.get('all') === '1';
       const v = firmware.view(all ? null : envsInUse());
@@ -1592,11 +2327,15 @@ const server = http.createServer(async (req, res) => {
       v.nodes = [...fleet.values()].map(r => ({ ip: r.meta.ip, name: r.info && r.info.name, online: r.meta.online, fw: r.derived.fw, otaLock: !!(r.cfg && r.cfg.ota && r.cfg.ota.lock), ota: r.meta.ota }));
       return send(res, 200, v);
     }
+    // @api Rafraîchit le catalogue des versions depuis GitHub.
     if (p === '/api/firmware/refresh' && req.method === 'POST') {
       try { await firmware.refresh(); } catch (e) { return send(res, 502, { error: `GitHub injoignable : ${e.message}` }); }
       fleet.forEach(derive);
       return send(res, 200, { ok: true, refreshedAt: firmware.catalogue().refreshedAt, releases: firmware.catalogue().releases.length });
     }
+    // @api Télécharge un firmware dans le dépôt local. `forFleet` prend d'un
+    // coup tous les fichiers de la version qui correspondent aux plateformes
+    // présentes.
     if (p === '/api/firmware/download' && req.method === 'POST') {
       const { tag, asset, forFleet } = await readBody(req);
       const started = [];
@@ -1610,11 +2349,14 @@ const server = http.createServer(async (req, res) => {
       }
       return send(res, 202, { started });
     }
+    // @api Supprime un firmware du dépôt local.
     if (p === '/api/firmware/delete' && req.method === 'POST') {
       const { tag, asset } = await readBody(req);
       firmware.remove(tag, asset); fleet.forEach(derive);
       return send(res, 200, { ok: true });
     }
+    // @api Ajoute au dépôt local un firmware fourni à la main (nom du fichier
+    // dans l'en-tête X-Filename).
     if (p === '/api/firmware/upload' && req.method === 'POST') {
       const name = path.basename(String(req.headers['x-filename'] || ''));
       const buf = await readRaw(req);
@@ -1622,16 +2364,22 @@ const server = http.createServer(async (req, res) => {
       fleet.forEach(derive);
       return send(res, 200, { ok: true, name, size: buf.length });
     }
+    // @api Met un node à jour en OTA depuis le dépôt local, en file
+    // d'attente.
     if ((m = /^\/api\/node\/([^/]+)\/update$/.exec(p)) && req.method === 'POST') {
       const { tag, asset, parallel } = await readBody(req);
       try { return send(res, 202, enqueueOta(decodeURIComponent(m[1]), tag, asset, parallel)); }
       catch (e) { return send(res, 400, { error: e.message }); }
     }
+    // @api Journal des changements observés sur la flotte depuis un
+    // horodatage, qu'ils viennent de Fleet ou d'ailleurs.
     if (p === '/api/changes') {
       const since = Number(url.searchParams.get('since') || 0);
       return send(res, 200, { now: Date.now(), events: changes.filter(e => e.at > since).slice(-500) });
     }
+    // @api Lance un balayage du ou des sous-réseaux à la recherche de nodes.
     if (p === '/api/scan' && req.method === 'POST') { scan(); return send(res, 202, { started: true }); }
+    // @api Ajoute un node par son adresse, après avoir vérifié qu'il répond.
     if (p === '/api/nodes' && req.method === 'POST') {
       const { ip } = await readBody(req);
       if (!ip) return send(res, 400, { error: 'ip manquante' });
@@ -1639,10 +2387,14 @@ const server = http.createServer(async (req, res) => {
       addNode(ip); saveKnown(); pollAll();
       return send(res, 200, { ok: true });
     }
+    // @api Oublie un node : Fleet cesse de l'interroger et de l'afficher.
+    // Rien n'est écrit sur le node.
     if ((m = /^\/api\/nodes\/([^/]+)$/.exec(p)) && req.method === 'DELETE') {
       fleet.delete(decodeURIComponent(m[1])); saveKnown();
       return send(res, 200, { ok: true });
     }
+    // @api GET renvoie la configuration WLED brute du node ; POST y applique
+    // une modification partielle.
     if ((m = /^\/api\/node\/([^/]+)\/cfg$/.exec(p))) {
       const ip = decodeURIComponent(m[1]);
       if (req.method === 'GET') {
@@ -1659,10 +2411,13 @@ const server = http.createServer(async (req, res) => {
         return send(res, 200, { ok: true, reply: r.json });
       }
     }
+    // @api Écrit une seule cellule de la grille sur le node — le chemin de la
+    // colonne et la valeur.
     if ((m = /^\/api\/node\/([^/]+)\/cell$/.exec(p)) && req.method === 'POST') {
       const { col, value } = await readBody(req);
       return send(res, 200, await writeCell(decodeURIComponent(m[1]), col, value));
     }
+    // @api Redémarre le node.
     if ((m = /^\/api\/node\/([^/]+)\/reboot$/.exec(p)) && req.method === 'POST') {
       if (READONLY) return send(res, 403, { error: 'lecture seule' });
       await postJson(decodeURIComponent(m[1]), '/json/state', { rb: true }, 5000);
@@ -1694,6 +2449,11 @@ server.listen(Number(lp), lh, () => {
   if (FIXED_IPS.length) FIXED_IPS.forEach(addNode);
   if (!FIXED_IPS.length) loadKnown();
   loadChanges();
+loadGithub();
+startAutoSync();
+// la connexion gardée est vérifiée une fois, et le client_id rafraîchi
+setTimeout(() => { checkGithubAuth(); refreshGithubApp(); }, 2000);
+setInterval(refreshGithubApp, APP_MANIFEST_INTERVAL);
   firmware.loadIndex();
   console.log(`dépôt firmware: ${firmware.catalogue().releases.length} release(s) connue(s)${firmware.catalogue().refreshedAt ? ', catalogue du ' + new Date(firmware.catalogue().refreshedAt).toLocaleString() : ' (jamais rafraîchi)'}`);
   if (fleet.size) console.log(`nodes connus: ${[...fleet.keys()].join(', ')}`);

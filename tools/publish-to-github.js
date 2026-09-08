@@ -13,6 +13,7 @@
 //   node tools/publish-to-github.js               # publish to the default sibling checkout
 //   node tools/publish-to-github.js --dir <path>   # use a specific checkout location
 //   node tools/publish-to-github.js --dry-run      # show what would be copied, don't push
+//   node tools/publish-to-github.js --branch beta  # publier sur la branche beta
 'use strict';
 const fs = require('fs');
 const path = require('path');
@@ -20,11 +21,16 @@ const { execFileSync } = require('child_process');
 
 const ROOT = path.join(__dirname, '..'); // wled-fleet/
 const REPO_URL = 'https://github.com/Tensegrity-Lighting-Service/WLED-Fleet.git';
-const EXTRA_EXCLUDE = new Set(['settings.json', 'led-profiles.json']);
+const EXTRA_EXCLUDE = new Set(['settings.json', 'led-profiles.json', 'github.json', 'github-dev.json']);
 
 const args = process.argv.slice(2);
 const dryRun = args.includes('--dry-run');
 const dirFlag = args.indexOf('--dir');
+// Branche de destination. Le travail en cours part sur « beta », que le canal
+// beta de l'updater suit — sans quoi éprouver une nouveauté obligerait à la
+// publier à tout le monde d'abord.
+const branchFlag = args.indexOf('--branch');
+const branch = branchFlag !== -1 && args[branchFlag + 1] ? args[branchFlag + 1] : 'main';
 const dest = dirFlag !== -1 && args[dirFlag + 1]
   ? path.resolve(args[dirFlag + 1])
   : path.join(ROOT, '..', '..', 'WLED-Fleet-public');
@@ -57,7 +63,20 @@ function copyFile(rel) {
   return true;
 }
 
+// docs/api.md est la référence des logiciels satellites : la publier périmée
+// serait pire que ne rien publier, puisqu'ils s'y fient sans pouvoir vérifier.
+// On la régénère ici plutôt que de compter sur la mémoire de qui publie.
+function refreshApiDoc() {
+  try {
+    execFileSync(process.execPath, [path.join(ROOT, 'tools', 'gen-api.js'), '--check'], { stdio: 'pipe' });
+  } catch {
+    execFileSync(process.execPath, [path.join(ROOT, 'tools', 'gen-api.js')], { stdio: 'inherit' });
+    console.log('docs/api.md était périmé : régénéré. Le commiter avec le reste.');
+  }
+}
+
 function main() {
+  refreshApiDoc();
   const files = fileList();
   console.log(`${files.length} fichier(s) suivis depuis ${ROOT}`);
   if (dryRun) {
@@ -73,10 +92,10 @@ function main() {
   } else {
     console.log(`checkout existant : ${dest} — mise à jour`);
     gitLive(dest, ['fetch', 'origin']);
-    try { gitLive(dest, ['checkout', 'main']); } catch { /* dépôt vide : pas encore de branche */ }
-    try { gitLive(dest, ['reset', '--hard', 'origin/main']); } catch { /* dépôt vide */ }
+    try { gitLive(dest, ['checkout', branch]); } catch { /* branche pas encore créée */ }
+    try { gitLive(dest, ['reset', '--hard', 'origin/' + branch]); } catch { /* branche pas encore poussée */ }
   }
-  try { gitLive(dest, ['checkout', '-B', 'main']); } catch { /* déjà dessus */ }
+  try { gitLive(dest, ['checkout', '-B', branch]); } catch { /* déjà dessus */ }
 
   clearDestExceptGit(dest);
   let copied = 0;
@@ -89,9 +108,9 @@ function main() {
   if (!changed) { console.log('rien à publier (déjà synchronisé)'); return; }
 
   const pkg = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8'));
-  const msg = `Sync v${pkg.version} (${new Date().toISOString().slice(0, 10)})`;
+  const msg = `Sync v${pkg.version}${branch === 'main' ? '' : ` [${branch}]`} (${new Date().toISOString().slice(0, 10)})`;
   gitLive(dest, ['commit', '-m', msg]);
-  gitLive(dest, ['push', '-u', 'origin', 'main']);
+  gitLive(dest, ['push', '-u', 'origin', branch]);
   console.log(`publié : ${msg}`);
 }
 

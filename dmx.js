@@ -41,14 +41,22 @@ function universeStarts(mode, addr, upTo) {
 const startsUniverse = (px, mode, addr) => px === 0 || universeStarts(mode, addr, px).includes(px);
 
 // plan complet d'un node. `ins` = hw.led.ins, `ignored` = POSITIONS (0-based) des
-// sorties déclarées non câblées, `profiles` = id de profil par position.
-function plan({ mode, uni, addr, ins, ignored = [], profiles = [] }) {
+// sorties déclarées non câblées, `profiles` = id de profil par position (ancien
+// schéma MQTT), `meta` = ce que le node dit de lui-même dans /fleet.json, indexé
+// par position. Le marqueur de /fleet.json l'emporte : c'est celui que Fleet
+// écrit désormais, l'autre n'existe plus que sur les nodes anciens.
+function plan({ mode, uni, addr, ins, ignored = [], profiles = [], meta = [] }) {
   mode = Number(mode); uni = Number(uni) || 1; addr = Number(addr) || 1;
   const ig = new Set(ignored);
-  const outs = (ins || []).map((b, i) => ({
-    i, profile: profiles[i] || null, pin: (b.pin || []).join('/'), start: b.start, len: b.len,
-    rgbw: RGBW_TYPES.includes(b.type), ignored: ig.has(i),
-  }));
+  const outs = (ins || []).map((b, i) => {
+    const m = meta[i] || {};
+    return {
+      i, profile: m.product || profiles[i] || null, prev: m.prev ?? null,
+      fixture: m.fixture ?? null, instance: m.instance || 0,
+      pin: (b.pin || []).join('/'), start: b.start, len: b.len,
+      rgbw: RGBW_TYPES.includes(b.type), ignored: ig.has(i),
+    };
+  });
   const total = outs.reduce((a, o) => Math.max(a, o.start + o.len), 0);
   const L = locator(mode, uni, addr);
   if (!L) return { mode, uni, addr, total, outputs: outs, multi: false, note: 'mode DMX non « Multi » : pas de mapping pixel par pixel' };

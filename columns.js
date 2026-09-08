@@ -50,6 +50,40 @@ const WHITE_SWAPS = { 0: 'aucun', 1: 'W & B', 2: 'W & G', 3: 'W & R', 4: 'WW & C
 // (isDig(t) && hasW(t)) et remet le swap à 0 sur les autres.
 const WHITE_SWAP_TYPES = [28, 29, 30, 31, 32, 34];
 
+// Consommation par pixel, choix nommés repris de settings_leds.htm (menu
+// « mA/LED »). Ce n'est pas un réglage libre dans l'esprit de WLED : le chiffre
+// dépend du TYPE de ruban, et l'interface propose donc les cas courants.
+//
+// 255 est le seul piège : ce n'est pas 255 mA mais une valeur magique qui
+// bascule sur le modèle de puissance WS2815 — 12 mA/LED, somme des couleurs ×3
+// (bus_manager.cpp:198, WLED #549). Elle freine donc MOINS que 55, et non plus.
+// D'où le libellé, qui annonce 12 et non 255.
+// Liste ORDONNÉE, pas un objet : les clés numériques d'un objet se réordonnent
+// toutes seules en JS, et « 12 mA » se retrouvait affiché après « 55 mA ».
+const LED_MA_PRESETS = [
+  [55, '55 mA — 5 V WS281x (défaut)'],
+  [35, '35 mA — WS2812 éco'],
+  [30, '30 mA — 12 V typique'],
+  [255, '12 mA — WS2815 (modèle dédié)'],
+  [15, '15 mA — guirlande / fairy'],
+];
+// Bornes du firmware : le champ par pixel est un uint8_t (bus_manager.h:285), et
+// une limite d'alimentation doit valoir au moins 250 mA (settings_leds.htm).
+const LED_MA_MAX = 255;
+const PSU_MA_MIN = 250, PSU_MA_MAX = 65000;
+// Consommation propre de l'ESP, retirée du budget avant toute répartition
+// (bus_manager.h:523-525 : 80 mA sur ESP8266, 120 sur ESP32).
+const MA_FOR_ESP = 120;
+
+// Les tensions du métier. WLED ne connaît PAS la tension : il raisonne en
+// milliampères et ignore complètement les volts. C'est donc une notion propre à
+// Fleet, et la seule façon d'attraper le ruban 24 V branché sur une alim 12 V —
+// une erreur qui ne se voit nulle part ailleurs et qui coûte le ruban.
+//
+// Liste fermée : au-delà de ces quatre valeurs on est hors des alimentations du
+// marché, et un champ libre inviterait surtout à saisir des fautes de frappe.
+const VOLTAGES = [5, 12, 24, 48];
+
 const ETH_TYPES = {
   0: 'None', 1: 'WT32-ETH01', 2: 'ESP32-POE', 3: 'WESP32', 4: 'QuinLED-ESP32',
   5: 'TwilightLord', 6: 'ESP3DEUXQuattro', 7: 'ESP32Deux', 8: 'KIT-VE',
@@ -270,4 +304,5 @@ const columns = [
 
 const groups = [...new Set(columns.map(c => c.group))];
 
-module.exports = { columns, groups, LED_TYPES, COLOR_ORDERS, WHITE_SWAPS, WHITE_SWAP_TYPES, DMX_MODES };
+module.exports = { columns, groups, LED_TYPES, COLOR_ORDERS, WHITE_SWAPS, WHITE_SWAP_TYPES, DMX_MODES,
+  LED_MA_PRESETS, LED_MA_MAX, PSU_MA_MIN, PSU_MA_MAX, MA_FOR_ESP, VOLTAGES, ETH_TYPES };

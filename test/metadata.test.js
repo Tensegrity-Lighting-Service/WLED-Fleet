@@ -65,10 +65,44 @@ test('parse est idempotent — régression : extra s\'imbriquait dans extra', ()
 });
 
 test('valeurs illisibles ignorées sans faire tomber la sortie', () => {
-  const [o] = md.parse({ outputs: [{ i: 0, product: 'TROPLONG', fixture: 'abc', instance: 5 }] }).outputs;
-  assert.strictEqual(o.product, null, 'un id produit fait 2 caractères');
+  const [o] = md.parse({ outputs: [{ i: 0, product: 'PAS UN ID', fixture: 'abc', instance: 5 }] }).outputs;
+  assert.strictEqual(o.product, null, 'un marqueur ne contient ni espace ni majuscule');
   assert.strictEqual(o.fixture, null, 'un numéro non numérique est ignoré');
   assert.strictEqual(o.instance, 5, 'le reste de la sortie survit');
+});
+
+test('le marqueur de produit est opaque : uuid ou ancien id court', () => {
+  // Fleet écrit des uuid depuis la v3 du catalogue, mais des nodes patchés avant
+  // portent encore un identifiant à 2 caractères. Les deux doivent survivre à un
+  // aller-retour, sinon une simple relecture effacerait le marqueur.
+  const uid = '7c1a8f3e-2b40-4d11-9a55-0e6f2c9b7d31';
+  const b = md.build({ outputs: [{ i: 0, product: uid, prev: 4 }, { i: 1, product: '0a' }] });
+  assert.strictEqual(b.outputs[0].product, uid);
+  assert.strictEqual(b.outputs[1].product, '0a');
+});
+
+test('la révision du produit voyage avec le marqueur', () => {
+  // c'est ce qui permet de dire « ce node a été patché avec la rev 3, le
+  // catalogue est en rev 5 » au lieu de supposer que le nom suffit.
+  const uid = '7c1a8f3e-2b40-4d11-9a55-0e6f2c9b7d31';
+  const b = md.build({ outputs: [{ i: 0, product: uid, prev: 3 }] });
+  assert.strictEqual(b.outputs[0].prev, 3);
+  assert.strictEqual(md.parse(b).outputs[0].prev, 3);
+  const orphan = md.build({ outputs: [{ i: 0, prev: 3, fixture: 1 }] });
+  assert.strictEqual(orphan.outputs[0].prev, undefined, 'sans produit, une révision ne veut rien dire');
+});
+
+test('un champ vidé DISPARAÎT, il ne devient pas zéro', () => {
+  // Number(null) et Number('') valent 0 : sans garde, retirer une sortie de sa
+  // fixture la déclarait dans une « fixture 0 » qui n'existe nulle part, et
+  // relire le fichier réinventait un ordre d'affichage à chaque tour.
+  const once = md.build({ outputs: [{ i: 0, pin: '2', fixture: 101 }] });
+  assert.strictEqual(once.outputs[0].order, undefined, 'aucun ordre n\'a été demandé');
+  const twice = md.build(md.parse(once));
+  assert.strictEqual(twice.outputs[0].order, undefined, 'un aller-retour n\'en invente pas non plus');
+  assert.strictEqual(twice.outputs[0].fixture, 101);
+  const cleared = md.build({ outputs: [{ i: 0, pin: '2', fixture: null, product: 'ab' }] });
+  assert.strictEqual(cleared.outputs[0].fixture, undefined, 'fixture retirée = clé absente, pas 0');
 });
 
 test('le pin est mémorisé pour détecter un réordonnancement fait hors de Fleet', () => {

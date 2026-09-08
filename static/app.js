@@ -23,8 +23,19 @@
   // staged edits, not yet sent: key "ip|colId" -> {ip, col, value}
   const pending = new Map();
   const pkey = (ip, colId) => ip + '|' + colId;
+  // ── Quel onglet est ouvert ────────────────────────────────────────────────
+  // Les pollers s'en servent pour ne pas travailler dans le vide. Avant, chaque
+  // onglet avait son drapeau `xxxOpen`, et showTab() les remettait TOUS à false
+  // à la main avant d'allumer le bon : neuf variables à tenir cohérentes, et
+  // une de plus à chaque onglet ajouté. L'oubli ne se voyait pas — le panneau
+  // continuait simplement à se rafraîchir en arrière-plan.
+  //
+  // La vérité est déjà dans `currentTab`. Une seule fonction la lit, et il n'y
+  // a plus rien à oublier.
+  let currentTab = 'grid';
+  const isOpen = k => currentTab === k;
   // change journal (from /api/changes): cells touched in the last 10 min keep a marker
-  let changes = [], lastChangeAt = 0, unseen = 0, journalOpen = false;
+  let changes = [], lastChangeAt = 0, unseen = 0;
   const recentChanges = new Map(); // "ip|col" -> latest event
   const RECENT_MS = 10 * 60 * 1000;
   const changedCls = (ip, colId) => { const c = recentChanges.get(pkey(ip, colId)); return c && Date.now() - c.at < RECENT_MS ? (c.source === 'externe' ? ' chg-ext' : ' chg-us') : ''; };
@@ -111,6 +122,28 @@
       box.querySelector('.pop-act').focus();
     });
   }
+  // même popover que confirmBox, avec un champ. Résout la valeur saisie, ou null
+  // si on annule — vide et annulé sont deux réponses différentes.
+  function promptBox(head, value = '', body = '') {
+    return new Promise(resolve => {
+      const box = document.createElement('div'); box.className = 'pop';
+      box.innerHTML = `<div class="pop-head">${esc(head)}</div>${body ? `<div class="pop-body">${esc(body)}</div>` : ''}
+        <div style="padding:0 10px 8px"><input class="pop-input" value="${esc(value)}" style="width:100%"></div>
+        <div class="pop-actions"><button class="pop-cancel">Annuler</button><button class="pop-act green">Appliquer</button></div>`;
+      document.body.appendChild(box);
+      const W = box.offsetWidth, H = box.offsetHeight;
+      box.style.left = Math.min(Math.max(8, lastPointer.x - 20), innerWidth - W - 8) + 'px';
+      box.style.top = (lastPointer.y + 12 + H > innerHeight - 8 ? Math.max(8, lastPointer.y - H - 12) : lastPointer.y + 12) + 'px';
+      const input = box.querySelector('.pop-input');
+      const done = v => { document.removeEventListener('mousedown', outside, true); document.removeEventListener('keydown', key, true); box.remove(); resolve(v); };
+      const outside = e => { if (!box.contains(e.target)) { e.stopPropagation(); e.preventDefault(); done(null); } };
+      const key = e => { if (e.key === 'Escape') { e.stopPropagation(); done(null); } else if (e.key === 'Enter') { e.stopPropagation(); done(input.value); } };
+      setTimeout(() => { document.addEventListener('mousedown', outside, true); document.addEventListener('keydown', key, true); }, 0);
+      box.querySelector('.pop-cancel').onclick = () => done(null);
+      box.querySelector('.pop-act').onclick = () => done(input.value);
+      input.focus(); input.select();
+    });
+  }
   function toast(msg, bad, ms) {
     const t = $('#toast'); t.textContent = msg; t.className = bad ? 'bad' : ''; t.style.display = 'block'; t.style.whiteSpace = 'pre-line';
     clearTimeout(t._t); t._t = setTimeout(() => t.style.display = 'none', ms || (bad ? 6000 : 2200));
@@ -124,11 +157,18 @@
   // se ressemblent exactement (aucune popup dans les deux cas), ce qui a fait
   // conclure trois fois à une panne alors que l'app était simplement à jour.
   // Le panneau Réglages l'affiche et permet de revérifier à la demande.
-  let updateState = { at: 0, status: 'jamais', version: null, notes: '', error: '' };
+  // Canal de mise à jour. Mémorisé sur le poste, pas compilé dans l'application :
+  // basculer de stable à beta ne doit pas demander de réinstaller. GitHub garantit
+  // le reste — /releases/latest/ ne résout jamais vers une préversion, donc le
+  // canal stable ne peut pas attraper une beta par accident.
+  const CHANNELS = { stable: 'Stable', beta: 'Beta — nouveautés en cours d\'essai' };
+  let updChannel = (() => { try { return CHANNELS[localStorage.getItem('wf.channel')] ? localStorage.getItem('wf.channel') : 'stable'; } catch { return 'stable'; } })();
+  const setChannel = c => { updChannel = CHANNELS[c] ? c : 'stable'; try { localStorage.setItem('wf.channel', updChannel); } catch { /* ignore */ } };
+  let updateState = { at: 0, status: 'jamais', version: null, notes: '', error: '', channel: updChannel };
   async function runUpdateCheck() {
     if (!window.__TAURI__) { updateState = { at: Date.now(), status: 'navigateur', version: null, notes: '', error: '' }; return updateState; }
     try {
-      const info = await window.__TAURI__.core.invoke('check_update');
+      const info = await window.__TAURI__.core.invoke('check_update', { channel: updChannel });
       updateState = info
         ? { at: Date.now(), status: 'disponible', version: info.version, notes: (info.notes || '').trim(), error: '' }
         : { at: Date.now(), status: 'ajour', version: null, notes: '', error: '' };
@@ -139,7 +179,7 @@
   }
   async function installAppUpdate() {
     toast('téléchargement et installation de la mise à jour…', false, 15000);
-    await window.__TAURI__.core.invoke('install_update'); // l'app relance elle-même une fois prête
+    await window.__TAURI__.core.invoke('install_update', { channel: updChannel }); // l'app relance elle-même une fois prête
   }
   // au démarrage : propose seulement s'il y a vraiment quelque chose, sans jamais
   // ouvrir de popup d'erreur au lancement (hors ligne = silencieux, mais consigné)
@@ -981,7 +1021,7 @@
   }
   function renderJournal() {
     $('#btnJournal').innerHTML = `Journal${unseen ? ` <span class="n">${unseen}</span>` : ''}`;
-    if (!journalOpen) return;
+    if (!isOpen('journal')) return;
     $('#journalBody').innerHTML = [...changes].reverse().slice(0, 300).map(ev => {
       const col = COLS.find(c => c.id === ev.col);
       const f = v => col ? raw(col, v) : (v == null ? '' : String(v));
@@ -990,7 +1030,6 @@
   }
 
   // ── Optimisation tab: antenna preset + node preset, real state, actions ───
-  let optOpen = false;
   async function renderOpt() {
     const p = $('#optpanel');
     const kept = keepDetails(p);
@@ -1030,7 +1069,6 @@
   }
 
   // ── DMX plan: universe.address of every output, content of every universe ──
-  let dmxOpen = false;
   // « repérer » : le serveur porte la sortie à une longueur d'exploration et
   // découpe le ruban en trois tons — en dessous du repère, le repère, au-delà —
   // pour compter en direct en ajustant Pixels. Une seule sortie à la fois ; le
@@ -1128,6 +1166,12 @@
     const nodeCell = (n, span) => {
       const pl = n.plan, rec = nodeRec(n.ip); const cur = c => { const st = pending.get(pkey(n.ip, c.id)); return st ? st.value : (rec ? get(rec, c.path) : undefined); };
       const mode = cur(colDmx.mode), uni = cur(colDmx.uni) ?? pl.uni, addr = cur(colDmx.addr) ?? pl.addr, mA = cur(colDmx.mA) ?? '';
+      // Le régime ne se lit nulle part : il se DÉDUIT. Limite globale à 0 et au
+      // moins une limite par sortie = limiteur par sortie. C'est exactement le
+      // discriminant du firmware (bus_manager.cpp:1449), et WLED ne stocke pas
+      // sa case à cocher autrement.
+      const rawIns0 = (rec && rec.cfg && rec.cfg.hw && rec.cfg.hw.led && rec.cfg.hw.led.ins) || [];
+      const ppl = Number(mA) === 0 && rawIns0.some(b => Number(b.maxpwr) > 0);
       const inConflict = inConflictOf(n), aligned = pl.multi && alignedOf(pl);
       // deux lignes, réglages à plat : un node à une seule sortie ne doit pas occuper la
       // hauteur de huit lignes de tableau (2026-09-08)
@@ -1139,10 +1183,29 @@
           <select data-nb="dmxmode" data-orig="${esc(String(mode ?? ''))}" title="mode DMX du node">${Object.entries(colDmx.mode.enum).map(([v, l]) => `<option value="${v}" ${Number(v) === Number(mode) ? 'selected' : ''}>${esc(l)}</option>`).join('')}</select>
           <label title="univers de départ"><span class="lbl">u</span><input type="number" data-nb="dmxuni" data-orig="${esc(String(uni))}" min="1" max="63999" value="${esc(String(uni))}"></label>
           <label title="adresse de départ dans cet univers : c'est elle qui permet de loger plusieurs nodes courts dans un même univers"><span class="lbl">adr</span><input type="number" data-nb="dmxaddr" data-orig="${esc(String(addr))}" min="1" max="512" value="${esc(String(addr))}"></label>
-          <label title="limite de courant du node (mA)"><span class="lbl">mA</span><input type="number" data-nb="maxpwr" data-orig="${esc(String(mA))}" min="0" step="50" value="${esc(String(mA))}"></label>
+          <label title="limite de courant du node (mA) : l'ABL de WLED baisse la luminosité pour ne jamais dépasser ce budget. Il en retire d'abord 120 mA pour l'ESP lui-même."><span class="lbl">mA</span><input type="number" data-nb="maxpwr" data-orig="${esc(String(mA))}" min="0" step="50" value="${esc(String(mA))}"${ppl ? ' disabled' : ''}></label>
+          <label class="chip" title="Un budget par sortie au lieu d'un seul pour tout le node. WLED le recommande dès qu'il y a plusieurs sorties : sans ça, une sortie chargée mange la marge des autres. Les deux régimes s'EXCLUENT — cocher met la limite globale à 0, c'est ce qui bascule le firmware. Indispensable quand les sorties sont sur des circuits ou des alimentations différents."><input type="checkbox" data-ppl data-orig="${ppl ? 1 : 0}" ${ppl ? 'checked' : ''}> par sortie</label>
+          <span class="ablnote" data-abl></span>
         </div></td>`;
     };
     const profileOptions = cur => `<option value="">profil…</option>${ledProfilesCache.map(pr => `<option value="${esc(pr.id)}" ${pr.id === cur ? 'selected' : ''}>${esc(pr.name)}</option>`).join('')}<option value="__new">＋ enregistrer cette ligne comme profil…</option>${ledProfilesCache.length ? '<option value="__manage">gérer les profils…</option>' : ''}`;
+    // Une fixture ne se stocke nulle part en entier : elle se reconstitue en
+    // rassemblant les sorties qui portent le même numéro, triées par instance.
+    // La pastille est donc l'essentiel de la colonne — c'est elle qui montre, à
+    // travers plusieurs nodes et plusieurs groupes, ce qui n'existe qu'en creux.
+    const fixField = o => {
+      const f = o.fixture;
+      const chip = f === null || f === undefined ? '<span class="fixdot none" title="aucune fixture : cette sortie n\'est pas encore déclarée à la console"></span>'
+        : `<span class="fixdot" style="background:${fixColor(f)}" title="fixture ${f}, instance ${o.instance || 0}"></span>`;
+      // l'instance n'a pas de champ visible : elle se déduit de l'ordre des lignes
+      // à l'assignation en lot, et n'a de sens que rapportée aux autres membres
+      return `${chip}<input type="number" data-fix="${o.i}" data-orig="${f ?? ''}" value="${f ?? ''}" min="1" max="9999" placeholder="—" title="numéro de fixture à la console. Plusieurs sorties, y compris sur des nodes différents, peuvent porter le même numéro : elles forment alors une seule fixture, dans l'ordre des instances. Mémorisé sur le node."><input type="hidden" data-inst data-orig="${o.instance || 0}" value="${o.instance || 0}">`;
+    };
+    // teinte stable dérivée du numéro : le même numéro donne toujours la même
+    // couleur, sur tous les postes, sans rien à mémoriser. Le pas de 137° est
+    // proche du nombre d'or ramené au cercle, donc deux numéros voisins ne se
+    // ressemblent jamais.
+    const fixColor = f => `hsl(${(Number(f) * 137) % 360} 62% 52%)`;
     const outRow = (n, o, r, i, first, span) => {
       const pl = n.plan;
       const pid = profileIdFor(o, r), unknown = !pid && !o.ignored && o.len;
@@ -1161,7 +1224,8 @@
         <td class="${unknown ? 'newprof' : ''}"><select data-prof title="${unknown ? 'profil inconnu de la bibliothèque locale : ce type/ordre/pixels ne correspond à aucun profil enregistré ici → ＋ enregistrer cette ligne comme profil pour le retrouver la prochaine fois.' : 'profil de LED : ce qui est branché sur cette sortie ; choisir un profil remplit type, ordre et pixels, et le node s\'en souvient (MQTT client id). Sans choix, Fleet reconnaît un profil quand la ligne y correspond exactement.'}">${profileOptions(pid)}</select></td>
         <td class="muted adv" title="GPIO de la sortie">${esc(o.pin)}</td>
         <td>${sel('type', LED_TYPES, r.type)}</td>
-        <td class="adv"><input type="number" data-out="ledma" data-orig="${r.ledma ?? 55}" value="${r.ledma ?? 55}" min="0" title="mA par LED (Auto Brightness Limiter) : consommation max estimée d'une LED de ce câble, pleine luminosité blanc plein. 55 = valeur WLED par défaut (WS2812 générique) ; mettre la valeur du fabricant si connue."></td>
+        <td class="adv"><input type="number" data-out="omax" data-orig="${r.maxpwr ?? 0}" value="${r.maxpwr ?? 0}" min="0" max="65000" step="50" title="Budget de courant de CETTE sortie (mA). N'agit que si « par sortie » est coché sur le node : sinon le firmware l'ignore entièrement, et WLED le réécrit tout seul au prorata des pixels à chaque enregistrement — c'est de là que viennent les valeurs bizarres qu'on trouve dans les configs."></td>
+        <td class="adv"><input type="number" data-out="ledma" data-orig="${r.ledma ?? 55}" value="${r.ledma ?? 55}" min="0" max="255" title="mA par pixel à pleine luminosité, blanc plein. C'est le chiffre sur lequel WLED calcule son freinage : SOUS-DÉCLARÉ, il freine trop peu, la tension s'effondre et les LEDs se mettent à déconner sans qu'aucune erreur ne s'affiche. Déclarer 55 là où la réalité est 120 laisse passer 2,2 fois le courant prévu. 55 = défaut WLED (WS2812 générique) ; compter par PIXEL et non par LED quand un pixel en contient plusieurs. Plage utile 1 à 254 — 255 n'est pas 255 mA mais bascule sur le modèle WS2815 (12 mA), donc freine MOINS."></td>
         <td>${sel('order', COLOR_ORDERS, (r.order || 0) & 0x0f)}</td>
         <td>${hasW ? sel('wswap', WHITE_SWAPS, wsw) : `<input type="hidden" data-out="wswap" data-orig="${wsw}" value="${wsw}"><span class="muted" title="ce type de LED n'a pas de canal blanc : WLED ne propose l'échange que sur les types numériques RGBW">—</span>`}</td>
         <td><input type="number" data-out="start" data-orig="${o.start}" value="${o.start}" min="0" title="index du premier pixel de cette sortie dans le node (0 = premier)"></td>
@@ -1169,11 +1233,12 @@
         <td><label class="chip"><input type="checkbox" data-out="rev" data-orig="${r.rev ? 1 : 0}" ${r.rev ? 'checked' : ''}> inversée</label></td>
         <td class="adv"><input type="number" data-out="skip" data-orig="${r.skip || 0}" value="${r.skip || 0}" min="0" title="Skip first LEDs : nombre de LEDs en tête de câble à ignorer (câblées mais non pilotées, ex. avant un connecteur)"></td>
         <td class="adv"><label class="chip"><input type="checkbox" data-out="ref" data-orig="${r.ref ? 1 : 0}" ${r.ref ? 'checked' : ''} title="Off Refresh : force un rafraîchissement du signal même à l'extinction (certaines LEDs/récepteurs en ont besoin pour ne pas clignoter ou perdre leur dernière couleur)"> off refresh</label></td>
+        <td class="fixcell">${fixField(o)}</td>
         <td class="oc-addr"><span class="addr"><b>${esc(o.from || '')}</b> → <b>${esc(o.to || '')}</b></span> <span class="straddle">${uniTxt}</span></td></tr>`;
     };
     const groupTable = gc => {
-      const head = `<thead><tr><th title="sélection pour l'édition en lot"></th><th title="chaînage : ⛓ pixels collés à la sortie du dessus (une seule fixture), ⊘ sortie seule"></th><th>Node</th><th>Sortie</th><th title="profil de LED : type + ordre + pixels mémorisés sous un nom">Profil</th><th class="adv">Pin</th><th>Type</th><th class="adv" title="Auto Brightness Limiter : mA par LED à pleine luminosité, pour estimer/limiter la consommation">mA/LED</th><th>Ordre</th><th title="échange du canal blanc (WLED : Swap) — proposé seulement sur les types numériques à canal blanc">Swap W</th><th title="index du premier pixel dans le node (0 = premier)">Départ</th><th title="pixels sur ce câble ; 📏 = calculateur, 📍 = repérer le dernier pixel">Pixels</th><th title="sens de parcours du ruban">Inv.</th><th class="adv">Skip</th><th class="adv">Off Refresh</th><th title="univers.canal du premier et du dernier pixel : ce qu'il faut patcher à la console (recalculé en direct)">Adresse console (de → à)</th></tr></thead>`;
-      const NCOL = 15; // colonnes après la cellule Node
+      const head = `<thead><tr><th title="sélection pour l'édition en lot"></th><th title="chaînage : ⛓ pixels collés à la sortie du dessus (une seule fixture), ⊘ sortie seule"></th><th>Node</th><th>Sortie</th><th title="profil de LED : type + ordre + pixels mémorisés sous un nom">Profil</th><th class="adv">Pin</th><th>Type</th><th class="adv" title="budget de courant de cette sortie — n_agit que si « par sortie » est coché sur le node">Limite mA</th><th class="adv" title="Auto Brightness Limiter : mA par pixel à pleine luminosité, pour estimer/limiter la consommation">mA/pixel</th><th>Ordre</th><th title="échange du canal blanc (WLED : Swap) — proposé seulement sur les types numériques à canal blanc">Swap W</th><th title="index du premier pixel dans le node (0 = premier)">Départ</th><th title="pixels sur ce câble ; 📏 = calculateur, 📍 = repérer le dernier pixel">Pixels</th><th title="sens de parcours du ruban">Inv.</th><th class="adv">Skip</th><th class="adv">Off Refresh</th><th title="numéro de fixture à la console. Plusieurs sorties, même sur des nodes différents, peuvent partager un numéro : elles forment alors une seule fixture. La pastille de couleur est dérivée du numéro, pour les repérer d'un coup d'œil.">Fixture</th><th title="univers.canal du premier et du dernier pixel : ce qu'il faut patcher à la console (recalculé en direct)">Adresse console (de → à)</th></tr></thead>`;
+      const NCOL = 17; // colonnes après la cellule Node
       const body = gc.nodes.map(n => {
         const pl = n.plan; const rec = nodeRec(n.ip); const rawIns = (rec && rec.cfg && rec.cfg.hw && rec.cfg.hw.led && rec.cfg.hw.led.ins) || [];
         if (!pl.multi) return `<tr data-node="${esc(n.ip)}"><td class="pickcell"></td><td class="chaincell"></td>${nodeCell(n, 1)}<td colspan="${NCOL - 1}" class="muted">mode ${esc(modeName(pl.mode))} : ${esc(pl.note)}</td></tr>`;
@@ -1222,11 +1287,94 @@
         const a = loc(start), b = loc(start + len - 1);
         tr.querySelector('.addr').innerHTML = `<b>${a.u}.${a.ch}</b> → <b>${b.u}.${b.ch + pl.chPerPx - 1}</b>`;
         tr.querySelector('.straddle').innerHTML = b.u !== a.u ? `<span class="${startsUniverse(start, pl) ? 'muted' : 'st-warn'}">${b.u - a.u + 1} univers</span>` : '<span class="st-ok">1 univers</span>';
-      }); };
+      });
+      renderAbl(ip, rows);
+    };
+    // Ce que la limite de courant autorise réellement, dit en clair sous le
+    // champ. L'arithmétique est celle du firmware (bus_manager.cpp:1483-1524,
+    // estimateCurrent l.196) : l'ESP se sert de 120 mA en premier, chaque LED
+    // compte 1 mA de veille en plus de sa couleur, et si le reste ne couvre pas
+    // 1 mA par pixel la luminosité est clouée au minimum. Rien de tout ça n'est
+    // visible dans WLED, et c'est ce qui fait qu'une flotte tourne bridée à
+    // 43 % sans que personne ne le sache.
+    const MA_ESP = 120;
+    function renderAbl(ip, rows) {
+      const cell = p.querySelector(`[data-nodecell="${CSS.escape(ip)}"]`);
+      const box = cell && cell.querySelector('[data-abl]'); if (!box) return;
+      const cap = Number(cell.querySelector('[data-nb=maxpwr]').value);
+      let px = 0, worst = 0;
+      for (const tr of rows) {
+        const { len, used } = rowVals(tr); if (!used || !(len > 0)) continue;
+        const ma = Number((tr.querySelector('[data-out=ledma]') || {}).value);
+        px += len;
+        worst += len * ((Number.isFinite(ma) ? ma : 55) + 1);   // +1 mA de veille par LED
+      }
+      // en régime « par sortie », le budget global vaut 0 par construction :
+      // c'est chaque sortie qui porte le sien, et l'ESP est réparti entre elles
+      const ppl = cell.querySelector('[data-ppl]');
+      if (ppl && ppl.checked) {
+        const actives = rows.filter(tr => { const v = rowVals(tr); return v.used && v.len > 0 && Number(tr.querySelector('[data-out=omax]').value) > 0; });
+        const part = MA_ESP / Math.max(1, actives.length);
+        let pire = 1;
+        for (const tr of actives) {
+          const { len } = rowVals(tr);
+          const ma = Number(tr.querySelector('[data-out=ledma]').value);
+          const w = len * ((Number.isFinite(ma) ? ma : 55) + 1);
+          const b = Math.max(len, Number(tr.querySelector('[data-out=omax]').value) - part);
+          pire = Math.min(pire, b / w);
+        }
+        if (!actives.length) { box.className = 'ablnote st-warn'; box.textContent = 'par sortie, mais aucune limite renseignée : rien ne bride'; return; }
+        box.className = `ablnote ${pire >= 0.9 ? 'muted' : pire >= 0.5 ? 'st-warn' : 'st-bad'}`;
+        box.textContent = `par sortie · la plus bridée à ${Math.round(Math.min(1, pire) * 100)} %`;
+        box.title = `${actives.length} sortie(s) budgétée(s). Les 120 mA de l'ESP sont divisés entre elles (${Math.round(part)} mA chacune).`;
+        return;
+      }
+      if (!cap) { box.className = 'ablnote st-warn'; box.textContent = 'aucune limite : l\'ABL ne bride rien'; return; }
+      if (!px) { box.textContent = ''; return; }
+      const utile = cap - MA_ESP;
+      if (utile <= px) { box.className = 'ablnote st-bad'; box.textContent = `budget utile ${utile} mA ≤ ${px} px : luminosité clouée au minimum`; return; }
+      const part = Math.min(1, utile / worst);
+      box.className = `ablnote ${part >= 0.9 ? 'muted' : part >= 0.5 ? 'st-warn' : 'st-bad'}`;
+      box.textContent = `blanc plein atteignable à ${Math.round(part * 100)} %`;
+      box.title = `Pire cas ${worst} mA (${px} px). Budget ${cap} mA moins 120 mA pour l'ESP = ${utile} mA.`
+        + (part < 1 ? ` L'ABL bride donc la luminosité à ${Math.round(part * 100)} % sur du blanc plein.` : '');
+    }
+    // ── Basculer de régime ────────────────────────────────────────────────
+    // Cocher « par sortie » revient à mettre la limite globale à 0 : c'est ce
+    // qui bascule le firmware, et c'est exactement ce que fait la case de WLED
+    // (settings_leds.htm:164). Décocher rétablit un budget global et
+    // redistribue au prorata des pixels, comme WLED le fait de son côté
+    // (:204) — sinon les valeurs par sortie resteraient là à ne rien faire, et
+    // c'est précisément ce qu'on trouve aujourd'hui dans les configs.
+    p.querySelectorAll('[data-ppl]').forEach(cb => cb.onchange = () => {
+      const ip = cb.closest('[data-nodecell]').dataset.nodecell;
+      const glob = p.querySelector(`[data-nodecell="${CSS.escape(ip)}"] [data-nb=maxpwr]`);
+      const rows = rowsOf(ip);
+      const budget = Number(glob.dataset.orig) || 0;
+      if (cb.checked) {
+        // ce qu'on répartit, c'est le budget d'avant, moins ce que l'ESP prend
+        const total = rows.reduce((a, tr) => a + (rowVals(tr).len || 0), 0);
+        const utile = Math.max(0, budget - MA_ESP);
+        rows.forEach(tr => {
+          const el = tr.querySelector('[data-out=omax]'); const len = rowVals(tr).len || 0;
+          if (Number(el.value) === 0 && total) el.value = String(Math.round(utile * len / total));
+        });
+        glob.value = '0';
+      } else {
+        glob.value = String(budget || 850);
+        rows.forEach(tr => { tr.querySelector('[data-out=omax]').value = '0'; });
+      }
+      glob.disabled = cb.checked;
+      recompute(ip); refreshDirty();
+    });
+    // au premier rendu aussi : sinon la note n'apparaît qu'après une première
+    // modification, alors que c'est justement à l'ouverture qu'on veut voir
+    // qu'un node tourne bridé
+    for (const n of d.nodes) if (n.plan && n.plan.multi) renderAbl(n.ip, rowsOf(n.ip));
     // dirty tracking: anything that differs from its data-orig enables the one Save button
     const changedNodes = () => {
       const set = new Set();
-      p.querySelectorAll('[data-out][data-orig],[data-nb][data-orig]').forEach(el => {
+      p.querySelectorAll('[data-out][data-orig],[data-nb][data-orig],[data-fix][data-orig],[data-ppl][data-orig]').forEach(el => {
         const cur = el.type === 'checkbox' ? (el.checked ? '1' : '0') : String(el.value);
         if (cur !== String(el.dataset.orig)) set.add(el.closest('tr').dataset.node || (el.closest('[data-nodecell]') || {}).dataset.nodecell);
       });
@@ -1296,7 +1444,7 @@
     // ── édition en lot : la valeur saisie sur une ligne cochée part sur toutes les autres
     // `start` ne se propage JAMAIS (chaque sortie a le sien : c'est le rôle de ⚡ Patcher),
     // ni dmxuni / dmxaddr côté node, pour la même raison.
-    const BULK_OUT = ['type', 'ledma', 'order', 'wswap', 'len', 'rev', 'skip', 'ref'];
+    const BULK_OUT = ['type', 'ledma', 'omax', 'order', 'wswap', 'len', 'rev', 'skip', 'ref'];
     const BULK_NB = ['dmxmode', 'maxpwr'];
     const pickedRows = () => [...p.querySelectorAll('tr[data-outrow]')].filter(tr => picks.has(`${tr.dataset.node}|${tr.dataset.outrow}`));
     const propagate = (el, tr) => {
@@ -1335,15 +1483,61 @@
       refreshDirty(); renderConflicts();
       if (tr && (el.dataset.out === 'len' || el.dataset.out === 'rev')) sendLocateUpdate(tr);
     }; });
+    // ── Fixtures ────────────────────────────────────────────────────────────
+    const allFixRows = () => [...p.querySelectorAll('tr[data-outrow]')];
+    const fixOf = tr => { const el = tr.querySelector('[data-fix]'); return el && el.value !== '' ? Number(el.value) : null; };
+    const paintFix = tr => {
+      const dot = tr.querySelector('.fixdot'); if (!dot) return;
+      const f = fixOf(tr), inst = Number(tr.querySelector('[data-inst]').value) || 0;
+      dot.classList.toggle('none', f === null);
+      dot.style.background = f === null ? '' : fixColor(f);
+      dot.title = f === null ? 'aucune fixture : cette sortie n\'est pas encore déclarée à la console' : `fixture ${f}, instance ${inst}`;
+    };
+    const nextFixture = () => { const used = new Set(allFixRows().map(fixOf).filter(f => f !== null)); let n = 1; while (used.has(n)) n++; return n; };
+    p.querySelectorAll('[data-fix]').forEach(el => el.oninput = () => {
+      const tr = el.closest('tr');
+      // une sortie qu'on sort d'une fixture repart à l'instance 0 : garder un
+      // décalage hérité d'un assemblage auquel elle n'appartient plus la ferait
+      // patcher à côté
+      if (el.value === '') tr.querySelector('[data-inst]').value = '0';
+      paintFix(tr); refreshDirty();
+    });
+    // Assignation en lot : les lignes cochées deviennent UNE fixture, dans leur
+    // ordre d'affichage, chaque membre reprenant les pixels du précédent. C'est
+    // le seul endroit où les instances se calculent — à la main, on ne saurait
+    // pas dire ce que « 36 » veut dire sans compter les autres membres.
+    const assignFixture = async () => {
+      const rows = pickedRows(); if (!rows.length) return;
+      const proposed = nextFixture();
+      const cur = [...new Set(rows.map(fixOf).filter(f => f !== null))];
+      const nodes = new Set(rows.map(r => r.dataset.node)).size;
+      const v = await promptBox(`Numéro de fixture pour ${rows.length} sortie(s)${nodes > 1 ? ` sur ${nodes} nodes` : ''} ?`,
+        String(cur.length === 1 ? cur[0] : proposed),
+        `Les sorties cochées formeront une seule fixture, dans l'ordre du tableau : la 1re à l'instance 0, les suivantes décalées de la longueur des précédentes. Laisser vide pour les retirer de toute fixture.${cur.length ? `\nActuellement : fixture ${cur.join(', ')}.` : ''}`);
+      if (v === null) return;
+      const num = String(v).trim() === '' ? null : Number(v);
+      if (num !== null && !(num >= 1 && num <= 9999)) return toast('numéro de fixture invalide', true);
+      let inst = 0;
+      for (const tr of rows) {
+        tr.querySelector('[data-fix]').value = num === null ? '' : String(num);
+        tr.querySelector('[data-inst]').value = String(num === null ? 0 : inst);
+        inst += Number(tr.querySelector('[data-out=len]').value) || 0;
+        paintFix(tr);
+      }
+      refreshDirty();
+      toast(num === null ? `${rows.length} sortie(s) retirée(s) de leur fixture` : `fixture ${num} : ${rows.length} sortie(s), ${inst} pixels`);
+    };
+
     // cases de sélection : ligne par ligne, et ☑ par groupe
     const refreshPickBar = () => {
       const rows = pickedRows();
       const bar = $('#pickbar');
       if (!rows.length) { if (bar) bar.remove(); return; }
       const nodes = new Set(rows.map(r => r.dataset.node)).size;
-      const html = `<b>☑ ${rows.length} sortie${rows.length > 1 ? 's' : ''}</b> <span class="muted">sur ${nodes} node${nodes > 1 ? 's' : ''} · modifier un champ sur une ligne cochée l'applique à toutes</span><span class="spacer"></span><button id="pickClear">Tout décocher</button>`;
+      const html = `<b>☑ ${rows.length} sortie${rows.length > 1 ? 's' : ''}</b> <span class="muted">sur ${nodes} node${nodes > 1 ? 's' : ''} · modifier un champ sur une ligne cochée l'applique à toutes</span><span class="locgrp"><button id="pickFix" title="donner un même numéro de fixture à toutes les lignes cochées : elles formeront une seule fixture à la console, dans l'ordre du tableau, y compris à travers plusieurs nodes">Fixture…</button><button id="pickClear">Tout décocher</button></span>`;
       if (bar) bar.innerHTML = html;
       else { const b2 = document.createElement('div'); b2.id = 'pickbar'; b2.className = 'locbar'; b2.style.bottom = locating ? '62px' : '10px'; b2.innerHTML = html; document.body.appendChild(b2); }
+      $('#pickFix').onclick = assignFixture;
       $('#pickClear').onclick = () => { picks.clear(); p.querySelectorAll('input[data-pick]').forEach(c => { c.checked = false; c.closest('tr').classList.remove('selected'); }); syncGroupPicks(); refreshPickBar(); };
     };
     const groupBoxes = gi => { const ips = new Set(gCards[gi].nodes.map(n => n.ip)); return [...p.querySelectorAll('input[data-pick]')].filter(c => ips.has(c.dataset.pick.slice(0, c.dataset.pick.lastIndexOf('|')))); };
@@ -1640,17 +1834,44 @@
         const outsChanged = rows.some(tr => [...tr.querySelectorAll('[data-out][data-orig]')].some(el => (el.type === 'checkbox' ? (el.checked ? '1' : '0') : String(el.value)) !== String(el.dataset.orig)));
         // order et wswap partent séparément : le serveur recompose l'octet
         // ((swap << 4) | ordre) sans écraser le quartet qu'on n'édite pas
-        const ins = outsChanged ? rows.map(tr => { const pl = n.plan; const o = pl.outputs[Number(tr.dataset.outrow)]; return { pin: o.pin, type: Number(tr.querySelector('[data-out=type]').value), order: Number(tr.querySelector('[data-out=order]').value), wswap: Number(tr.querySelector('[data-out=wswap]').value) || 0, start: Number(tr.querySelector('[data-out=start]').value), len: Number(tr.querySelector('[data-out=len]').value), rev: tr.querySelector('[data-out=rev]').checked, skip: Number(tr.querySelector('[data-out=skip]').value) || 0, ledma: Number(tr.querySelector('[data-out=ledma]').value), ref: tr.querySelector('[data-out=ref]').checked }; }) : null;
+        const ins = outsChanged ? rows.map(tr => { const pl = n.plan; const o = pl.outputs[Number(tr.dataset.outrow)]; return { pin: o.pin, type: Number(tr.querySelector('[data-out=type]').value), order: Number(tr.querySelector('[data-out=order]').value), wswap: Number(tr.querySelector('[data-out=wswap]').value) || 0, start: Number(tr.querySelector('[data-out=start]').value), len: Number(tr.querySelector('[data-out=len]').value), rev: tr.querySelector('[data-out=rev]').checked, skip: Number(tr.querySelector('[data-out=skip]').value) || 0, omax: Number(tr.querySelector('[data-out=omax]').value) || 0, ledma: Number(tr.querySelector('[data-out=ledma]').value), ref: tr.querySelector('[data-out=ref]').checked }; }) : null;
+        // fixtures : seules les lignes dont le numéro ou l'instance a bougé, pour
+        // ne pas réécrire /fleet.json en entier à chaque enregistrement
+        const meta = rows.filter(tr => ['[data-fix]', '[data-inst]'].some(s => { const el = tr.querySelector(s); return el && String(el.value) !== String(el.dataset.orig); }))
+          .map(tr => ({ i: Number(tr.dataset.outrow),
+            fixture: tr.querySelector('[data-fix]').value === '' ? null : Number(tr.querySelector('[data-fix]').value),
+            instance: Number(tr.querySelector('[data-inst]').value) || 0 }));
         const cell = p.querySelector(`[data-nodecell="${CSS.escape(ip)}"]`); const settings = [];
         for (const [id, col] of [['dmxmode', colDmx.mode], ['dmxuni', colDmx.uni], ['dmxaddr', colDmx.addr], ['maxpwr', colDmx.mA]]) { const el = cell && cell.querySelector(`[data-nb="${id}"]`); if (el && el.value !== '' && String(el.value) !== String(el.dataset.orig)) settings.push({ col, value: normalize(col, el.value) }); }
-        plan.push({ ip, name: n.name || ip, ins, settings });
+        plan.push({ ip, name: n.name || ip, ins, meta, settings });
       }
-      const lines = plan.map(x => `• ${x.name} : ${[x.ins ? `${x.ins.length} sorties (${x.ins.map(o => o.len).join(' + ')} px)` : '', ...x.settings.map(s => `${s.col.label} = ${raw(s.col, s.value)}`)].filter(Boolean).join(', ')}`).join('\n');
-      if (!await confirmBox(`Écrire sur ${plan.length} node(s) ?\n\n${lines}\n\nSorties : bloc complet renvoyé (WLED le reconstruit), sauvegarde de la flotte prise avant. Réglages DMX : envoyés via Déployer.`)) return;
+      const lines = plan.map(x => `• ${x.name} : ${[x.ins ? `${x.ins.length} sorties (${x.ins.map(o => o.len).join(' + ')} px)` : '', x.meta.length ? `${x.meta.length} fixture(s)` : '', ...x.settings.map(s => `${s.col.label} = ${raw(s.col, s.value)}`)].filter(Boolean).join(', ')}`).join('\n');
+      // ne décrire que ce qui va réellement se passer : annoncer une réécriture
+      // des sorties alors qu'on ne touche qu'un numéro de fixture fait hésiter
+      // sur un geste qui ne risque rien
+      const how = [
+        plan.some(x => x.ins) ? 'Sorties : bloc complet renvoyé (WLED le reconstruit), sauvegarde de la flotte prise avant.' : '',
+        plan.some(x => x.meta.length) ? 'Fixtures : écrites dans /fleet.json sur le node, la config LED n\'est pas touchée.' : '',
+        plan.some(x => x.settings.length) ? 'Réglages DMX : envoyés via Déployer.' : '',
+      ].filter(Boolean).join('\n');
+      if (!await confirmBox(`Écrire sur ${plan.length} node(s) ?\n\n${lines}\n\n${how}`)) return;
       sb.disabled = true; sb.textContent = 'écriture…';
       let staged = 0;
       for (const x of plan) {
-        if (x.ins) { try { await post('/api/snapshots', { name: `avant sorties ${x.name}` }); const r = await post(`/api/node/${encodeURIComponent(x.ip)}/outputs`, { ins: x.ins }); toast(`${x.name} : sorties écrites, ${r.total} px`); } catch (e) { toast(`${x.name} : ${e.message}`, true); } }
+        // les réglages d'abord, le marqueur ensuite : un échec entre les deux
+        // laisse un node sans fixture déclarée, pas un node qui en revendique une
+        // qu'il n'a pas
+        if (x.ins) {
+          try {
+            await post('/api/snapshots', { name: `avant sorties ${x.name}` });
+            const r = await post(`/api/node/${encodeURIComponent(x.ip)}/outputs`, { ins: x.ins, meta: x.meta });
+            toast(`${x.name} : sorties écrites, ${r.total} px`);
+            if (r.warn) toast(`${x.name} : ${r.warn}`, true);
+          } catch (e) { toast(`${x.name} : ${e.message}`, true); }
+        } else if (x.meta.length) {
+          try { await post(`/api/node/${encodeURIComponent(x.ip)}/meta`, { outputs: x.meta }); toast(`${x.name} : fixtures enregistrées`); }
+          catch (e) { toast(`${x.name} : ${e.message}`, true); }
+        }
         for (const s of x.settings) { stageValue(x.ip, s.col, s.value); staged++; }
       }
       if (staged) { updatePendingUI(); renderBody(); await deploy(); }
@@ -1662,8 +1883,340 @@
     // le reste par « Enregistrer les modifications ».
   }
 
+  // ── onglet Bibliothèque : le catalogue des produits LED ────────────────────
+  // Un produit = tout ce qui est vrai du matériel branché, jamais ce qui relève
+  // de l'installation (sens, index de départ, univers, adresse). C'est ce qui
+  // permet d'appliquer un produit sans jamais casser un patch.
+  //
+  // Chaque produit porte un uuid frappé à sa création et une révision qui monte
+  // dès que ses réglages changent. Le node retient les deux : Fleet sait donc
+  // dire « cette sortie a été patchée avec la rev 3, le catalogue est en rev 5 »
+  // au lieu de laisser croire qu'un même nom veut dire mêmes réglages.
+  let libData = null, libSel = null, libDraft = null;
+  const libLabel = p => [p.ref.brand, p.ref.model].filter(Boolean).join(' ') || p.slug;
+  const REV_STATE = {
+    stale: { cls: 'st-warn', txt: 'patchée avec une révision plus ancienne — réappliquer le produit la mettrait à jour' },
+    ahead: { cls: 'st-bad', txt: 'patchée avec une révision que ce poste n\'a pas : la bibliothèque locale est en retard, ne rien réappliquer avant de l\'avoir rafraîchie' },
+  };
+
+  async function renderLib() {
+    const pane = $('#libpanel');
+    try { libData = await api('/api/library'); } catch (e) { pane.innerHTML = `<div class="st-bad">${esc(e.message)}</div>`; return; }
+    const d = libData;
+    libSig = JSON.stringify([d.products.map(x => [x.uid, x.rev, x.retired]), d.usage]);
+    const products = d.products.filter(x => !x.retired);
+    if (libSel && !products.some(x => x.uid === libSel)) libSel = null;
+    if (!libSel && !libDraft && products.length) libSel = products[0].uid;
+    const cur = libDraft || products.find(x => x.uid === libSel) || null;
+    const usage = d.usage || {};
+
+    // groupés par marque : une gamme se lit mieux que quarante lignes à plat
+    const byBrand = new Map();
+    for (const x of products) { const k = x.ref.brand || '(sans marque)'; if (!byBrand.has(k)) byBrand.set(k, []); byBrand.get(k).push(x); }
+    const list = [...byBrand.entries()].sort((a, b) => a[0].localeCompare(b[0])).map(([brand, items]) => `
+      <div class="libbrand">${esc(brand)}</div>
+      ${items.map(x => {
+        const used = usage[x.uid] || [];
+        const behind = used.filter(u => u.revState === 'stale').length;
+        const ahead = used.filter(u => u.revState === 'ahead').length;
+        const px = x.presets.map(pr => pr.px).join(' / ');
+        return `<div class="libitem${x.uid === libSel && !libDraft ? ' sel' : ''}" data-pick="${esc(x.uid)}">
+          <div><b>${esc(x.ref.model || x.slug)}</b> <span class="revchip" title="révision du produit : elle monte dès que ses réglages changent">rev ${x.rev}</span></div>
+          <div class="muted">${esc(LED_TYPES[x.led.type] || x.led.type)}${px ? ` · ${esc(px)} px` : ' · aucune longueur'}${used.length ? ` · ${used.length} sortie${used.length > 1 ? 's' : ''}` : ''}</div>
+          ${behind ? `<div class="st-warn">${behind} sortie${behind > 1 ? 's' : ''} sur une révision plus ancienne</div>` : ''}
+          ${ahead ? `<div class="st-bad">${ahead} sortie${ahead > 1 ? 's' : ''} sur une révision inconnue ici</div>` : ''}
+        </div>`;
+      }).join('')}`).join('') || '<div class="muted" style="padding:10px 2px">aucun produit — « ＋ Nouveau produit » pour commencer</div>';
+
+    // marqueurs lus sur des nodes qui ne désignent aucun produit d'ici : ils ne
+    // sont JAMAIS effacés, seulement signalés — le node vient d'un poste dont la
+    // bibliothèque est plus complète, et écraser perdrait l'information.
+    const known = new Set(d.products.map(x => x.uid));
+    const orphans = Object.entries(usage).filter(([k]) => !known.has(k));
+
+    pane.innerHTML = `<h2>Bibliothèque <span class="muted">${products.length} produit${products.length > 1 ? 's' : ''}</span>
+        <span class="spacer"></span>
+        <button id="libNew" class="rowbtn">＋ Nouveau produit</button></h2>
+      <div class="muted" style="font-size:12px;margin:-4px 0 10px;max-width:900px">Un produit décrit ce qui est branché : type de LED, ordre des couleurs, échange du blanc, mA par LED, LEDs sautées, off refresh, LEDs par mètre, et une ou plusieurs longueurs types. Ce qui dépend de l'installation — sens inversé, index de départ, univers, adresse — n'y est pas : appliquer un produit ne peut donc pas casser un patch existant.</div>
+      ${orphans.length ? `<div class="st-warn" style="margin-bottom:10px">${orphans.length} marqueur${orphans.length > 1 ? 's' : ''} lu${orphans.length > 1 ? 's' : ''} sur la flotte ne désigne${orphans.length > 1 ? 'nt' : ''} aucun produit d'ici : ${orphans.map(([k, v]) => `<span class="mono">${esc(k.slice(0, 8))}</span> (${v.length} sortie${v.length > 1 ? 's' : ''})`).join(', ')}. Ces nodes viennent d'un poste dont la bibliothèque est plus complète — leurs marqueurs sont conservés tels quels.</div>` : ''}
+      <div class="fwcols">
+        <div class="liblist">${list}</div>
+        <div id="libEditor">${cur ? editorHtml(cur, usage[cur.uid] || []) : '<div class="muted">choisir un produit à gauche</div>'}</div>
+      </div>
+      <div id="libremote"></div>
+      <div id="libnodes"></div>`;
+
+    pane.querySelectorAll('[data-pick]').forEach(el => el.onclick = () => { libSel = el.dataset.pick; libDraft = null; renderLib(); });
+    $('#libNew').onclick = () => { libDraft = blankProduct(); libSel = null; renderLib(); };
+    wireLibEditor();
+    renderRemote();
+    renderNodeLib();
+  }
+
+  // ── Connexion GitHub, en une fois ─────────────────────────────────────────
+  // GitHub rend un code court à taper sur son site ; on interroge ensuite
+  // jusqu'à ce que l'utilisateur ait validé. Aucun logiciel à installer, et
+  // le code est affiché en grand parce qu'il se recopie à la main.
+  let ghPoll = null;
+  async function startGithubLogin() {
+    const box = $('#ghDevice'); if (!box) return;
+    clearInterval(ghPoll);
+    box.innerHTML = '<div class="muted">connexion à GitHub…</div>';
+    let d; try { d = await post('/api/library/login/start', {}); }
+    catch (e) { box.innerHTML = `<div class="st-bad">${esc(e.message)}</div>`; return; }
+    box.innerHTML = `<div class="ghdevice">
+        <div>Ouvrir <a href="${esc(d.url)}">${esc(d.url)}</a> et saisir ce code :</div>
+        <div class="ghcode" id="ghCode" title="cliquer pour copier">${esc(d.userCode)}</div>
+        <div class="muted">le code expire dans ${Math.round(d.expiresIn / 60)} minutes · l'attente se termine toute seule</div>
+      </div>`;
+    $('#ghCode').onclick = () => { navigator.clipboard.writeText(d.userCode).then(() => toast('code copié'), () => {}); };
+    openExternal(d.url);
+    const deadline = Date.now() + d.expiresIn * 1000;
+    ghPoll = setInterval(async () => {
+      if (Date.now() > deadline) { clearInterval(ghPoll); box.innerHTML = '<div class="st-warn">code expiré — recommencer</div>'; return; }
+      let r; try { r = await post('/api/library/login/poll', {}); }
+      catch (e) { clearInterval(ghPoll); box.innerHTML = `<div class="st-bad">${esc(e.message)}</div>`; return; }
+      if (r.pending) return;                       // pas encore validé : c'est normal
+      clearInterval(ghPoll); box.innerHTML = '';
+      toast(`connecté à GitHub — ${r.login || 'compte lié'}`);
+      renderRemote();
+    }, Math.max(5, d.interval) * 1000);
+  }
+
+  // ── Le dépôt partagé ──────────────────────────────────────────────────────
+  // Deux boutons distincts, jamais un « Synchroniser » : un bouton unique cache
+  // le sens de circulation des données, et c'est ainsi qu'on écrase le travail
+  // d'un collègue sans s'en rendre compte. Rafraîchir tire, Publier pousse.
+  async function renderRemote() {
+    const box = $('#libremote'); if (!box) return;
+    let r; try { r = await api('/api/library/remote'); } catch { box.innerHTML = ''; return; }
+    const connecte = r.hasToken;
+    box.innerHTML = `<h2 style="margin-top:16px">Dépôt partagé
+        <span class="muted">${r.repo ? esc(r.repo) : 'non configuré'}${r.lastSyncAt ? ` · dernière synchro ${new Date(r.lastSyncAt).toLocaleString()}` : ''}</span></h2>
+      ${r.lastError ? `<div class="st-bad" style="margin-bottom:8px">${esc(r.lastError)}</div>` : ''}
+      <div class="ghauth">
+        ${connecte
+    ? `<span class="st-ok">● connecté${r.login ? ` — <b>${esc(r.login)}</b>` : ''}</span>
+             <span class="muted">${r.source === 'gh' ? 'par GitHub CLI, aucun jeton conservé ici' : r.source === 'device' ? 'connexion gardée, chiffrée pour ce compte Windows' : `jeton saisi à la main ${esc(r.tail)}`} — c'est ce nom qui signe les produits publiés</span>
+             <span class="spacer"></span><button id="ghOut" class="rowbtn">Se déconnecter</button>`
+    : `<button id="ghIn" class="rowbtn primary">Se connecter à GitHub</button>
+             <span class="muted">une seule fois : la connexion est gardée d'un lancement à l'autre, et survit aux mises à jour de l'application</span>`}
+      </div>
+      <div id="ghDevice"></div>
+      <div class="setrow" style="max-width:700px;margin-top:8px">
+        <label for="ghRepo">Dépôt</label><div><input id="ghRepo" value="${esc(r.repo)}" placeholder="proprietaire/depot" style="width:260px">
+          <input id="ghBranch" value="${esc(r.branch)}" style="width:80px" title="branche">
+          <button id="ghSave" class="rowbtn">Enregistrer</button></div>
+        <div class="hint">un fichier par produit, nommé par son identifiant — deux postes ne peuvent donc jamais se disputer un nom</div>
+        <label for="ghAuto">Synchronisation</label>
+        <div><label class="chip"><input type="checkbox" id="ghAuto"${r.auto ? ' checked' : ''}> automatique</label>
+          <span class="muted">au démarrage, toutes les 10 min, et après chaque modification</span></div>
+        <div class="hint">sans danger uniquement parce qu'une publication ne peut rien écraser : sur collision, la version en ligne devient la base et la nôtre repart au-dessus</div>
+      </div>
+      <div style="margin-top:8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+        <button id="ghPull" class="rowbtn"${r.repo ? '' : ' disabled'} title="tire le dépôt. Jamais destructif : un produit modifié ici et pas encore publié n'est pas écrasé.">↓ Rafraîchir</button>
+        <button id="ghPush" class="rowbtn"${r.repo && connecte && r.pending ? '' : ' disabled'} title="publie les produits modifiés ici. Sur collision, la version en ligne devient la base et la nôtre repart au-dessus : rien n'est jamais écrasé.">↑ Publier${r.pending ? ` (${r.pending})` : ''}</button>
+        <span class="muted" style="font-size:12px">${r.pending ? `${r.pending} produit(s) pas encore publié(s)` : 'tout est publié'}</span>
+        <span class="spacer"></span>
+        <details class="ghadv"><summary class="muted">autre méthode de connexion</summary>
+          <div class="setrow" style="margin-top:6px">
+            <label for="ghToken">Jeton personnel</label>
+            <div><input id="ghToken" type="password" placeholder="ghp_… portée « Contents: read and write » sur ce seul dépôt" style="width:300px">
+              <button id="ghSaveTok" class="rowbtn">Utiliser</button></div>
+            <div class="hint">plus restreint qu'une connexion normale, mais à renouveler à la main quand il expire</div>
+            <label>GitHub CLI</label>
+            <div><button id="ghCli" class="rowbtn">Utiliser la session « gh »</button></div>
+            <div class="hint">si GitHub CLI est installé et connecté : rien n'est alors conservé par Fleet, le jeton lui est demandé à chaque usage</div>
+          </div>
+        </details>
+      </div>`;
+
+    const save = async (body, msg) => {
+      try { await post('/api/library/remote', body); toast(msg); renderRemote(); }
+      catch (e) { toast(e.message, true); }
+    };
+    $('#ghSave').onclick = () => save({ repo: $('#ghRepo').value, branch: $('#ghBranch').value }, 'dépôt enregistré');
+    $('#ghAuto').onchange = () => save({ auto: $('#ghAuto').checked }, $('#ghAuto').checked ? 'synchronisation automatique activée' : 'synchronisation automatique désactivée');
+    $('#ghSaveTok').onclick = () => { if (!$('#ghToken').value) return toast('aucun jeton saisi', true); save({ token: $('#ghToken').value }, 'jeton enregistré'); };
+    $('#ghCli').onclick = async () => {
+      try { await post('/api/library/login/cli', {}); toast('connecté par GitHub CLI'); renderRemote(); }
+      catch (e) { toast(e.message, true, 9000); }
+    };
+    if ($('#ghOut')) $('#ghOut').onclick = async () => {
+      if (!await confirmBox('Se déconnecter de GitHub ?\nLe dépôt et les réglages restent, seule l\'identité s\'en va.')) return;
+      try { await post('/api/library/logout', {}); toast('déconnecté'); renderRemote(); } catch (e) { toast(e.message, true); }
+    };
+    if ($('#ghIn')) $('#ghIn').onclick = startGithubLogin;
+    $('#ghPull').onclick = async () => {
+      try {
+        const x = await post('/api/library/pull', {});
+        const bits = [x.added.length && `${x.added.length} ajouté(s)`, x.updated.length && `${x.updated.length} mis à jour`, x.unchanged && `${x.unchanged} inchangé(s)`].filter(Boolean);
+        toast(bits.join(', ') || 'rien de neuf');
+        if (x.kept.length) toast(`gardés tels quels, modifiés ici et pas encore publiés : ${x.kept.join(', ')}`, true, 9000);
+        await renderLib(); await loadLedProfiles();
+      } catch (e) { toast(e.message, true); }
+    };
+    $('#ghPush').onclick = async () => {
+      if (!await confirmBox(`Publier ${r.pending} produit(s) vers ${r.repo} ?\nRien ne sera écrasé : un produit modifié en ligne entre-temps devient la base, et la version d'ici repart au-dessus.`)) return;
+      try {
+        const x = await post('/api/library/publish', {});
+        const reb = x.done.filter(y => y.action === 'rebase');
+        toast(`${x.done.length} publié(s)${reb.length ? ` — ${reb.map(y => `« ${y.label} » replacé en rev ${y.rev}`).join(', ')}` : ''}`, false, reb.length ? 9000 : 2500);
+        if (x.failed.length) toast(x.failed.map(y => `${y.label} : ${y.error}`).join('\n'), true, 9000);
+        await renderLib();
+      } catch (e) { toast(e.message, true); }
+    };
+  }
+
+  // ── Ce que les nodes portent de la bibliothèque ────────────────────────────
+  // Chaque node emporte la fiche complète des produits qu'il cite. Un node qui
+  // revient d'un hangar, ou d'un poste dont le catalogue était plus avancé, se
+  // raconte donc tout seul. Rien n'est recopié sans un clic : c'est ce qui
+  // permet de CONSTATER une divergence au lieu de l'effacer.
+  const NODELIB = {
+    absent: { cls: 'st-warn', txt: 'produit inconnu de ce poste' },
+    newer: { cls: 'st-warn', txt: 'le node porte une révision plus récente que la nôtre' },
+    older: { cls: 'muted', txt: 'le node porte une révision plus ancienne : il sera remis à jour au prochain enregistrement de sa sortie' },
+    diverged: { cls: 'st-bad', txt: 'MÊME révision, réglages DIFFÉRENTS : deux postes ont fait monter le même numéro sur des contenus différents. Le numéro ne départage plus, il faut choisir.' },
+  };
+  async function renderNodeLib() {
+    const box = $('#libnodes'); if (!box) return;
+    let d; try { d = await api('/api/library/nodes'); } catch { return; }
+    if (!d.nodes.length) { box.innerHTML = ''; return; }
+    box.innerHTML = `<h2 style="margin-top:16px">Ce que les nodes portent <span class="muted">${d.nodes.length} node${d.nodes.length > 1 ? 's' : ''} à regarder</span></h2>
+      <div class="muted" style="font-size:12px;margin-bottom:8px;max-width:900px">Chaque node emporte la fiche complète des produits que ses sorties citent. Ceux qui ne correspondent pas au catalogue de ce poste sont listés ici — rien n'est repris sans un clic.</div>
+      ${d.nodes.map(n => `<div class="libnode"><b>${esc(n.name)}</b> <span class="muted">${n.online ? '' : 'hors ligne · '}copie du ${new Date(n.savedAt).toLocaleDateString()}</span>
+        ${n.items.map(it => {
+          const s = NODELIB[it.state] || {};
+          return `<div class="libnodeitem"><span class="${s.cls || ''}" title="${esc(s.txt || '')}">${esc(it.label)} — rev ${it.rev}${it.mineRev !== null ? ` ici rev ${it.mineRev}` : ''}</span>
+            ${it.state === 'older' ? '' : `<button class="rowbtn" data-adopt="${esc(it.uid)}" data-ip="${esc(n.ip)}" title="reprendre cette version dans le catalogue de ce poste, avec sa révision — sans en créer une nouvelle">Reprendre</button>`}</div>`;
+        }).join('')}</div>`).join('')}`;
+    box.querySelectorAll('[data-adopt]').forEach(b => b.onclick = async () => {
+      if (!await confirmBox(`Reprendre ce produit depuis ${esc(b.closest('.libnode').querySelector('b').textContent)} ?\nLa version locale sera remplacée par celle du node, avec sa révision.`)) return;
+      try { const r = await post('/api/library/adopt', { ip: b.dataset.ip, uid: b.dataset.adopt }); toast(`« ${libLabel(r.product)} » repris en rev ${r.product.rev}`); await renderLib(); await loadLedProfiles(); }
+      catch (e) { toast(e.message, true); }
+    });
+  }
+
+  // Les usages viennent du sondage de la flotte : ils arrivent APRÈS le premier
+  // rendu, et changent quand un node revient ou qu'une sortie est repatchée. On
+  // redessine alors, mais jamais sous les doigts de l'utilisateur — une saisie en
+  // cours ou un champ actif suspendent le rafraîchissement jusqu'au suivant.
+  let libSig = '';
+  async function pollLib() {
+    if (!isOpen('lib') || libDraft) return;
+    const inEditor = document.activeElement && $('#libEditor') && $('#libEditor').contains(document.activeElement);
+    if (inEditor) return;
+    let d; try { d = await api('/api/library'); } catch { return; }
+    const sig = JSON.stringify([d.products.map(p => [p.uid, p.rev, p.retired]), d.usage]);
+    if (sig === libSig) return;
+    libSig = sig; renderLib();
+  }
+
+  const blankProduct = () => ({ uid: null, legacyId: null, rev: 1, slug: '', ref: { brand: '', model: '', sku: '', internal: '', note: '' },
+    led: { type: 22, order: 0, wswap: 0, ledma: 55, skip: 0, offRefresh: false, perM: null }, presets: [] });
+
+  function editorHtml(x, used) {
+    const d = libData;
+    const hasW = (d.whiteSwapTypes || []).includes(Number(x.led.type));
+    const opt = (map, cur) => Object.entries(map || {}).map(([v, l]) => `<option value="${v}"${Number(v) === Number(cur) ? ' selected' : ''}>${esc(l)}</option>`).join('');
+    return `<h2>${x.uid ? `Modifier <span class="revchip">rev ${x.rev}</span>` : 'Nouveau produit'}
+        <span class="spacer"></span>
+        ${x.uid ? '<button id="libDel" class="rowbtn">Retirer</button>' : ''}
+        <button id="libSave" class="rowbtn primary">Enregistrer</button></h2>
+      ${x.uid ? `<div class="muted" style="font-size:11px;margin:-6px 0 8px">identifiant <span class="mono">${esc(x.uid)}</span>${x.legacyId ? ` · ancien marqueur <span class="mono">${esc(x.legacyId)}</span>, toujours reconnu` : ''}</div>` : ''}
+      <div class="setrow">
+        <label for="lbBrand">Marque</label><div><input id="lbBrand" value="${esc(x.ref.brand)}" style="width:190px"></div>
+        <label for="lbModel">Modèle</label><div><input id="lbModel" value="${esc(x.ref.model)}" style="width:190px"></div>
+        <div class="hint">marque ou modèle obligatoire${x.slug ? ` · fichier <span class="mono">${esc(x.slug)}.json</span>, figé : renommer ne le change pas` : ''}</div>
+        <label for="lbSku">Référence</label><div><input id="lbSku" value="${esc(x.ref.sku)}" placeholder="fabricant" style="width:150px"> <input id="lbInt" value="${esc(x.ref.internal)}" placeholder="interne" style="width:120px"></div>
+        <label for="lbNote">Note</label><div><input id="lbNote" value="${esc(x.ref.note)}" style="width:100%;max-width:330px"></div>
+        <div class="hint">corriger un nom ou une note ne fait pas monter la révision : les nodes déjà patchés restent à jour</div>
+
+        <label for="lbType">Type de LED</label><div><select id="lbType">${opt(d.ledTypes, x.led.type)}</select></div>
+        <label for="lbOrder">Ordre des couleurs</label><div><select id="lbOrder">${opt(d.colorOrders, x.led.order)}</select></div>
+        <div class="hint">interne à WLED : le flux DMX reçu reste toujours RGB(W) dans l'ordre naturel</div>
+        <label for="lbWswap">Échange du blanc</label>
+        <div>${hasW ? `<select id="lbWswap">${opt(d.whiteSwaps, x.led.wswap)}</select>` : '<span class="muted">— ce type n\'a pas de canal blanc</span>'}</div>
+        <div class="hint"></div>
+
+        <label for="lbPerM">LEDs par mètre</label><div><input type="number" id="lbPerM" value="${x.led.perM ?? ''}" min="1" placeholder="—" style="width:70px"></div>
+        <div class="hint">nomme les longueurs automatiquement et alimente le calculateur 📏</div>
+        <label for="lbMaSel">Consommation</label>
+        <div><select id="lbMaSel">${(d.ledMaPresets || []).map(([v, l]) => `<option value="${v}"${Number(v) === Number(x.led.ledma) ? ' selected' : ''}>${esc(l)}</option>`).join('')}<option value="__c"${!(d.ledMaPresets || []).some(([v]) => Number(v) === Number(x.led.ledma)) ? ' selected' : ''}>Personnalisé…</option></select>
+          <input type="number" id="lbMa" value="${x.led.ledma}" min="0" max="${d.ledMaMax || 255}" style="width:64px;${!(d.ledMaPresets || []).some(([v]) => Number(v) === Number(x.led.ledma)) ? '' : 'display:none'}"> <span id="lbMaU" class="muted"${!(d.ledMaPresets || []).some(([v]) => Number(v) === Number(x.led.ledma)) ? '' : ' hidden'}>mA par pixel</span></div>
+        <div class="hint">Le chiffre dépend du <b>type de ruban</b> — c'est pour ça que WLED propose des cas courants plutôt qu'un nombre libre. C'est aussi le chiffre sur lequel il calcule son freinage : sous-déclaré, il freine trop peu, la tension s'effondre et les LEDs déconnent sans qu'aucune erreur ne s'affiche. Déclarer 55 là où la réalité est 120 laisse passer 2,2 fois le courant prévu. Compter par <b>pixel</b>, pas par LED, quand un pixel en contient plusieurs.</div>
+        <label for="lbSkip">LEDs sautées</label><div><input type="number" id="lbSkip" value="${x.led.skip}" min="0" style="width:70px"> <span class="muted">en tête de câble</span></div>
+        <label for="lbRef">Off refresh</label><div><label class="chip"><input type="checkbox" id="lbRef"${x.led.offRefresh ? ' checked' : ''}> rafraîchir même éteint</label></div>
+        <div class="hint"></div>
+      </div>
+      <h2 style="margin-top:14px">Longueurs types <span class="muted">une par référence de produit fini</span></h2>
+      <table class="outs" style="width:auto"><tbody id="lbPresets">${(x.presets.length ? x.presets : [{ label: '', px: '' }]).map(presetRow).join('')}</tbody></table>
+      <button id="lbAddPreset" class="rowbtn">＋ longueur</button>
+      ${used.length ? `<h2 style="margin-top:14px">Utilisé par <span class="muted">${used.length} sortie${used.length > 1 ? 's' : ''}</span></h2>
+        <div class="libused">${used.map(u => {
+          const st = REV_STATE[u.revState];
+          return `<div${st ? ` class="${st.cls}" title="${esc(st.txt)}"` : ''}>${esc(u.name)} · sortie ${u.index + 1} <span class="mono">${u.len} px</span>${u.rev ? ` · rev ${u.rev}` : ''}</div>`;
+        }).join('')}</div>` : ''}`;
+  }
+  const presetRow = p => `<tr>
+    <td><input data-pl value="${esc(p.label || '')}" placeholder="auto" style="width:110px"></td>
+    <td><input type="number" data-px value="${p.px ?? ''}" min="1" style="width:70px"> px</td>
+    <td><button class="rowbtn" data-rmpreset title="retirer cette longueur">✕</button></td></tr>`;
+
+  function wireLibEditor() {
+    const ed = $('#libEditor'); if (!ed || !$('#libSave')) return;
+    const read = () => ({
+      uid: libDraft ? libDraft.uid : libSel,
+      ref: { brand: $('#lbBrand').value, model: $('#lbModel').value, sku: $('#lbSku').value, internal: $('#lbInt').value, note: $('#lbNote').value },
+      led: { type: Number($('#lbType').value), order: Number($('#lbOrder').value), wswap: $('#lbWswap') ? Number($('#lbWswap').value) : 0,
+        ledma: Number($('#lbMa').value), skip: Number($('#lbSkip').value), offRefresh: $('#lbRef').checked,
+        perM: $('#lbPerM').value === '' ? null : Number($('#lbPerM').value) },
+      presets: [...ed.querySelectorAll('#lbPresets tr')]
+        .map(tr => ({ label: tr.querySelector('[data-pl]').value, px: Number(tr.querySelector('[data-px]').value) }))
+        .filter(v => v.px > 0),
+    });
+    // changer le type fait apparaître ou disparaître l'échange du blanc : on
+    // redessine en gardant la saisie en cours plutôt que de la perdre
+    $('#lbType').onchange = () => { libDraft = { ...blankProduct(), ...read() }; renderLib(); };
+    // le champ libre n'apparaît que si aucun cas courant ne convient
+    $('#lbMaSel').onchange = () => {
+      const custom = $('#lbMaSel').value === '__c';
+      $('#lbMa').style.display = custom ? '' : 'none';
+      $('#lbMaU').hidden = !custom;
+      if (!custom) $('#lbMa').value = $('#lbMaSel').value;
+    };
+    $('#lbAddPreset').onclick = () => { $('#lbPresets').insertAdjacentHTML('beforeend', presetRow({ label: '', px: '' })); wireLibEditor(); };
+    ed.querySelectorAll('[data-rmpreset]').forEach(b => b.onclick = () => {
+      const tb = $('#lbPresets');
+      if (tb.rows.length > 1) b.closest('tr').remove();
+      else { b.closest('tr').querySelector('[data-px]').value = ''; b.closest('tr').querySelector('[data-pl]').value = ''; }
+    });
+    $('#libSave').onclick = async () => {
+      try {
+        const r = await post('/api/library/product', read());
+        libDraft = null; libSel = r.product.uid;
+        toast(`« ${libLabel(r.product)} » enregistré, rev ${r.product.rev}`);
+        await renderLib(); await loadLedProfiles();
+      } catch (e) { toast(e.message, true); }
+    };
+    const del = $('#libDel');
+    if (del) del.onclick = async () => {
+      const x = libData.products.find(y => y.uid === libSel); if (!x) return;
+      const used = (libData.usage || {})[libSel] || [];
+      const why = used.length
+        ? `\n${used.length} sortie(s) l'utilisent : le produit est marqué retiré, jamais effacé, pour que leurs marqueurs gardent un sens.`
+        : '\nAucune sortie ne l\'utilise : il peut disparaître pour de bon.';
+      if (!await confirmBox(`Retirer « ${libLabel(x)} » ?${why}`)) return;
+      try {
+        await api(`/api/library/product/${encodeURIComponent(libSel)}`, { method: 'DELETE' });
+        libSel = null; toast('produit retiré');
+        await renderLib(); await loadLedProfiles();
+      } catch (e) { toast(e.message, true); }
+    };
+  }
+
   // ── settings panel (settings.json, restart through the launcher) ───────────
-  let setOpen = false;
   async function renderSettings() {
     const p = $('#setpanel');
     let d; try { d = await api('/api/settings'); } catch (e) { p.innerHTML = `<div class="st-bad">${esc(e.message)}</div>`; return; }
@@ -1701,6 +2254,9 @@
         <label>Version</label>
         <div><b id="sVer">…</b> <span class="muted" style="font-size:11px">· <a href="https://github.com/Tensegrity-Lighting-Service/WLED-Fleet/releases" target="_blank" rel="noopener">releases</a></span></div>
         <div class="hint">dossier de l'app : <span class="mono" id="sDir">…</span></div>
+        <label for="sChan">Canal</label>
+        <div><select id="sChan">${Object.entries(CHANNELS).map(([v, l]) => `<option value="${v}"${v === updChannel ? ' selected' : ''}>${esc(l)}</option>`).join('')}</select></div>
+        <div class="hint">La beta reçoit les nouveautés avant qu'elles soient éprouvées : à réserver à un poste qui n'est pas en exploitation. Le canal stable ne peut pas attraper une beta par accident, même plus récente. Changer de canal ne réinstalle rien — la vérification suivante ira simplement voir ailleurs, et vos données ne bougent pas (elles vivent dans Documents).</div>
         <label>Mise à jour</label>
         <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
           <button id="sUpd" class="rowbtn">Vérifier maintenant</button>
@@ -1727,6 +2283,13 @@
       }[st.status] || '';
     };
     showUpdate(updateState);
+    // changer de canal revérifie aussitôt : sans ça on ne sait pas ce qu'on
+    // vient de choisir, et il faudrait cliquer « Vérifier » pour le découvrir
+    $('#sChan').onchange = async () => {
+      setChannel($('#sChan').value);
+      showUpdate({ ...updateState, status: 'jamais' });
+      showUpdate(await runUpdateCheck());
+    };
     $('#sUpd').onclick = async () => {
       const b = $('#sUpd'); b.disabled = true; b.textContent = 'vérification…';
       showUpdate(await runUpdateCheck());
@@ -1753,12 +2316,12 @@
   // proposed free IP and an « Appairer » button. The show network (SSID +
   // password) comes from the antenna; the node keeps its own name. Nothing
   // else is written.
-  let pairOpen = false, pairNets = null, pairPc = null, pairJob = null, pairShow = null, pairAll = false, pairApConfigured = null;
+  let pairNets = null, pairPc = null, pairJob = null, pairShow = null, pairAll = false, pairApConfigured = null;
   // radar mode (NetSpot-like): native WlanScan every 8 s while the tab is open, signal history per BSSID
   let pairRadar = false, pairRadarTimer = null, pairScanning = false; const pairHist = new Map();
   const spark = (arr, w = 60, h = 14) => { if (!arr || !arr.length) return ''; const pts = arr.map((v, i) => `${(i / Math.max(1, arr.length - 1)) * w},${h - Math.round((v / 100) * (h - 2)) - 1}`).join(' '); return `<svg width="${w}" height="${h}" style="vertical-align:middle;margin-left:6px"><polyline points="${pts}" fill="none" stroke="var(--info)" stroke-width="1.5"/></svg>`; };
   async function pollPair() {
-    if (!pairOpen) return;
+    if (!isOpen('pair')) return;
     try { const j = await api('/api/pair/status'); pairJob = j.job; } catch { /* server away */ }
     renderPair();
   }
@@ -1778,7 +2341,7 @@
   }
   function setRadar(on) {
     pairRadar = on; if (pairRadarTimer) { clearInterval(pairRadarTimer); pairRadarTimer = null; }
-    if (on) { scanPair(false); pairRadarTimer = setInterval(() => { if (pairOpen && !(pairJob && pairJob.status === 'running')) scanPair(false); else if (!pairOpen) setRadar(false); }, 8000); }
+    if (on) { scanPair(false); pairRadarTimer = setInterval(() => { if (isOpen('pair') && !(pairJob && pairJob.status === 'running')) scanPair(false); else if (!isOpen('pair')) setRadar(false); }, 8000); }
   }
   function renderPair() {
     const p = $('#pairpanel');
@@ -1847,13 +2410,13 @@
       pollPair();
     });
   }
-  setInterval(() => { if (pairOpen && pairJob && pairJob.status === 'running') pollPair(); }, 2000);
+  setInterval(() => { if (isOpen('pair') && pairJob && pairJob.status === 'running') pollPair(); }, 2000);
 
   // ── fleet snapshots (offline store, export / import / compare / restore) ───
-  let snapOpen = false, snapList = [], snapView = null; // snapView = {id, mode:'diff'|'restore', data}
+  let snapList = [], snapView = null; // snapView = {id, mode:'diff'|'restore', data}
   const post = (u, b) => api(u, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(b || {}) });
   async function pollSnap() {
-    if (!snapOpen) return;
+    if (!isOpen('snap')) return;
     try { snapList = (await api('/api/snapshots')).snapshots; renderSnap(); } catch { /* server away */ }
   }
   // ── showfile: everything the app knows in ONE file (settings, antennas with
@@ -1983,7 +2546,7 @@
   }
 
   // ── antenna (MikroTik, read-only) ──────────────────────────────────────────
-  let apOpen = false, apData = null, apPresetData = null, apPresetLoading = false;
+  let apData = null, apPresetData = null, apPresetLoading = false;
   const sigBar = dbm => { if (dbm == null) return ''; const pct = Math.max(0, Math.min(100, Math.round((dbm + 90) * 2))); const col = dbm >= -60 ? 'var(--accent)' : dbm >= -72 ? 'var(--warn)' : 'var(--bad)'; return `<span class="sig" title="${dbm} dBm"><i style="width:${pct}%;background:${col}"></i></span>`; };
   async function pollAp() {
     try {
@@ -1992,7 +2555,7 @@
       const n = apData.ok ? apData.clients.length : 0;
       $('#btnAp').innerHTML = `Antenne${n ? ` <span class="n">${n}</span>` : ''}${wizData && wizData.state === 'connected' ? ' <span class="n" style="background:var(--accent)" title="WiFiman Wizard connecté">W</span>' : ''}`;
       $('#btnAp').style.color = apData.configured && !apData.ok ? 'var(--bad)' : '';
-      if (apOpen) renderAp();
+      if (isOpen('ap')) renderAp();
     } catch { /* server away */ }
   }
   function renderAp() {
@@ -2348,7 +2911,7 @@
   };
 
   // ── firmware repository / updates ──────────────────────────────────────────
-  let fwOpen = false, fwData = null; const fwSel = new Set();
+  let fwData = null; const fwSel = new Set();
   const fmtSize = b => b == null ? '' : (b / 1048576).toFixed(2) + ' Mo';
   const fmtDate = s => s ? new Date(s).toLocaleDateString() : '';
 
@@ -2357,7 +2920,7 @@
       fwData = await api('/api/firmware' + ($('#fwAll').checked ? '?all=1' : ''));
       const avail = fwData.nodes.filter(n => n.fw && n.fw.available).length;
       $('#btnFw').innerHTML = `Mises à jour${avail ? ` <span class="n">${avail}</span>` : ''}`;
-      if (fwOpen) renderFw();
+      if (isOpen('fw')) renderFw();
     } catch { /* server away */ }
   }
 
@@ -2587,26 +3150,25 @@
     setTimeout(checkAppUpdate, 4000);
     // the tab controller may have shown a tab before columns / fleet were loaded: render it again with data
     if (typeof showTab === 'function') showTab(currentTab);
-    setInterval(refresh, 2000); setInterval(pollChanges, 2000); setInterval(pollFw, 2000); setInterval(pollAp, 3000);
+    setInterval(refresh, 2000); setInterval(pollChanges, 2000); setInterval(pollFw, 2000); setInterval(pollAp, 3000); setInterval(pollLib, 3000);
   })();
   // ── tabs: one pane at a time, full height; ⧉ opens the current tab in its own window ──
   const TABS = {
     grid:     { btn: '#btnGrid',     pane: '#tabgrid',   show: () => {} },
-    journal:  { btn: '#btnJournal',  pane: '#journal',   show: () => { journalOpen = true; unseen = 0; renderJournal(); } },
-    ap:       { btn: '#btnAp',       pane: '#appanel',   show: () => { apOpen = true; apLastKey = ''; pollAp(); } },
-    fw:       { btn: '#btnFw',       pane: '#fwpanel',   show: () => { fwOpen = true; pollFw(); } },
-    dmx:      { btn: '#btnDmx',      pane: '#dmxpanel',  show: () => { dmxOpen = true; renderDmx(); } },
-    opt:      { btn: '#btnOpt',      pane: '#optpanel',  show: () => { optOpen = true; renderOpt(); } },
-    pair:     { btn: '#btnPair',     pane: '#pairpanel', show: () => { pairOpen = true; renderPair(); if (!pairNets) scanPair(); pollPair(); if (pairRadar) setRadar(true); } },
-    snap:     { btn: '#btnSnap',     pane: '#snappanel', show: () => { snapOpen = true; pollSnap(); } },
-    settings: { btn: '#btnSettings', pane: '#setpanel',  show: () => { setOpen = true; renderSettings(); } },
+    journal:  { btn: '#btnJournal',  pane: '#journal',   show: () => { unseen = 0; renderJournal(); } },
+    ap:       { btn: '#btnAp',       pane: '#appanel',   show: () => { apLastKey = ''; pollAp(); } },
+    fw:       { btn: '#btnFw',       pane: '#fwpanel',   show: () => { pollFw(); } },
+    dmx:      { btn: '#btnDmx',      pane: '#dmxpanel',  show: () => { renderDmx(); } },
+    lib:      { btn: '#btnLib',      pane: '#libpanel',  show: () => { renderLib(); } },
+    opt:      { btn: '#btnOpt',      pane: '#optpanel',  show: () => { renderOpt(); } },
+    pair:     { btn: '#btnPair',     pane: '#pairpanel', show: () => { renderPair(); if (!pairNets) scanPair(); pollPair(); if (pairRadar) setRadar(true); } },
+    snap:     { btn: '#btnSnap',     pane: '#snappanel', show: () => { pollSnap(); } },
+    settings: { btn: '#btnSettings', pane: '#setpanel',  show: () => { renderSettings(); } },
   };
-  let currentTab = 'grid';
   function showTab(name) {
     if (!TABS[name]) name = 'grid';
     if (currentTab === 'dmx' && name !== 'dmx') stopLocating();
     currentTab = name;
-    journalOpen = apOpen = fwOpen = pairOpen = snapOpen = setOpen = dmxOpen = optOpen = false;
     for (const [k, t] of Object.entries(TABS)) { $(t.pane).classList.toggle('open', k === name); $(t.btn).classList.toggle('active', k === name); }
     TABS[name].show();
     try { localStorage.setItem('wf.tab', name); } catch { /* ignore */ }

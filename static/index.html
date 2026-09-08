@@ -26,6 +26,7 @@
   <button id="btnAp" title="antenne Wi‑Fi (MikroTik RouterOS, lecture seule) : radios, canaux, puissance, clients connectés et ce que l'antenne voit de chaque node. Le badge = nombre de clients Wi‑Fi associés.">Antenne</button>
   <button id="btnOpt" title="préréglages d'optimisation de la liaison radio : côté antenne (plage de canaux, fast roaming, options facultatives) et côté nodes (veille Wi‑Fi, puissance TX, paquets hors séquence), avec l'état réel et les actions">Optimisation</button>
   <button id="btnDmx" title="sorties LED de chaque node (pin, type, ordre, départ, longueur, sens) et leur adresse console univers.canal calculée en direct ; contenu de chaque univers ; conflits d'univers entre nodes. Dans WLED l'univers d'une sortie n'est pas un réglage : il découle du point de départ du node et de la longueur des sorties précédentes. Le badge = nombre de sorties dont le profil (type/ordre/pixels) n'est pas encore dans la bibliothèque locale de profils LED.">Sorties / DMX</button>
+  <button id="btnLib" title="catalogue des produits LED de la gamme : pour chaque produit, tous ses réglages de sortie (type, ordre des couleurs, échange du blanc, mA/LED, skip, off refresh, LEDs par mètre) et ses longueurs types. Choisir un produit sur une sortie remplit tous ces champs d'un coup. Le badge = produits jamais publiés dans la bibliothèque partagée.">Bibliothèque</button>
   <button id="btnFw" title="dépôt de firmwares hors-ligne (catalogue GitHub mémorisé + .bin téléchargés localement) et mise à jour OTA des nodes depuis ce dépôt. Le badge = nombre de nodes qui ont une version plus récente disponible.">Mises à jour</button>
   <button id="btnPair" title="appairage de nouveaux nodes : le PC se connecte à l'AP du node (WLED-AP, ou réseau ouvert), lui envoie le SSID / mot de passe du show, un nom et une IP fixe, puis revient sur son Wi‑Fi. Le node rejoint la flotte tout seul.">Appairage</button>
   <button id="btnSnap" title="sauvegardes de la configuration de toute la flotte (cfg.json + presets.json de chaque node), stockées hors ligne sur ce PC : exporter en fichier, importer, comparer avec l'état actuel, restaurer vers les nodes">Sauvegardes</button>
@@ -61,6 +62,7 @@
 </div>
 <div id="optpanel" class="tabpane"></div>
 <div id="dmxpanel" class="tabpane"></div>
+<div id="libpanel" class="tabpane"></div>
 <div id="setpanel" class="tabpane"></div>
 <div id="pairpanel" class="tabpane"></div>
 <div id="snappanel" class="tabpane"></div>

@@ -131,6 +131,29 @@
   .sig{display:inline-block;width:46px;height:8px;background:var(--line);border-radius:4px;overflow:hidden;vertical-align:middle;margin-right:6px}
   .sig i{display:block;height:100%}
   .fwcols{display:grid;grid-template-columns:1fr 1fr;gap:18px}
+  /* bibliothèque : liste des produits groupés par marque à gauche, éditeur à droite */
+  #libpanel .fwcols{grid-template-columns:minmax(220px,300px) 1fr}
+  .liblist{border:1px solid var(--line);border-radius:8px;overflow:hidden;align-self:start}
+  .libbrand{padding:5px 10px;background:var(--line);color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.05em}
+  .libitem{padding:7px 10px;cursor:pointer;border-top:1px solid var(--line);line-height:1.45}
+  .libitem:first-child{border-top:0}
+  .libitem:hover{background:var(--panel2)} .libitem.sel{background:var(--sel)}
+  .libitem .muted,.libitem .st-warn,.libitem .st-bad{font-size:11px}
+  .revchip{font-family:ui-monospace,Consolas,monospace;font-size:10px;color:var(--muted);border:1px solid var(--line);border-radius:4px;padding:0 4px;vertical-align:1px}
+  .libused{font-size:12px;line-height:1.65} .libused .mono{color:var(--muted)}
+  /* ce que la limite de courant autorise vraiment, sous le champ mA du node */
+  .ablnote{display:block;font-size:10px;line-height:1.3;margin-top:2px;cursor:help}
+  .ghauth{display:flex;align-items:center;gap:10px;flex-wrap:wrap;max-width:900px;padding:8px 10px;border:1px solid var(--line);border-radius:8px;font-size:12px}
+  .ghdevice{margin-top:8px;padding:10px 12px;border:1px solid var(--line2);border-radius:8px;max-width:460px;text-align:center;font-size:12px}
+  .ghcode{font-family:ui-monospace,Consolas,monospace;font-size:26px;letter-spacing:.18em;font-weight:650;margin:8px 0;cursor:pointer;user-select:all}
+  .ghadv summary{cursor:pointer;font-size:12px} .ghadv{max-width:900px}
+  .libnode{border:1px solid var(--line);border-radius:8px;padding:8px 10px;margin-bottom:8px;max-width:900px;font-size:12px}
+  .libnodeitem{display:flex;align-items:center;gap:8px;margin-top:5px}
+  .libnodeitem>span{flex:1}
+  /* colonne Fixture : la pastille porte l'information, le champ ne fait que la saisir */
+  table.outs td.fixcell{white-space:nowrap} table.outs td.fixcell input[data-fix]{width:56px}
+  .fixdot{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:5px;vertical-align:0}
+  .fixdot.none{background:transparent;box-shadow:inset 0 0 0 1px var(--line2)}
   /* en-tête de l'onglet figée : .tabpane est le conteneur de défilement, donc un
      sticky suffit — les marges négatives couvrent son padding latéral, sinon le
      contenu défile visiblement dans les 14 px de marge */

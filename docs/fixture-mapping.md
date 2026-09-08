@@ -77,8 +77,10 @@ multipart), servi ensuite par un simple `GET /fleet.json`.
   "updatedAt": 1757337600000,
   "updatedBy": "decle",
   "outputs": [
-    { "i": 0, "pin": "10", "product": "a0", "fixture": 101, "instance": 0 },
-    { "i": 1, "pin": "12", "product": "a0", "fixture": 101, "instance": 36 }
+    { "i": 0, "pin": "10", "product": "d8972dbb-1383-4f3c-b0c0-c1ea6a2dc378",
+      "prev": 2, "fixture": 101, "instance": 0 },
+    { "i": 1, "pin": "12", "product": "d8972dbb-1383-4f3c-b0c0-c1ea6a2dc378",
+      "prev": 2, "fixture": 101, "instance": 36 }
   ] }
 ```
 
@@ -86,7 +88,8 @@ multipart), servi ensuite par un simple `GET /fleet.json`.
 |---|---|
 | `i` | **position** de la sortie dans `hw.led.ins` — c'est la clé de correspondance |
 | `pin` | GPIO au moment de l'écriture, pour détecter un réordonnancement fait hors de Fleet |
-| `product` | identifiant (2 caractères) dans le catalogue de produits de Fleet |
+| `product` | identifiant du produit dans le catalogue de Fleet — **chaîne opaque** |
+| `prev` | **révision du produit** avec laquelle cette sortie a été patchée |
 | `fixture` | **numéro de fixture console** |
 | `instance` | décalage de la première instance de cette sortie dans la fixture (0 = début) |
 | `order` | ordre d'affichage voulu par l'utilisateur |
@@ -105,6 +108,26 @@ Règles de lecture :
   cette position, quelqu'un a réordonné les sorties en dehors de Fleet : les
   métadonnées de cette sortie sont **douteuses**.
 
+### `product` et `prev`
+
+`product` est une **chaîne opaque** : ne rien en déduire, ne pas la découper, la
+comparer telle quelle. Fleet y écrit un uuid v4 depuis la version 3 de son
+catalogue ; des nodes patchés avant portent encore un identifiant court à deux
+caractères (`"a0"`). Les deux formes restent valides et cohabitent dans une même
+flotte — Fleet ne réécrit pas un node pour le seul plaisir de moderniser son
+marqueur.
+
+`prev` est la **révision du produit** au moment où ces réglages ont été écrits.
+Elle monte quand les réglages du produit changent, pas quand on corrige son nom.
+Elle sert à répondre à une question que le marqueur seul ne permet pas de poser :
+ce node porte-t-il vraiment les réglages actuels du produit, ou ceux d'une
+version antérieure ? Un node resté longtemps hors ligne annonce ainsi `prev: 3`
+alors que le catalogue est en révision 5.
+
+Une révision **supérieure** à celle du catalogue local n'est pas une anomalie du
+node : c'est le catalogue local qui est en retard. Ne rien réappliquer dans ce
+cas — ce serait écraser des réglages plus récents.
+
 ### Historique
 
 Avant ce fichier, Fleet planquait deux informations dans les champs MQTT, faute
@@ -116,6 +139,53 @@ de place ailleurs. D'anciens nodes peuvent encore les porter :
   de 1. Ex. `wled/41686c#u2.4` = sorties 2 et 4 non câblées.
 
 `/fleet.json` fait autorité quand il existe.
+
+---
+
+## 3 bis. La fiche des produits : `/fleet-lib.json`
+
+Un `product` renvoie à un catalogue extérieur au node. Un lecteur qui n'a pas ce
+catalogue tient donc un identifiant qui ne veut rien dire. Fleet dépose, à côté
+des marqueurs, la **fiche complète** des produits que les sorties de ce node
+citent — le node se décrit alors tout seul.
+
+```jsonc
+{ "format": "wled-fleet-node-library",
+  "formatVersion": 3,
+  "savedAt": 1757337600000,
+  "products": [
+    { "uid": "d8972dbb-1383-4f3c-b0c0-c1ea6a2dc378",
+      "rev": 2,
+      "slug": "ledpro-flex60",
+      "ref": { "brand": "LEDpro", "model": "Flex60", "sku": "LP-F60-2815",
+               "internal": "", "note": "" },
+      "led": { "type": 22, "order": 1, "wswap": 0, "ledma": 55,
+               "skip": 0, "offRefresh": false, "perM": 60 },
+      "presets": [ { "label": "2 m", "px": 120, "default": true } ] }
+  ] }
+```
+
+`led` reprend le vocabulaire de `hw.led.ins[]` : appliquer un produit à une
+sortie est une copie de champs, sans traduction. `order` est le quartet **bas**
+et `wswap` le quartet **haut** du même octet WLED.
+
+Ce que le produit ne contient **pas**, délibérément : le sens de parcours
+(`rev`), l'index de départ, l'univers et l'adresse. Ce sont des propriétés de
+l'installation, pas du produit ; les y mettre ferait qu'appliquer un produit
+casserait un patch.
+
+Règles de lecture :
+
+- **C'est un exemplaire daté, pas une autorité.** Il dit ce que Fleet savait du
+  produit au moment où il a écrit cette sortie. Le catalogue d'un autre poste
+  peut être plus avancé.
+- Le fichier peut être **absent** : node jamais vu par Fleet, ou dont aucune
+  sortie ne cite de produit.
+- Il ne contient que les produits **cités par ce node**, pas le catalogue entier.
+- Deux copies portant le **même `rev` avec des `led`/`presets` différents**
+  signalent que deux postes ont fait monter le même numéro chacun de leur côté.
+  Le numéro ne départage alors rien : c'est un cas à signaler, pas à trancher
+  automatiquement.
 
 ---
 
@@ -244,7 +314,9 @@ uni: 10, addr: 1, mode: 4, start: 0, len: 200
 - `/fleet.json` peut être **absent, périmé ou incomplet**. Il n'est écrit que
   lorsque l'utilisateur enregistre depuis Fleet.
 - Les `product` renvoient à un catalogue **externe au node**. Un identifiant
-  inconnu doit être conservé tel quel, jamais effacé.
+  inconnu doit être conservé tel quel, jamais effacé : il vient probablement
+  d'un poste dont le catalogue est plus complet. `/fleet-lib.json` donne la
+  fiche quand elle est là, mais telle qu'elle était à l'écriture.
 - L'écriture du fichier exige le **PIN des réglages** quand le node en a un
   (WLED répond 401).
 - Ne jamais écrire sous les noms `cfg.json` (provoque un redémarrage),

@@ -33,8 +33,19 @@ const FILE = '/fleet.json';
 const FORMAT = 'wled-fleet-node';
 const FORMAT_VERSION = 1;
 
-const isProductId = v => typeof v === 'string' && /^[0-9a-z]{2}$/.test(v);
-const intOrNull = v => { const n = Number(v); return Number.isFinite(n) ? Math.round(n) : null; };
+// Le marqueur de produit est OPAQUE : un uuid depuis la v3 du catalogue, un
+// identifiant court à 2 caractères pour ce que Fleet a écrit avant. On accepte
+// les deux sans les interpréter — c'est library.resolve() qui sait les traduire,
+// et un marqueur qu'on ne reconnaît pas se conserve tel quel plutôt que de
+// disparaître à la première réécriture.
+const isProductId = v => typeof v === 'string' && /^[0-9a-z][0-9a-z-]{1,39}$/.test(v);
+// Attention à `Number(null) === 0` et `Number('') === 0` : sans ce garde, un
+// champ vidé (fixture retirée) revenait à 0 au lieu de disparaître, et le node
+// se retrouvait déclaré dans une « fixture 0 » qui n'existe pas.
+const intOrNull = v => {
+  if (v === null || v === undefined || v === '') return null;
+  const n = Number(v); return Number.isFinite(n) ? Math.round(n) : null;
+};
 
 // Une sortie est repérée par sa POSITION dans hw.led.ins, comme le reste de
 // Fleet. On mémorise aussi son `pin` : si quelqu'un réordonne les sorties hors
@@ -45,6 +56,10 @@ function normOutput(o, i) {
     i,                                   // position dans hw.led.ins
     pin: typeof x.pin === 'string' ? x.pin : null,
     product: isProductId(x.product) ? x.product : null,
+    // révision du produit au moment où ces réglages ont été écrits. C'est elle
+    // qui permet de dire « ce node a été patché avec la v3, le catalogue est en
+    // v5 » plutôt que de supposer qu'un même produit veut dire mêmes réglages.
+    prev: intOrNull(x.prev),
     fixture: intOrNull(x.fixture),       // Fixture ID console
     instance: intOrNull(x.instance) || 0,// décalage de la 1re instance dans la fixture
     order: intOrNull(x.order),           // ordre voulu par l'utilisateur
@@ -85,6 +100,7 @@ function build(meta) {
       const out = { i: o.i };
       if (o.pin) out.pin = o.pin;
       if (o.product) out.product = o.product;
+      if (o.product && o.prev !== null) out.prev = o.prev;   // sans produit, une révision ne veut rien dire
       if (o.fixture !== null) out.fixture = o.fixture;
       if (o.instance) out.instance = o.instance;
       if (o.order !== null) out.order = o.order;
@@ -133,27 +149,30 @@ const nextFixtureId = outputs => {
 // node en a un : WLED répond alors 401, qu'on remonte en clair.
 const http = require('http');
 
-function read(ip, timeoutMs = 4000) {
+// Lecture générique d'un fichier JSON du node. `null` couvre indistinctement
+// « absent » et « injoignable » : dans les deux cas l'appelant n'apprend rien
+// de ce node et doit continuer sans.
+function readFile(ip, name, timeoutMs = 4000) {
   const [host, port] = String(ip).split(':');
   return new Promise(resolve => {
-    const req = http.get({ host, port: port ? +port : 80, path: FILE, timeout: timeoutMs }, res => {
+    const req = http.get({ host, port: port ? +port : 80, path: name, timeout: timeoutMs }, res => {
       let d = ''; res.on('data', c => d += c);
       res.on('end', () => {
-        if (res.statusCode === 404) return resolve(empty()); // pas encore de métadonnées : normal
-        if (res.statusCode !== 200) return resolve(empty());
-        try { resolve(parse(JSON.parse(d))); } catch { resolve(empty()); } // fichier abîmé : on repart de zéro
+        if (res.statusCode !== 200) return resolve(null);   // 404 = jamais écrit, ce n'est pas une erreur
+        try { resolve(JSON.parse(d)); } catch { resolve(null); }  // fichier abîmé : on repart de zéro
       });
     });
-    req.on('error', () => resolve(empty()));
-    req.on('timeout', () => { req.destroy(); resolve(empty()); });
+    req.on('error', () => resolve(null));
+    req.on('timeout', () => { req.destroy(); resolve(null); });
   });
 }
+const read = (ip, timeoutMs = 4000) => readFile(ip, FILE, timeoutMs).then(d => (d === null ? empty() : parse(d)));
 
-function write(ip, meta, timeoutMs = 8000) {
+function writeFile(ip, name, doc, timeoutMs = 8000) {
   const [host, port] = String(ip).split(':');
-  const data = Buffer.from(JSON.stringify(build(meta), null, 1));
+  const data = Buffer.from(JSON.stringify(doc, null, 1));
   const boundary = '----wledfleet' + Date.now().toString(16);
-  const head = Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="data"; filename="${FILE.replace(/^\//, '')}"\r\nContent-Type: application/json\r\n\r\n`);
+  const head = Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="data"; filename="${name.replace(/^\//, '')}"\r\nContent-Type: application/json\r\n\r\n`);
   const body = Buffer.concat([head, data, Buffer.from(`\r\n--${boundary}--\r\n`)]);
   return new Promise((resolve, reject) => {
     const req = http.request({ host, port: port ? +port : 80, method: 'POST', path: '/upload', timeout: timeoutMs,
@@ -161,14 +180,15 @@ function write(ip, meta, timeoutMs = 8000) {
       let d = ''; res.on('data', c => d += c);
       res.on('end', () => {
         if (res.statusCode === 401) return reject(new Error('node protégé par un PIN : le déverrouiller pour écrire ses métadonnées'));
-        if (res.statusCode >= 400) return reject(new Error(`HTTP ${res.statusCode} en écrivant ${FILE} : ${String(d).slice(0, 120)}`));
+        if (res.statusCode >= 400) return reject(new Error(`HTTP ${res.statusCode} en écrivant ${name} : ${String(d).slice(0, 120)}`));
         resolve({ ok: true, bytes: data.length });
       });
     });
     req.on('error', reject);
-    req.on('timeout', () => req.destroy(new Error(`timeout en écrivant ${FILE}`)));
+    req.on('timeout', () => req.destroy(new Error(`timeout en écrivant ${name}`)));
     req.end(body);
   });
 }
+const write = (ip, meta, timeoutMs = 8000) => writeFile(ip, FILE, build(meta), timeoutMs);
 
-module.exports = { FILE, FORMAT, FORMAT_VERSION, parse, build, empty, isEmpty, fixtures, nextFixtureId, read, write };
+module.exports = { FILE, FORMAT, FORMAT_VERSION, parse, build, empty, isEmpty, fixtures, nextFixtureId, read, write, readFile, writeFile };

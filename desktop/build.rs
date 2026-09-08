@@ -10,6 +10,7 @@ use std::path::Path;
 const EXCLUDE_DIRS: &[&str] = &["desktop", ".git", ".github", "node_modules", "test", "snapshots", "firmware", "release", "__pycache__"];
 const EXCLUDE_FILES: &[&str] = &[
     "settings.json", "known-nodes.json", "led-profiles.json", ".gitignore",
+    "github.json", "github-dev.json",
     "changes.log", "changes-dev.log", "ap.json", "ap-dev.json", "rf-scans.log",
     "pairing.log", "wizard.json", "wizard-dev.json", "wizard-surveys.log",
     "wizard-live.log", "server-errors.log", "wizard-probe.log",
