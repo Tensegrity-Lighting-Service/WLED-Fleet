@@ -87,3 +87,81 @@ test('une fiche illisible ne fait pas tomber le catalogue', () => {
   assert.strictEqual(drv.normStore({ drivers: [{ ref: {} }, D({ outputs: 2 })] }).drivers.length, 1);
   assert.deepStrictEqual(drv.normStore(null).drivers, []);
 });
+
+// ── Déduire les cartes de la flotte ────────────────────────────────────────
+// Les cas viennent tous du relevé réel des 16 nodes : c'est là que se trouvent
+// les pièges, pas dans un jeu de données inventé.
+const N = (name, o) => ({ ip: '10.0.0.1', name, arch: 'esp32', release: 'ESP32_Ethernet', brand: 'WLED', product: 'FOSS', eth: 0, outputs: [[16], [12], [4]], ...o });
+
+test('deux nodes du même modèle se regroupent malgré un Ethernet déclaré d\'un seul côté', () => {
+  // relevé réel : les deux QUADRI tournent le MÊME build, mais JAR déclare
+  // eth 13 et COUR 0, et leurs GPIO 3 et 4 sont intervertis. Les séparer
+  // créerait deux fiches pour une seule carte — et le doublon serait durable,
+  // puisque des nodes le porteraient.
+  const [c, ...reste] = drv.guess([
+    N('QUADRI_JAR', { eth: 13, outputs: [[16], [12], [2], [4]] }),
+    N('QUADRI_COUR', { eth: 0, outputs: [[16], [12], [4], [2]] }),
+  ]);
+  assert.strictEqual(reste.length, 0, 'un seul modèle, pas deux');
+  assert.strictEqual(c.nodes.length, 2);
+  assert.strictEqual(c.board.eth, 13, 'un type déclaré quelque part l\'emporte sur « aucun »');
+  assert.ok(c.ecarts.some(e => e.code === 'eth-partiel'), 'et l\'écart est signalé, pas avalé');
+  assert.ok(c.ecarts.some(e => e.code === 'gpio-ordre'), 'le brochage interverti aussi');
+});
+
+test('le nom vient de la carte quand elle s\'annonce elle-même', () => {
+  const [c] = drv.guess([N('CASQUE', { arch: 'ESP32-C3', release: '', brand: 'www.athom.tech', product: 'Athom_USB_Controller', outputs: [[10]] })]);
+  assert.strictEqual(c.ref.brand, 'www.athom.tech');
+  assert.strictEqual(c.ref.model, 'Athom_USB_Controller');
+});
+
+test('à défaut, le type d\'Ethernet de WLED nomme de vraies cartes', () => {
+  const [c] = drv.guess([N('JAR', { eth: 13 })]);
+  assert.strictEqual(c.ref.model, 'LILYGO T-ETH-POE');
+});
+
+test('sans rien pour la nommer, la fiche reste descriptive et à corriger', () => {
+  const [c] = drv.guess([N('boule', { arch: 'ESP32-C3', release: '', eth: 0, outputs: [[10]] })]);
+  assert.strictEqual(c.ref.model, 'ESP32-C3 · 1 sortie');
+  assert.strictEqual(c.ref.source, 'à nommer');
+});
+
+test('des puces différentes ne se regroupent JAMAIS', () => {
+  const g = drv.guess([N('a', { arch: 'ESP32-C3', outputs: [[10]] }), N('b', { arch: 'ESP32-S3', outputs: [[10]] })]);
+  assert.strictEqual(g.length, 2);
+});
+
+test('rien d\'électrique n\'est inventé', () => {
+  // une fiche qui prétendrait connaître les tensions ou le courant ferait dire
+  // des faussetés au rapport de cohérence, alors que rien de tout cela n'existe
+  // dans la configuration d'un node.
+  const [c] = drv.guess([N('x')]);
+  for (const champ of ['inputVolts', 'maxA', 'maxAPerOut', 'fused', 'levelShifter']) {
+    assert.strictEqual(c.board[champ], undefined, `${champ} ne se déduit pas d'un node`);
+  }
+  // et la fiche normalisée qui en sort est bien vide de ce côté
+  const fiche = drv.normDriver({ ref: { brand: '', model: 'X' }, board: c.board });
+  assert.deepStrictEqual(fiche.board.inputVolts, []);
+  assert.strictEqual(fiche.board.maxA, null);
+});
+
+test('un node sans aucune sortie câblée ne produit pas de fiche', () => {
+  assert.deepStrictEqual(drv.guess([N('vide', { outputs: [] })]), []);
+  assert.deepStrictEqual(drv.guess([]), []);
+  assert.deepStrictEqual(drv.guess(null), []);
+});
+
+test('guess ne modifie pas ce qu\'on lui donne', () => {
+  const src = [N('a'), N('b', { eth: 13 })];
+  const avant = JSON.stringify(src);
+  drv.guess(src);
+  assert.strictEqual(JSON.stringify(src), avant);
+});
+
+test('les modèles les plus répandus arrivent en tête', () => {
+  const g = drv.guess([
+    N('seul', { arch: 'ESP32-S3', outputs: [[1]] }),
+    N('a', { arch: 'ESP32-C3', outputs: [[10]] }), N('b', { arch: 'ESP32-C3', outputs: [[10]] }), N('c', { arch: 'ESP32-C3', outputs: [[10]] }),
+  ]);
+  assert.strictEqual(g[0].nodes.length, 3);
+});

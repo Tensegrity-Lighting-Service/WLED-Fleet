@@ -8,7 +8,7 @@ Référence des surfaces exposées par WLED Fleet, à l'usage des logiciels
 satellites — plugin MA3, scripts, outils tiers. Générée depuis le code : elle ne
 peut pas diverger de ce que le serveur fait réellement.
 
-Version de l'application au moment de la génération : **0.11.1** · 101 points
+Version de l'application au moment de la génération : **0.12.0** · 102 points
 d'entrée.
 
 ## Ce qui fait autorité, et ce qui n'en fait pas
@@ -95,6 +95,7 @@ d'ensemble lit 3, et accepte alors de dépendre d'une instance de Fleet en march
 | méthode | chemin | rôle |
 |---|---|---|
 | `GET` | `/api/drivers` | Catalogue de cartes : pour chaque modèle, son brochage, ses tensions d'entrée et ses courants admissibles, plus la liste des nodes qui le déclarent. Sert à dire si un budget de courant est réaliste pour ce matériel — ce que le node lui-même ne sait pas. |
+| `GET` | `/api/drivers/guess` | Propose une fiche de carte par modèle distinct reconnu dans la flotte, d'après la puce, la variante de build, le type d'Ethernet et le brochage. Rien n'est créé : les écarts à l'intérieur d'un groupe sont rendus pour que l'utilisateur tranche, et les caractéristiques électriques restent à saisir — elles ne sont nulle part sur un node. |
 | `POST` | `/api/drivers/item` | Crée ou met à jour une carte. L'uid est frappé à la création et ne change jamais ; la révision monte quand le matériel change, pas quand on corrige le nom. |
 | `DELETE` | `/api/drivers/item/:id` | Retire une carte. Marquée retirée — jamais effacée — dès qu'un node la déclare, pour que son marqueur garde un sens. |
 | `GET` | `/api/psus` | Catalogue d'alimentations : tension, ampères et watts (liés par la tension), rails, taux d'usage conseillé, plus les nodes rattachés. Décrit un MODÈLE, jamais un exemplaire — l'exemplaire vit sur le node. |

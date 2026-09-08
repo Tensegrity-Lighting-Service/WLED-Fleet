@@ -277,3 +277,9 @@
   .gedge{fill:none;stroke:var(--line2);stroke-width:1.5;vector-effect:non-scaling-stroke}
   .gedge.warn{stroke:var(--warn)} .gedge.bad{stroke:var(--bad);stroke-width:2.5}
   .gghost{fill:none;stroke:var(--info);stroke-width:2;stroke-dasharray:5 4;vector-effect:non-scaling-stroke}
+
+/* écart entre une sortie et la fiche produit qu'elle revendique : sous le
+   sélecteur de profil, là où on regarde déjà. Discret quand tout concorde,
+   visible quand ça diverge. */
+.devline { font-size: 10px; line-height: 1.3; margin-top: 2px; white-space: nowrap; }
+.devline .rowbtn { padding: 0 3px; margin-left: 3px; font-size: 10px; line-height: 1.2; }

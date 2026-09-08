@@ -12,6 +12,7 @@
   applyTheme(theme);
   document.querySelectorAll('#themeSw button').forEach(b => b.onclick = () => applyTheme(b.dataset.theme));
   let COLS = [], GROUPS = [], fleet = { nodes: [] }, LED_TYPES = {}, COLOR_ORDERS = {}, WHITE_SWAPS = {}, WHITE_SWAP_TYPES = [];
+  let dmxLib = null;   // les fiches produits, pour la colonne Px de Sorties/DMX
   let ledProfilesCache = []; // local library (led-profiles.json), kept in sync for the Sorties/DMX badge and table
   let sortKey = 'name', sortDir = 1, editing = null;
   // manual row order (drag the ⋮⋮ handle): a list of node identities (MAC, else IP), persisted
@@ -211,9 +212,25 @@
   }
   // the node's own stored id (MQTT client id) wins if it still exists locally; otherwise Fleet
   // recognizes a profile whose type/order/pixels match this output exactly
+  // Quel produit cette sortie revendique-t-elle ?
+  //
+  // Deux façons, et les deux ont manqué. Le MARQUEUR d'abord : un node patché
+  // avant le passage aux uuid porte encore un identifiant à 2 caractères, que
+  // seul le legacyId de la fiche sait rattraper — sans lui la colonne restait
+  // vide alors que Fleet, lui, résolvait le produit très bien.
+  // À défaut de marqueur, la RESSEMBLANCE : type, ordre, et une longueur qui
+  // soit l'une des longueurs types. Exiger la longueur par défaut faisait
+  // qu'un produit utilisé à 160 px quand sa fiche en propose 80 ne se
+  // reconnaissait dans rien — c'est-à-dire précisément le cas que les
+  // longueurs types existent pour couvrir.
   const profileIdFor = (o, r) => {
-    if (o.profile && ledProfilesCache.some(x => x.id === o.profile)) return o.profile;
-    const m = ledProfilesCache.find(x => Number(x.type) === Number(r.type) && Number(x.order) === ((r.order || 0) & 0x0f) && Number(x.len) === Number(o.len));
+    if (o.profile) {
+      const m = ledProfilesCache.find(x => x.id === o.profile || (x.legacyId && x.legacyId === o.profile));
+      if (m) return m.id;
+    }
+    const t = Number(r.type), ord = (r.order || 0) & 0x0f, len = Number(o.len);
+    const m = ledProfilesCache.find(x => Number(x.type) === t && Number(x.order) === ord
+      && (Number(x.len) === len || (Array.isArray(x.lens) && x.lens.includes(len))));
     return m ? m.id : '';
   };
   // every wired, counted output whose type/order/pixels match no profile in the local library
@@ -1132,7 +1149,7 @@
   }
   async function renderDmx() {
     const p = $('#dmxpanel');
-    let d; try { [d] = await Promise.all([api('/api/dmx-plan'), loadLedProfiles()]); } catch (e) { p.innerHTML = `<div class="st-bad">${esc(e.message)}</div>`; return; }
+    let d; try { const r = await Promise.all([api('/api/dmx-plan'), api('/api/library'), loadLedProfiles()]); d = r[0]; dmxLib = r[1]; } catch (e) { p.innerHTML = `<div class="st-bad">${esc(e.message)}</div>`; return; }
     const CPX = { 4: 3, 5: 3, 6: 4 }; // channels per pixel by DMX mode (Multi RGB, Multi DRGB, Multi RGBW)
     const modeName = m => ({ 4: 'Multi RGB', 5: 'Multi DRGB', 6: 'Multi RGBW' })[m] || (COLS.find(c => c.id === 'dmxmode') || { enum: {} }).enum[m] || m;
     // conflit = recouvrement AU CANAL PRÈS (voir dmx.js) : deux nodes peuvent partager un
@@ -1188,7 +1205,7 @@
           <span class="ablnote" data-abl></span>
         </div></td>`;
     };
-    const profileOptions = cur => `<option value="">profil…</option>${ledProfilesCache.map(pr => `<option value="${esc(pr.id)}" ${pr.id === cur ? 'selected' : ''}>${esc(pr.name)}</option>`).join('')}<option value="__new">＋ enregistrer cette ligne comme profil…</option>${ledProfilesCache.length ? '<option value="__manage">gérer les profils…</option>' : ''}`;
+    const profileOptions = cur => `<option value="">profil…</option>${ledProfilesCache.map(pr => `<option value="${esc(pr.id)}" ${pr.id === cur || (pr.legacyId && pr.legacyId === cur) ? 'selected' : ''}>${esc(pr.name)}</option>`).join('')}<option value="__new">＋ enregistrer cette ligne comme profil…</option>${ledProfilesCache.length ? '<option value="__manage">gérer les profils…</option>' : ''}`;
     // Une fixture ne se stocke nulle part en entier : elle se reconstitue en
     // rassemblant les sorties qui portent le même numéro, triées par instance.
     // La pastille est donc l'essentiel de la colonne — c'est elle qui montre, à
@@ -1213,15 +1230,59 @@
       const offBoundary = i > 0 && !linked && o.aligned === false; // seule ET au milieu d'un univers
       const uniTxt = !o.len ? '' : o.universes > 1 ? `<span class="${offBoundary ? 'st-warn' : 'muted'}" title="${offBoundary ? 'sortie seule qui commence au milieu d\'un univers : à la console elle reste à cheval' : 'cette sortie occupe plusieurs univers'}">${o.universes} univers</span>` : '<span class="st-ok">1 univers</span>';
       const wsw = (r.order || 0) >> 4, hasW = WHITE_SWAP_TYPES.includes(Number(r.type));
+  // Les longueurs types de la fiche, à côté du profil.
+  //
+  // Ce n'est PAS le nombre de pixels déclaré — celui-là reste la colonne
+  // Pixels, et c'est lui qui fait foi : une longueur saisie à la main est
+  // légitime et l emporte toujours. Cette colonne ne fait que proposer ce que
+  // la fiche prévoit, pour éviter de retaper un nombre et de s en écarter sans
+  // le vouloir. Vide quand la sortie ne revendique aucun produit.
+  // `pid` est le produit RECONNU par profileIdFor — marqueur ou ressemblance.
+  // S'en tenir au seul marqueur laissait la colonne vide sur toutes les sorties
+  // jamais patchées par Fleet, alors que la colonne Profil, elle, les nommait :
+  // deux colonnes voisines qui n'auraient pas dit la même chose.
+  const pxCell = (o, pid) => {
+    const prod = dmxLib && (dmxLib.products || []).find(x => x.uid === pid || x.uid === o.profile || (x.legacyId && x.legacyId === o.profile));
+    const lens = prod ? prod.presets : [];
+    if (!lens.length) return '<span class="muted" title="aucune longueur type : la sortie ne revendique pas de produit, ou sa fiche n en porte aucune">—</span>';
+    const cur = lens.find(x => x.px === o.len);
+    return `<select data-preset title="longueurs types de « ${esc(labelProd(prod))} ». Choisir remplit la colonne Pixels ; la valeur saisie reste la vérité finale.">` +
+      `<option value=""${cur ? '' : ' selected'}>${cur ? '—' : esc(String(o.len)) + ' px (hors fiche)'}</option>` +
+      lens.map(x => `<option value="${x.px}"${cur && cur.px === x.px ? ' selected' : ''}>${esc(x.name ? x.name + ' — ' + x.px : String(x.px))} px${x.default ? ' ★' : ''}</option>`).join('') +
+      '</select>';
+  };
+  const labelProd = p => [p.ref.brand, p.ref.model].filter(Boolean).join(' ') || p.slug;
+
+  // Ce que le produit dit, et ce que la sortie fait réellement.
+  //
+  // /api/dmx-plan calcule déjà tout ça (productLabel, deviation) — ça ne
+  // s'affichait nulle part. Or c'est la question qu'on se pose devant la
+  // grille : « cette ligne est-elle encore la fiche, ou quelqu'un l'a-t-il
+  // retouchée ? ». Une longueur changée à la main est légitime et fait foi ;
+  // ce qui ne va pas, c'est de ne pas le VOIR.
+  const devCell = o => {
+    const d = o.deviation;
+    if (!o.productLabel && !d) return '';
+    const nom = esc(o.productLabel || '');
+    const preset = d && d.preset ? esc(d.preset) : null;
+    const custom = d && d.customLen ? `${d.customLen} px` : null;
+    const ecarts = (d && d.fields || []).map(x => `${x.label} : ${x.node} au lieu de ${x.product}`);
+    const modifie = d && d.modified;
+    return `<div class="devline${modifie ? ' st-warn' : ' muted'}" title="${esc(ecarts.length ? 'écart avec la fiche : ' + ecarts.join(' · ') : 'la sortie correspond à sa fiche')}">` +
+      `${nom}${preset ? ' · ' + preset : ''}${custom ? ' · ' + custom : ''}${modifie ? ' · modifié' : ''}` +
+      `</div>`;
+  };
+
       // la colonne de chaînage passe AVANT la cellule de node (qui porte le rowspan) :
       // l'ordre doit suivre celui des <th>, sinon tout le tableau glisse d'une colonne
       const pk = `${n.ip}|${i}`, picked = picks.has(pk);
       return `<tr data-outrow="${i}" data-node="${esc(n.ip)}" class="${o.ignored ? 'offline' : ''}${first ? ' first' : ''}${linked ? ' chained' : ''}${picked ? ' selected' : ''}">
-        <td class="pickcell"><input type="checkbox" data-pick="${esc(pk)}" ${picked ? 'checked' : ''} title="cocher plusieurs lignes, puis modifier un champ sur l'une d'elles : la valeur part sur toutes les lignes cochées"></td>
-        <td class="chaincell${linked ? ' linked' : ''}" data-chain="${i}" title="${i === 0 ? 'première sortie du node : rien au-dessus à quoi la chaîner' : linked ? 'chaînée : ses pixels reprennent juste après ceux de la sortie du dessus, les deux forment une seule fixture continue à la console. Cliquer pour la détacher (elle repartira sur un début d\'univers).' : 'sortie seule. Cliquer pour la chaîner à celle du dessus : ses pixels reprendront juste après, sans trou — le cas de deux sorties d\'un même assemblage (tournette int + ext).'}">${i === 0 ? '' : `<span class="chainmark">${linked ? '⛓' : '⊘'}</span>`}</td>
         ${first ? nodeCell(n, span) : ''}
+        <td class="pickcell"><input type="checkbox" data-pick="${esc(pk)}" ${picked ? 'checked' : ''} title="cocher plusieurs lignes, puis modifier un champ sur l'une d'elles : la valeur part sur toutes les lignes cochées"></td>
         <td><label class="chip" title="utilisée = câblée. Décocher une sortie qui existe dans WLED mais n'est pas branchée : grisée, et les canaux qu'elle occuperait ne sont plus réservés (hors conflits). Mémorisé sur le node (marqueur dans son MQTT device topic), rien d'autre n'est écrit."><input type="checkbox" data-ignore="${i}" ${o.ignored ? '' : 'checked'}> Sortie ${o.i + 1}</label></td>
-        <td class="${unknown ? 'newprof' : ''}"><select data-prof title="${unknown ? 'profil inconnu de la bibliothèque locale : ce type/ordre/pixels ne correspond à aucun profil enregistré ici → ＋ enregistrer cette ligne comme profil pour le retrouver la prochaine fois.' : 'profil de LED : ce qui est branché sur cette sortie ; choisir un profil remplit type, ordre et pixels, et le node s\'en souvient (MQTT client id). Sans choix, Fleet reconnaît un profil quand la ligne y correspond exactement.'}">${profileOptions(pid)}</select></td>
+        <td class="chaincell${linked ? ' linked' : ''}" data-chain="${i}" title="${i === 0 ? 'première sortie du node : rien au-dessus à quoi la chaîner' : linked ? 'chaînée : ses pixels reprennent juste après ceux de la sortie du dessus, les deux forment une seule fixture continue à la console. Cliquer pour la détacher (elle repartira sur un début d\'univers).' : 'sortie seule. Cliquer pour la chaîner à celle du dessus : ses pixels reprendront juste après, sans trou — le cas de deux sorties d\'un même assemblage (tournette int + ext).'}">${i === 0 ? '' : `<span class="chainmark">${linked ? '⛓' : '⊘'}</span>`}</td>
+        <td class="${unknown ? 'newprof' : ''}"><select data-prof title="${unknown ? 'profil inconnu de la bibliothèque locale : ce type/ordre/pixels ne correspond à aucun profil enregistré ici → ＋ enregistrer cette ligne comme profil pour le retrouver la prochaine fois.' : 'profil de LED : ce qui est branché sur cette sortie ; choisir un profil remplit type, ordre et pixels, et le node s\'en souvient (MQTT client id). Sans choix, Fleet reconnaît un profil quand la ligne y correspond exactement.'}">${profileOptions(pid)}</select>${devCell(o)}</td>
+        <td class="pxcell">${pxCell(o, pid)}</td>
         <td class="muted adv" title="GPIO de la sortie">${esc(o.pin)}</td>
         <td>${sel('type', LED_TYPES, r.type)}</td>
         <td class="adv"><input type="number" data-out="omax" data-orig="${r.maxpwr ?? 0}" value="${r.maxpwr ?? 0}" min="0" max="65000" step="50" title="Budget de courant de CETTE sortie (mA). N'agit que si « par sortie » est coché sur le node : sinon le firmware l'ignore entièrement, et WLED le réécrit tout seul au prorata des pixels à chaque enregistrement — c'est de là que viennent les valeurs bizarres qu'on trouve dans les configs."></td>
@@ -1237,13 +1298,13 @@
         <td class="oc-addr"><span class="addr"><b>${esc(o.from || '')}</b> → <b>${esc(o.to || '')}</b></span> <span class="straddle">${uniTxt}</span></td></tr>`;
     };
     const groupTable = gc => {
-      const head = `<thead><tr><th title="sélection pour l'édition en lot"></th><th title="chaînage : ⛓ pixels collés à la sortie du dessus (une seule fixture), ⊘ sortie seule"></th><th>Node</th><th>Sortie</th><th title="profil de LED : type + ordre + pixels mémorisés sous un nom">Profil</th><th class="adv">Pin</th><th>Type</th><th class="adv" title="budget de courant de cette sortie — n_agit que si « par sortie » est coché sur le node">Limite mA</th><th class="adv" title="Auto Brightness Limiter : mA par pixel à pleine luminosité, pour estimer/limiter la consommation">mA/pixel</th><th>Ordre</th><th title="échange du canal blanc (WLED : Swap) — proposé seulement sur les types numériques à canal blanc">Swap W</th><th title="index du premier pixel dans le node (0 = premier)">Départ</th><th title="pixels sur ce câble ; 📏 = calculateur, 📍 = repérer le dernier pixel">Pixels</th><th title="sens de parcours du ruban">Inv.</th><th class="adv">Skip</th><th class="adv">Off Refresh</th><th title="numéro de fixture à la console. Plusieurs sorties, même sur des nodes différents, peuvent partager un numéro : elles forment alors une seule fixture. La pastille de couleur est dérivée du numéro, pour les repérer d'un coup d'œil.">Fixture</th><th title="univers.canal du premier et du dernier pixel : ce qu'il faut patcher à la console (recalculé en direct)">Adresse console (de → à)</th></tr></thead>`;
+      const head = `<thead><tr><th>Node</th><th title="sélection pour l'édition en lot : elle porte sur des SORTIES, pas sur des nodes"></th><th>Sortie</th><th title="chaînage : ⛓ pixels collés à la sortie du dessus (une seule fixture), ⊘ sortie seule"></th><th title="profil de LED : type + ordre + pixels mémorisés sous un nom">Profil</th><th title="longueur type du produit choisi. La longueur réellement déclarée reste la colonne Pixels : celle-ci ne fait que proposer ce que la fiche prévoit.">Px</th><th class="adv">Pin</th><th>Type</th><th class="adv" title="budget de courant de cette sortie — n_agit que si « par sortie » est coché sur le node">Limite mA</th><th class="adv" title="Auto Brightness Limiter : mA par pixel à pleine luminosité, pour estimer/limiter la consommation">mA/pixel</th><th>Ordre</th><th title="échange du canal blanc (WLED : Swap) — proposé seulement sur les types numériques à canal blanc">Swap W</th><th title="index du premier pixel dans le node (0 = premier)">Départ</th><th title="pixels sur ce câble ; 📏 = calculateur, 📍 = repérer le dernier pixel">Pixels</th><th title="sens de parcours du ruban">Inv.</th><th class="adv">Skip</th><th class="adv">Off Refresh</th><th title="numéro de fixture à la console. Plusieurs sorties, même sur des nodes différents, peuvent partager un numéro : elles forment alors une seule fixture. La pastille de couleur est dérivée du numéro, pour les repérer d'un coup d'œil.">Fixture</th><th title="univers.canal du premier et du dernier pixel : ce qu'il faut patcher à la console (recalculé en direct)">Adresse console (de → à)</th></tr></thead>`;
       const NCOL = 17; // colonnes après la cellule Node
       const body = gc.nodes.map(n => {
         const pl = n.plan; const rec = nodeRec(n.ip); const rawIns = (rec && rec.cfg && rec.cfg.hw && rec.cfg.hw.led && rec.cfg.hw.led.ins) || [];
-        if (!pl.multi) return `<tr data-node="${esc(n.ip)}"><td class="pickcell"></td><td class="chaincell"></td>${nodeCell(n, 1)}<td colspan="${NCOL - 1}" class="muted">mode ${esc(modeName(pl.mode))} : ${esc(pl.note)}</td></tr>`;
+        if (!pl.multi) return `<tr data-node="${esc(n.ip)}">${nodeCell(n, 1)}<td class="pickcell"></td><td colspan="${NCOL}" class="muted">mode ${esc(modeName(pl.mode))} : ${esc(pl.note)}</td></tr>`;
         const outs = pl.outputs; const span = Math.max(1, outs.length);
-        if (!outs.length) return `<tr data-node="${esc(n.ip)}"><td class="pickcell"></td><td class="chaincell"></td>${nodeCell(n, 1)}<td colspan="${NCOL - 1}" class="muted">aucune sortie déclarée</td></tr>`;
+        if (!outs.length) return `<tr data-node="${esc(n.ip)}">${nodeCell(n, 1)}<td class="pickcell"></td><td colspan="${NCOL}" class="muted">aucune sortie déclarée</td></tr>`;
         return outs.map((o, i) => outRow(n, o, rawIns[i] || {}, i, i === 0, span)).join('');
       }).join('');
       const ns = gc.nodes.filter(n => n.plan.multi);
@@ -1578,6 +1639,13 @@
       cb.closest('tr').classList.toggle('offline', !cb.checked); renderConflicts(); // in place: the unsaved edits of the page stay
     });
     // 📏 pixels = LEDs per metre × length ; universes = ceil(px / pxPerUni) for the row's LED type
+    // Choisir une longueur type remplit la colonne Pixels — qui reste seule
+    // maîtresse : on peut la retoucher juste après, et l'écart s'affichera.
+    p.querySelectorAll('select[data-preset]').forEach(sl => sl.onchange = () => {
+      const v = Number(sl.value); if (!v) return;
+      const el = sl.closest('tr').querySelector('[data-out=len]');
+      el.value = String(v); el.dispatchEvent(new Event('input'));
+    });
     p.querySelectorAll('button[data-calc]').forEach(b => b.onclick = async () => {
       const tr = b.closest('tr');
       const rgbw = rgbwTypes.includes(Number(tr.querySelector('[data-out=type]').value)); const per = rgbw ? 128 : 170;
@@ -2059,12 +2127,22 @@
         </table></details></div>`;
     };
 
+    // La carte se choisit ICI et nulle part ailleurs : c'est un fait de
+    // matériel, au même titre que l'alimentation qui nourrit le boîtier, et
+    // Sorties/DMX ne parle que de pixels. Le rattachement part dans le
+    // /fleet.json du node, donc il survit à un changement de poste.
+    const selCarte = (ip, uid) => {
+      const list = (d.drivers || []);
+      if (!list.length) return '<span class="muted" title="aucune carte au catalogue : onglet Matériel > Bibliothèques > Cartes">—</span>';
+      return `<select data-setdriver="${esc(ip)}" title="quelle carte est ce node : ce qu'elle admet en tension et en courant décide si son budget est réaliste"><option value="">—</option>${list.map(x => `<option value="${esc(x.uid)}"${x.uid === uid ? ' selected' : ''}>${esc([x.ref.brand, x.ref.model].filter(Boolean).join(' '))}</option>`).join('')}</select>`;
+    };
+
     const ligneNode = n => {
       const full = (d.nodes || []).find(x => x.ip === n.ip) || {};
       const b = full.budget || {};
       const r = n.ratio === null || n.ratio === undefined ? null : Math.round(n.ratio * 100);
       return `<tr><td><b>${esc(n.name)}</b></td>
-        <td class="muted">${full.driver ? esc([full.driver.ref.brand, full.driver.ref.model].filter(Boolean).join(' ')) : '—'}</td>
+        <td>${selCarte(n.ip, full.driver ? full.driver.uid : '')}</td>
         <td>${aFmt(n.maxA)}${b.ablGoverns ? ' <span class="muted" title="le facteur d\'usage dépasse ce budget : c\'est l\'ABL qui décide ici">◂</span>' : ''}</td>
         <td class="muted">${aFmt(n.worstA)}</td>
         <td class="${r === null ? 'muted' : r < 50 ? 'st-warn' : 'muted'}">${r === null ? '—' : `${r} %`}</td>
@@ -2097,6 +2175,16 @@
     pane.querySelectorAll('[data-pwedit]').forEach(b => b.onclick = () => editPsu(b.dataset.pwedit));
     pane.querySelectorAll('[data-attach]').forEach(sel => sel.onchange = () => attach(sel.dataset.attach, sel.value));
     pane.querySelectorAll('[data-detach]').forEach(b => b.onclick = () => attach(b.dataset.detach, null));
+    pane.querySelectorAll('[data-setdriver]').forEach(sl => sl.onchange = async () => {
+      const ip = sl.dataset.setdriver, uid = sl.value || null;
+      try {
+        // rail: undefined = on ne touche PAS au rattachement d'alimentation en
+        // changeant la carte ; ce sont deux faits indépendants
+        await post(`/api/node/${encodeURIComponent(ip)}/power`, { driver: uid });
+        toast(uid ? 'carte rattachée' : 'carte détachée');
+        renderPower();
+      } catch (e) { toast(e.message, true); renderPower(); }
+    });
     updatePowerBadge(d);
   }
 
@@ -2193,7 +2281,7 @@
       : "Une alimentation décrit un MODÈLE — « Meanwell LRS-350-24 » — et non l'exemplaire n° 3 du camion : « Alim jardin » ne voudrait rien dire sur un autre poste, et le rattachement vit sur le node. Ampères et watts sont liés par la tension : saisir l'un remplit l'autre.";
 
     pane.innerHTML = `${libTabs()}<h2>${titre} <span class="muted">${items.length}</span>
-        <span class="spacer"></span><button id="catNew" class="rowbtn">＋ Nouveau</button></h2>
+        <span class="spacer"></span>${kind === 'drivers' ? '<button id="catGuess" class="rowbtn" title="parcourt la flotte et propose une fiche par modèle de carte reconnu : puce, variante de build, type d Ethernet, brochage. Rien n est créé sans validation, et les caractéristiques électriques restent à saisir.">Déduire de la flotte…</button>' : ''}<button id="catNew" class="rowbtn">＋ Nouveau</button></h2>
       <div class="muted" style="font-size:12px;margin:-4px 0 10px;max-width:900px">${intro}</div>
       <div class="fwcols">
         <div class="liblist">${list}</div>
@@ -2203,7 +2291,52 @@
     wireLibTabs(pane);
     pane.querySelectorAll('[data-pick]').forEach(el => el.onclick = () => { libSel = el.dataset.pick; libDraft = null; renderLib(); });
     $('#catNew').onclick = () => { libDraft = kind === 'drivers' ? blankDriver() : blankPsu(); libSel = null; renderLib(); };
+    if ($('#catGuess')) $('#catGuess').onclick = guessDrivers;
     if (cur) wireCatEditor(kind, cur);
+  }
+
+  // ── Déduire les cartes de ce qui est en ligne ─────────────────────────────
+  // Le serveur fait le regroupement (drivers.guess) : c'est là que vivent les
+  // règles, et elles sont testées. Ici on ne fait que montrer ce qu'il propose
+  // — y compris les ÉCARTS à l'intérieur d'un groupe, parce que c'est
+  // justement ce que l'utilisateur doit trancher : deux nodes qui portent la
+  // même carte peuvent se présenter différemment, et un doublon créé ici
+  // serait durable.
+  async function guessDrivers() {
+    let g; try { g = await api('/api/drivers/guess'); } catch (e) { return toast(e.message, true); }
+    const cs = g.candidates || [];
+    if (!cs.length) return toast(`rien de nouveau : les ${g.nodes} node(s) en ligne correspondent déjà à des fiches`);
+    const lignes = cs.map((c, i) => `<label class="chip" style="display:flex;gap:8px;align-items:flex-start;margin:4px 0">
+      <input type="checkbox" data-gd="${i}" checked>
+      <span><b>${esc(c.board.mcu || 'carte')}</b> · ${c.board.outputs} sortie${c.board.outputs > 1 ? 's' : ''} · GPIO ${esc(c.board.pins.map(p => p.gpio.join('/')).join(', '))}${c.board.release ? ' · ' + esc(c.board.release) : ''}
+      <br><span class="muted">${c.nodes.length} node${c.nodes.length > 1 ? 's' : ''} : ${esc(c.nodes.slice(0, 3).join(', '))}${c.nodes.length > 3 ? '…' : ''}</span>
+      ${c.ecarts.map(e => `<br><span class="st-warn">▲ ${esc(e.msg)}</span>`).join('')}
+      <br><input data-gdbrand="${i}" value="${esc(c.ref.brand)}" placeholder="marque" style="width:120px;margin-top:3px">
+      <input data-gdmodel="${i}" value="${esc(c.ref.model)}" placeholder="modèle" style="width:200px;margin-top:3px">
+      <span class="muted" style="font-size:11px"> ${esc(c.ref.source)}</span></span></label>`).join('');
+    const box = document.createElement('div'); box.className = 'pop';
+    box.style.cssText = 'left:50%;top:10%;transform:translateX(-50%);max-width:620px;max-height:74vh;overflow:auto';
+    box.innerHTML = `<div class="pop-head">${cs.length} modèle(s) de carte reconnu(s) sans fiche</div>
+      <div class="pop-body">Déduit de ce que les nodes annoncent : puce, variante de build, type d'Ethernet, GPIO de chaque sortie. Les tensions admises, le courant maximal et le fusible ne sont nulle part sur un node — ils restent à saisir, et tant qu'ils sont vides le rapport de cohérence ne conclut rien sur cette carte. Un ▲ signale ce qui diffère entre nodes du même groupe : à vérifier avant de valider.</div>
+      <div style="padding:0 10px">${lignes}</div>
+      <div class="pop-actions"><button class="pop-cancel">Annuler</button><button class="pop-act green">Créer</button></div>`;
+    document.body.appendChild(box);
+    const done = () => box.remove();
+    box.querySelector('.pop-cancel').onclick = done;
+    box.querySelector('.pop-act').onclick = async () => {
+      let n = 0, voulus = 0;
+      for (const [i, c] of cs.entries()) {
+        if (!box.querySelector(`[data-gd="${i}"]`).checked) continue;
+        voulus++;
+        const brand = box.querySelector(`[data-gdbrand="${i}"]`).value.trim();
+        const model = box.querySelector(`[data-gdmodel="${i}"]`).value.trim();
+        try { await post('/api/drivers/item', { ref: { brand, model }, board: c.board }); n++; }
+        catch (e) { toast(`${model || brand || 'carte'} : ${e.message}`, true); }
+      }
+      done();
+      toast(`${n} fiche(s) créée(s) sur ${voulus}`);
+      renderLib();
+    };
   }
 
   const blankDriver = () => ({ uid: null, rev: 1, ref: { brand: '', model: '', sku: '', internal: '', note: '' },

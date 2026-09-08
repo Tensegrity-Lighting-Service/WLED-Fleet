@@ -126,10 +126,96 @@ function mismatches(driver, node) {
   return out;
 }
 
+// ── Déduire les cartes de ce qui est déjà en ligne ─────────────────────────
+// Saisir une fiche par carte quand la flotte les décrit déjà serait du travail
+// pour rien. WLED annonce sa puce, sa variante de build, son type d'Ethernet et
+// le GPIO de chaque sortie : de quoi reconnaître un MODÈLE, pas de quoi le
+// qualifier électriquement — ça, ça vient de la fiche constructeur.
+//
+// ── Le piège, rencontré sur la vraie flotte ───────────────────────────────
+// Deux nodes qui portent la MÊME carte peuvent se présenter différemment. Les
+// deux QUADRI tournent le même build « ESP32_Ethernet », mais l'un déclare
+// eth = 13 (LILYGO T-ETH-POE) et l'autre 0 (aucun), et leurs GPIO 3 et 4 sont
+// intervertis. Une signature naïve créerait donc deux fiches pour un seul
+// modèle — et ce doublon-là est durable, puisque des nodes le porteraient.
+//
+// D'où deux règles : le regroupement ignore l'ORDRE des GPIO et le type
+// d'Ethernet, et tout ce qui diffère à l'intérieur d'un groupe est RENDU, pour
+// que la décision reste à l'utilisateur. Rien n'est créé sans validation.
+const NO_BRAND = new Set(['wled', 'foss', '']);          // ce que le build générique annonce
+
+// Un node tel que le serveur le résume : ce qu'on peut lire sans rien supposer.
+//   { ip, name, arch, release, brand, product, eth, outputs: [[gpio…], …] }
+function guess(nodes) {
+  const groups = new Map();
+  for (const n of (Array.isArray(nodes) ? nodes : [])) {
+    const outs = (Array.isArray(n && n.outputs) ? n.outputs : [])
+      .map(p => [...new Set((Array.isArray(p) ? p : [p]).map(Number).filter(Number.isInteger))]);
+    if (!outs.length) continue;                          // rien de câblé : rien à déduire
+    const mcu = String((n.arch) || '').trim();
+    const release = String((n.release) || '').trim();
+    // clé volontairement insensible à l'ordre des sorties et muette sur eth
+    const key = [mcu, release, outs.length, outs.map(g => g.join('/')).sort().join(',')].join('|');
+    if (!groups.has(key)) groups.set(key, { key, mcu, release, outputs: outs.length, vus: [] });
+    groups.get(key).vus.push({
+      ip: n.ip || '', name: String(n.name || n.ip || '').trim(),
+      eth: Number.isInteger(Number(n.eth)) ? Number(n.eth) : 0,
+      brand: String(n.brand || '').trim(), product: String(n.product || '').trim(),
+      gpio: outs,
+    });
+  }
+
+  return [...groups.values()].map(g => {
+    const ecarts = [];
+    // Ethernet : « 0 » veut dire « pas configuré », pas « la carte n'en a
+    // pas ». Un type déclaré quelque part dans le groupe l'emporte donc, et
+    // l'écart est signalé — c'est peut-être un node resté en WiFi par erreur.
+    const eths = [...new Set(g.vus.map(v => v.eth))];
+    const eth = eths.find(e => e !== 0) || 0;
+    if (eths.length > 1) {
+      const sans = g.vus.filter(v => v.eth === 0).map(v => v.name);
+      ecarts.push({ code: 'eth-partiel', msg: `${ETH_TYPES[eth] || 'Ethernet'} déclaré sur ${g.vus.length - sans.length} node(s), aucun sur ${sans.join(', ')}` });
+    }
+    // Brochage : on retient l'arrangement le plus répandu, et on dit lesquels
+    // en sortent. Interverti n'est pas faux — mais ça se sait.
+    const parOrdre = new Map();
+    for (const v of g.vus) {
+      const k = v.gpio.map(x => x.join('/')).join(',');
+      if (!parOrdre.has(k)) parOrdre.set(k, []);
+      parOrdre.get(k).push(v);
+    }
+    const ordres = [...parOrdre.entries()].sort((a, b) => b[1].length - a[1].length);
+    const gpio = ordres[0][1][0].gpio;
+    if (ordres.length > 1) {
+      ecarts.push({ code: 'gpio-ordre', msg: 'brochage dans un autre ordre sur ' + ordres.slice(1).map(([k, vs]) => `${vs.map(v => v.name).join(', ')} (${k})`).join(' · ') });
+    }
+    // Le nom : d'abord ce que la carte dit d'elle-même — certaines s'annoncent
+    // vraiment (Athom). Sinon la table Ethernet de WLED, qui nomme de vraies
+    // cartes. Sinon un libellé descriptif, à corriger à la main.
+    const nomme = g.vus.find(v => !NO_BRAND.has(v.brand.toLowerCase()) && v.product);
+    const ref = nomme ? { brand: nomme.brand, model: nomme.product, source: 'la carte se nomme elle-même' }
+      : eth && ETH_TYPES[eth] ? { brand: '', model: ETH_TYPES[eth], source: 'type Ethernet déclaré' }
+        : { brand: '', model: `${g.mcu || 'carte'} · ${g.outputs} sortie${g.outputs > 1 ? 's' : ''}`, source: 'à nommer' };
+
+    return {
+      key: g.key, ref,
+      board: {
+        mcu: g.mcu, release: g.release, eth, outputs: g.outputs,
+        pins: gpio.map((gp, i) => ({ i, gpio: gp })),
+        // rien d'électrique : ce n'est nulle part dans la configuration d'un
+        // node, et une fiche à moitié remplie qui prétendrait le contraire
+        // ferait dire des faussetés au rapport de cohérence
+      },
+      nodes: g.vus.map(v => v.name),
+      ecarts,
+    };
+  }).sort((a, b) => b.nodes.length - a.nodes.length);
+}
+
 module.exports = {
   FORMAT, FORMAT_VERSION, NODE_FORMAT,
   normDriver: cat.normOne, normStore: cat.normStore, upsert: cat.upsert, retire: cat.retire,
   resolve: cat.resolve, find: cat.resolve, revState: cat.revState,
   nodeSlice: cat.nodeSlice, parseNodeSlice: cat.parseNodeSlice, compareNodeSlice: cat.compareNodeSlice,
-  label: cat.label, substance, normBoard, mismatches, catalog: cat,
+  label: cat.label, substance, normBoard, mismatches, guess, catalog: cat,
 };

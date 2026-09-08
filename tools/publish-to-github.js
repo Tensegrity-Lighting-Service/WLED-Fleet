@@ -92,7 +92,7 @@ function main() {
   } else {
     console.log(`checkout existant : ${dest} — mise à jour`);
     gitLive(dest, ['fetch', 'origin']);
-    try { gitLive(dest, ['checkout', branch]); } catch { /* branche pas encore créée */ }
+    try { gitLive(dest, ['checkout', 'refs/heads/' + branch]); } catch { /* branche pas encore créée */ }
     try { gitLive(dest, ['reset', '--hard', 'origin/' + branch]); } catch { /* branche pas encore poussée */ }
   }
   try { gitLive(dest, ['checkout', '-B', branch]); } catch { /* déjà dessus */ }
@@ -110,7 +110,12 @@ function main() {
   const pkg = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8'));
   const msg = `Sync v${pkg.version}${branch === 'main' ? '' : ` [${branch}]`} (${new Date().toISOString().slice(0, 10)})`;
   gitLive(dest, ['commit', '-m', msg]);
-  gitLive(dest, ['push', '-u', 'origin', branch]);
+  // refspec complète, jamais le nom nu : la préversion beta porte un TAG « beta »
+  // en face de la BRANCHE « beta », et git refuse alors de trancher
+  // (« src refspec beta matches more than one »). Le jour où ça arrive, publier
+  // devient impossible sans qu'on comprenne pourquoi — le nom seul est correct
+  // partout ailleurs.
+  gitLive(dest, ['push', '-u', 'origin', `refs/heads/${branch}:refs/heads/${branch}`]);
   console.log(`publié : ${msg}`);
 }
 

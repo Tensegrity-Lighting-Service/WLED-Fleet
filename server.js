@@ -1379,8 +1379,12 @@ function startAutoSync() {
 }
 // forme attendue par l'ancien point d'entrée et par les anciens showfiles
 const legacyProfiles = () => libraryStore.products.filter(p => !p.retired).map(p => ({
-  id: p.uid, name: library.label(p), type: p.led.type, order: p.led.order,
+  id: p.uid, legacyId: p.legacyId, name: library.label(p), type: p.led.type, order: p.led.order,
   len: (p.presets.find(x => x.default) || p.presets[0] || {}).px || 0,
+  // toutes les longueurs de la fiche, pas seulement celle par défaut : sans
+  // elles, une sortie réglée sur une AUTRE longueur type ne se reconnaissait
+  // plus dans son propre produit
+  lens: p.presets.map(x => x.px),
   perM: p.led.perM, note: p.ref.note,
 }));
 // quelles sorties de la flotte utilisent quel produit — sert au badge, au
@@ -1932,6 +1936,29 @@ const server = http.createServer(async (req, res) => {
     // déclarent. Sert à dire si un budget de courant est réaliste pour ce
     // matériel — ce que le node lui-même ne sait pas.
     if (p === '/api/drivers' && req.method === 'GET') return send(res, 200, catView('drivers'));
+    // @api Propose une fiche de carte par modèle distinct reconnu dans la
+    // flotte, d'après la puce, la variante de build, le type d'Ethernet et le
+    // brochage. Rien n'est créé : les écarts à l'intérieur d'un groupe sont
+    // rendus pour que l'utilisateur tranche, et les caractéristiques
+    // électriques restent à saisir — elles ne sont nulle part sur un node.
+    if (p === '/api/drivers/guess' && req.method === 'GET') {
+      const vus = [];
+      for (const rec of fleet.values()) {
+        const i = rec.info || {}, cfg = rec.cfg || {};
+        const ins = ((cfg.hw && cfg.hw.led && cfg.hw.led.ins) || []).filter(Boolean);
+        vus.push({
+          ip: rec.meta.ip, name: i.name || rec.meta.ip,
+          arch: i.arch, release: i.release, brand: i.brand, product: i.product,
+          eth: (cfg.eth || {}).type,
+          outputs: ins.map(o => o.pin || []),
+        });
+      }
+      const cands = drivers.guess(vus);
+      // ce qui correspond déjà à une fiche du catalogue n'a pas à être reproposé
+      const connus = driverStore.drivers.filter(x => !x.retired)
+        .map(x => [x.board.mcu, x.board.release, x.board.outputs, x.board.pins.map(pp => pp.gpio.join('/')).sort().join(',')].join('|'));
+      return send(res, 200, { candidates: cands.filter(c => !connus.includes(c.key)), nodes: vus.length });
+    }
     // @api Crée ou met à jour une carte. L'uid est frappé à la création et ne
     // change jamais ; la révision monte quand le matériel change, pas quand on
     // corrige le nom.
