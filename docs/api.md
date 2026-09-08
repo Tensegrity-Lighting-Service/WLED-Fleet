@@ -8,7 +8,7 @@ Référence des surfaces exposées par WLED Fleet, à l'usage des logiciels
 satellites — plugin MA3, scripts, outils tiers. Générée depuis le code : elle ne
 peut pas diverger de ce que le serveur fait réellement.
 
-Version de l'application au moment de la génération : **0.10.0** · 91 points
+Version de l'application au moment de la génération : **0.11.0** · 101 points
 d'entrée.
 
 ## Ce qui fait autorité, et ce qui n'en fait pas
@@ -90,10 +90,16 @@ d'ensemble lit 3, et accepte alors de dépendre d'une instance de Fleet en march
 | `POST` | `/api/node/:ip/meta/restore` | Repose les métadonnées sur un node revenu nu, à partir de la copie gardée par Fleet. Ne fait rien si le node a encore les siennes. |
 | `POST` | `/api/node/:ip/output-profile` | Ancien marqueur de produit par sortie, écrit dans le client id MQTT. Conservé pour les nodes anciens ; les nouveaux passent par /api/node/:ip/meta. |
 
-### Bibliothèque de produits LED
+### Catalogues : produits, cartes, alimentations
 
 | méthode | chemin | rôle |
 |---|---|---|
+| `GET` | `/api/drivers` | Catalogue de cartes : pour chaque modèle, son brochage, ses tensions d'entrée et ses courants admissibles, plus la liste des nodes qui le déclarent. Sert à dire si un budget de courant est réaliste pour ce matériel — ce que le node lui-même ne sait pas. |
+| `POST` | `/api/drivers/item` | Crée ou met à jour une carte. L'uid est frappé à la création et ne change jamais ; la révision monte quand le matériel change, pas quand on corrige le nom. |
+| `DELETE` | `/api/drivers/item/:id` | Retire une carte. Marquée retirée — jamais effacée — dès qu'un node la déclare, pour que son marqueur garde un sens. |
+| `GET` | `/api/psus` | Catalogue d'alimentations : tension, ampères et watts (liés par la tension), rails, taux d'usage conseillé, plus les nodes rattachés. Décrit un MODÈLE, jamais un exemplaire — l'exemplaire vit sur le node. |
+| `POST` | `/api/psus/item` | Crée ou met à jour une alimentation. Ampères et watts sont réconciliés par la tension ; `basis` retient lequel a été saisi, pour que changer la tension sache quelle grandeur tenir constante. |
+| `DELETE` | `/api/psus/item/:id` | Retire une alimentation, selon les mêmes règles que les cartes. |
 | `GET` | `/api/library` | Catalogue de produits LED, avec pour chaque produit le relevé des sorties qui l'utilisent et l'état de leur révision (à jour, en retard, en avance, inconnue). |
 | `POST` | `/api/library/product` | Crée ou met à jour un produit. L'uid est frappé à la création et ne change jamais ; la révision monte quand les réglages changent, pas quand le nom change. |
 | `DELETE` | `/api/library/product/:uid` | Retire un produit. Il est marqué retiré — jamais effacé — dès qu'une sortie de la flotte le référence, pour que son marqueur garde un sens. |
@@ -103,11 +109,20 @@ d'ensemble lit 3, et accepte alors de dépendre d'une instance de Fleet en march
 | `POST` | `/api/library/login/poll` | Interroge l'avancement de la connexion. Répond `pending` tant que le code n'a pas été validé sur github.com — ce n'est pas une erreur, c'est l'attente normale. |
 | `POST` | `/api/library/logout` | Se déconnecte : le jeton gardé est effacé. Le dépôt et les réglages restent, seule l'identité s'en va. |
 | `POST` | `/api/library/login/cli` | Se connecte par GitHub CLI, quand il est installé : Fleet lui demande son jeton au moment de s'en servir et n'en stocke aucun. Voie secondaire — la connexion normale ne dépend d'aucun logiciel extérieur. |
-| `POST` | `/api/library/pull` | Tire le dépôt partagé (jamais destructif). Un produit modifié localement et pas encore publié n'est PAS écrasé : il est signalé comme divergent, à publier — c'est la publication qui saura se replacer au-dessus de la version en ligne. |
-| `POST` | `/api/library/publish` | Publie vers le dépôt partagé : un produit si `uid` est donné, sinon tous ceux qui ont changé localement. Rien n'est jamais écrasé — sur collision, la version en ligne devient la base et la nôtre repart au-dessus, de sorte qu'aucun numéro de révision ne désigne deux contenus. |
+| `POST` | `/api/library/pull` | Tire le dépôt partagé (jamais destructif), les trois catalogues. Une fiche modifiée localement et pas encore publiée n'est PAS écrasée : elle est signalée comme divergente, à publier — c'est la publication qui saura se replacer au-dessus de la version en ligne. |
+| `POST` | `/api/library/publish` | Publie vers le dépôt partagé : une fiche si `uid` est donné (dans le catalogue `kind`, produits par défaut), sinon tout ce qui a changé localement dans les trois. Rien n'est jamais écrasé — sur collision, la version en ligne devient la base et la nôtre repart au-dessus, de sorte qu'aucun numéro de révision ne désigne deux contenus. |
 | `GET` | `/api/library/nodes` | Ce que les nodes portent de la bibliothèque : chaque node cite les produits de ses sorties, avec leur fiche complète et leur révision. Le rapprochement dit, produit par produit, si le node est à jour, en retard, en avance, inconnu de ce poste, ou divergent — même révision, réglages différents, deux postes hors ligne ayant fait monter le même numéro. |
 | `POST` | `/api/library/adopt` | Récupère dans le catalogue local un produit porté par un node — celui d'un node revenu d'ailleurs, ou d'un poste dont la bibliothèque était en avance. Jamais automatique : recopier sans demander effacerait silencieusement la version locale. |
 | `GET` | `/api/led-profiles` | Ancienne forme du catalogue, à plat. Conservée le temps qu'un showfile ancien passe ; utiliser /api/library. |
+
+### Chaîne électrique
+
+| méthode | chemin | rôle |
+|---|---|---|
+| `GET` | `/api/power` | Le rapport de cohérence électrique : pour chaque alimentation posée sur le plateau, sa capacité, la somme des budgets des nodes qu'elle nourrit, et les constats. Plus les nodes rattachés à rien — la seule liste que personne ne peut produire autrement. Les seuils et l'arithmétique de l'ABL sont dans power.js, vérifiés dans le firmware. |
+| `POST` | `/api/power/psu` | Crée ou met à jour un EXEMPLAIRE d'alimentation : son libellé, le modèle du catalogue qu'il suit, et où il se trouve. Propre au spectacle — « Alim jardin » ne veut rien dire sur un autre poste — donc jamais publié dans le dépôt partagé, mais présent dans le showfile. |
+| `DELETE` | `/api/power/psu/:id` | Retire un exemplaire d'alimentation. Les nodes qui le désignent sont renvoyés : c'est à l'utilisateur de les rattacher ailleurs, on ne les détache pas d'autorité. |
+| `POST` | `/api/node/:ip/power` | Rattache un node : quelle alimentation le nourrit, sur quel rail, et quelle carte il est. Écrit dans son /fleet.json, donc le node se raconte ensuite tout seul — y compris sur un autre poste. |
 
 ### Écritures en attente
 
@@ -120,8 +135,8 @@ d'ensemble lit 3, et accepte alors de dépendre d'une instance de Fleet en march
 
 | méthode | chemin | rôle |
 |---|---|---|
-| `POST` | `/api/showfile` | Exporte un showfile : groupes, sorties non câblées, bibliothèque de produits, métadonnées des nodes, réglages retenus. Jamais de secrets. |
-| `POST` | `/api/showfile/import` | Importe un showfile. Les identifiants de produits sont conservés tels quels, sinon les marqueurs déjà posés sur les nodes désigneraient autre chose. |
+| `POST` | `/api/showfile` | Exporte un showfile : groupes, sorties non câblées, les trois bibliothèques, le plan d'alimentation, les métadonnées des nodes et les réglages retenus. Jamais de secrets. |
+| `POST` | `/api/showfile/import` | Importe un showfile. Les identifiants des fiches — produits, drivers, alimentations — et leurs révisions sont conservés tels quels, sinon les marqueurs déjà posés sur les nodes désigneraient autre chose. Les catalogues et le plan d'alimentation sont FUSIONNÉS, jamais remplacés : importer le showfile d'un autre plateau n'efface rien d'ici. |
 | `GET` | `/api/snapshots` | Liste des sauvegardes de flotte. |
 | `POST` | `/api/snapshots` | Prend une sauvegarde de la flotte : config, presets et fichiers Fleet de chaque node joignable. |
 | `POST` | `/api/snapshots/import` | Importe un fichier de sauvegarde produit ailleurs. |

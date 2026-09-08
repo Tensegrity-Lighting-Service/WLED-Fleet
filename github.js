@@ -36,10 +36,33 @@
 'use strict';
 const https = require('https');
 const library = require('./library');
+const drivers = require('./drivers');
+const psus = require('./psus');
 
 const API = 'api.github.com';
-const DIR = 'products';
-const pathFor = uid => `${DIR}/${uid}.json`;
+
+// ── Trois types dans un même dépôt ─────────────────────────────────────────
+// Un répertoire par type. Les produits gardent `products/` : changer leur
+// chemin invaliderait le `blobSha` mémorisé de chacun, le premier rafraîchi
+// retéléchargerait tout, et une publication créerait un doublon au nouveau
+// chemin sans supprimer l'ancien.
+//
+// Le `format` inscrit dans chaque fichier n'est pas décoratif : c'est lui qui
+// permet de REFUSER un fichier lu au mauvais endroit. Sans cette vérification,
+// un driver passé au normalisateur des produits lèverait « marque ou modèle
+// requis », rendrait null, et serait ignoré en silence — une entrée disparue
+// sans un mot est exactement ce qu'on ne veut pas d'un catalogue partagé.
+const SPACES = {
+  products: { dir: 'products', format: 'wled-led-product', collection: 'products', catalog: library.catalog },
+  drivers: { dir: 'drivers', format: 'wled-fleet-driver', collection: 'drivers', catalog: drivers.catalog },
+  psus: { dir: 'psus', format: 'wled-fleet-psu', collection: 'psus', catalog: psus.catalog },
+};
+// Par défaut les produits : c'est le seul type qui existait avant, et tout
+// appelant qui ne précise rien parle d'eux.
+const spaceOf = s => (typeof s === 'string' ? SPACES[s] : s) || SPACES.products;
+const catalogOf = space => space.catalog || library.catalog;
+const pathFor = (uid, space) => `${spaceOf(space).dir}/${uid}.json`;
+const DIR = SPACES.products.dir;
 
 // ── Transport ───────────────────────────────────────────────────────────────
 // Un seul endroit qui parle à GitHub, pour que les messages d'erreur soient
@@ -99,9 +122,10 @@ function explain(status, headers, json) {
 //   'publish'  notre version part telle quelle
 //   'rebase'   les deux ont changé : on repart de la version en ligne, on y
 //              remet nos réglages, et on prend `rev = en ligne + 1`
-function decide(mine, theirs) {
+function decide(mine, theirs, space) {
+  const substance = catalogOf(spaceOf(space)).substance;
   if (!theirs) return { action: 'create', product: { ...mine, rev: Math.max(1, mine.rev) } };
-  const same = library.substance(mine) === library.substance(theirs);
+  const same = substance(mine) === substance(theirs);
   if (same && mine.rev === theirs.rev) return { action: 'skip', product: theirs };
   if (same) {
     // même contenu, numéros différents : le plus haut gagne, personne ne perd
@@ -123,49 +147,78 @@ function decide(mine, theirs) {
 }
 
 // Ce qu'un fichier du dépôt contient : le produit, plus de quoi le situer.
-const encode = product => Buffer.from(JSON.stringify({
-  format: 'wled-led-product', formatVersion: library.FORMAT_VERSION,
-  ...product, origin: 'library', dirty: false, blobSha: undefined,
-}, (k, v) => (v === undefined ? undefined : v), 2)).toString('base64');
+const encode = (product, space) => {
+  const sp = spaceOf(space);
+  return Buffer.from(JSON.stringify({
+    format: sp.format, formatVersion: catalogOf(sp).FORMAT_VERSION,
+    ...product, origin: 'library', dirty: false, blobSha: undefined,
+  }, (k, v) => (v === undefined ? undefined : v), 2)).toString('base64');
+};
 
-function decodeBlob(b64) {
-  try { return library.normProduct({ ...JSON.parse(Buffer.from(b64, 'base64').toString('utf8')), origin: 'library', dirty: false }); }
+// Le `format` est VÉRIFIÉ, pas seulement écrit. Avec trois types dans un même
+// dépôt, un fichier lu au mauvais endroit — parce qu'on s'est trompé de
+// répertoire, ou parce que quelqu'un a déplacé un fichier à la main — serait
+// sinon passé au mauvais normalisateur, qui lèverait sur un champ manquant et
+// rendrait null. L'entrée disparaîtrait alors sans un mot du catalogue partagé.
+function decodeBlob(b64, space) {
+  const sp = spaceOf(space);
+  let doc;
+  try { doc = JSON.parse(Buffer.from(b64, 'base64').toString('utf8')); } catch { return null; }
+  if (!doc || typeof doc !== 'object') return null;
+  // un fichier sans format est un fichier d'avant la vérification : on le
+  // tolère dans son propre répertoire, mais jamais ailleurs
+  if (doc.format && doc.format !== sp.format) return null;
+  try { return catalogOf(sp).normOne({ ...doc, origin: 'library', dirty: false }); }
   catch { return null; }
 }
 
 // ── Opérations en ligne ─────────────────────────────────────────────────────
 // Liste le dépôt en UNE requête : l'arbre git donne chemin et sha de chaque
 // fichier, donc on sait quoi retélécharger sans interroger fichier par fichier.
-async function listRemote(repo, { token, branch = 'main' } = {}) {
+// UNE requête pour tout le dépôt, quel que soit le nombre de types : l'arbre
+// récursif donne chemin et sha de chaque fichier d'un coup. Filtrer trois
+// répertoires ne coûte donc pas une requête de plus.
+async function listRemote(repo, opts = {}) {
+  const { token, branch = 'main' } = opts;
+  const spaces = (opts.spaces || Object.keys(SPACES)).map(spaceOf);
   const r = await request('GET', `/repos/${repo}/git/trees/${branch}?recursive=1`, { token });
   if (r.status === 404) return [];                       // dépôt vide : pas une erreur
   if (r.error) throw new Error(r.error);
-  return (r.json.tree || [])
-    .filter(e => e.type === 'blob' && e.path.startsWith(`${DIR}/`) && e.path.endsWith('.json'))
-    .map(e => ({ path: e.path, sha: e.sha, uid: e.path.slice(DIR.length + 1, -5) }));
+  const out = [];
+  for (const e of r.json.tree || []) {
+    if (e.type !== 'blob' || !e.path.endsWith('.json')) continue;
+    const sp = spaces.find(x => e.path.startsWith(`${x.dir}/`));
+    if (!sp) continue;
+    out.push({ path: e.path, sha: e.sha, uid: e.path.slice(sp.dir.length + 1, -5), space: sp, kind: sp.collection });
+  }
+  return out;
 }
 
-async function getProduct(repo, uid, { token, branch = 'main' } = {}) {
-  const r = await request('GET', `/repos/${repo}/contents/${pathFor(uid)}?ref=${encodeURIComponent(branch)}`, { token });
+async function getProduct(repo, uid, opts = {}) {
+  const { token, branch = 'main' } = opts;
+  const sp = spaceOf(opts.space);
+  const r = await request('GET', `/repos/${repo}/contents/${pathFor(uid, sp)}?ref=${encodeURIComponent(branch)}`, { token });
   if (r.status === 404) return null;
   if (r.error) throw new Error(r.error);
-  return { product: decodeBlob(r.json.content || ''), sha: r.json.sha };
+  return { product: decodeBlob(r.json.content || '', sp), sha: r.json.sha };
 }
+const getItem = getProduct;
 
 // Publie un produit, en se remettant d'un conflit plutôt qu'en abandonnant.
 // Renvoie ce qui a réellement été fait, pour que l'interface puisse le dire.
 async function publish(repo, mine, opts = {}) {
   const { token, branch = 'main', message, tries = 3 } = opts;
   if (!token) throw new Error('aucun jeton GitHub enregistré');
+  const sp = spaceOf(opts.space);
   let known = await getProduct(repo, mine.uid, opts);
   for (let attempt = 1; attempt <= tries; attempt++) {
-    const d = decide(mine, known && known.product);
+    const d = decide(mine, known && known.product, sp);
     if (d.action === 'skip' || d.action === 'adopt') return { ...d, sha: known.sha };
-    const r = await request('PUT', `/repos/${repo}/contents/${pathFor(mine.uid)}`, {
+    const r = await request('PUT', `/repos/${repo}/contents/${pathFor(mine.uid, sp)}`, {
       token,
       body: {
-        message: message || `${library.label(d.product)} — rev ${d.product.rev}`,
-        content: encode(d.product), branch,
+        message: message || `${catalogOf(sp).label(d.product)} — rev ${d.product.rev}`,
+        content: encode(d.product, sp), branch,
         ...(known && known.sha ? { sha: known.sha } : {}),   // sans sha, GitHub refuse d'écraser
       },
     });
@@ -180,14 +233,19 @@ async function publish(repo, mine, opts = {}) {
 }
 
 // Tire le dépôt : ne retélécharge que les fichiers dont le sha a bougé.
-async function pull(repo, store, opts = {}) {
+// `stores` = { products: …, drivers: …, psus: … } ou, pour l'ancien appel, un
+// seul magasin de produits. On ne retélécharge que les fichiers dont le sha a
+// bougé : c'est ce qui rend un rafraîchissement quotidien gratuit.
+async function pull(repo, stores, opts = {}) {
+  const byKind = stores && (stores.products || stores.drivers || stores.psus) ? stores : { products: stores };
   const remote = await listRemote(repo, opts);
   const fetched = [], unchanged = [];
   for (const entry of remote) {
-    const mine = library.resolve(store, entry.uid);
+    const cat = catalogOf(entry.space);
+    const mine = cat.resolve(byKind[entry.kind], entry.uid);
     if (mine && mine.blobSha === entry.sha) { unchanged.push(entry.uid); continue; }
-    const got = await getProduct(repo, entry.uid, opts);
-    if (got && got.product) fetched.push({ ...got.product, blobSha: got.sha });
+    const got = await getProduct(repo, entry.uid, { ...opts, space: entry.space });
+    if (got && got.product) fetched.push({ ...got.product, blobSha: got.sha, kind: entry.kind });
   }
   return { fetched, unchanged, remote };
 }
@@ -254,4 +312,4 @@ async function whoami(token) {
   return { login: r.json.login, name: r.json.name || '' };
 }
 
-module.exports = { request, explain, decide, encode, decodeBlob, listRemote, getProduct, publish, pull, pathFor, DIR, deviceStart, devicePoll, whoami };
+module.exports = { request, explain, decide, encode, decodeBlob, listRemote, getProduct, getItem, publish, pull, pathFor, DIR, SPACES, spaceOf, deviceStart, devicePoll, whoami };

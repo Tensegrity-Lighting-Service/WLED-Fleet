@@ -72,8 +72,11 @@ multipart), servi ensuite par un simple `GET /fleet.json`.
 
 ```jsonc
 { "format": "wled-fleet-node",
-  "formatVersion": 1,
+  "formatVersion": 2,
   "group": "Boule",
+  "power": { "psu": "8f97e081-6f2f-4133-bd38-ec7a91f2439b",
+             "rail": "A",
+             "driver": "76966b0d-1b2c-4a55-9e10-3f8d2a4b6c71" },
   "updatedAt": 1757337600000,
   "updatedBy": "decle",
   "outputs": [
@@ -107,6 +110,36 @@ Règles de lecture :
 - `i` renvoie à `hw.led.ins[i]`. Si `pin` ne correspond plus au GPIO trouvé à
   cette position, quelqu'un a réordonné les sorties en dehors de Fleet : les
   métadonnées de cette sortie sont **douteuses**.
+
+### `power` — ce qui alimente et ce qui pilote
+
+Apparu en **formatVersion 2**. Absent d'un fichier plus ancien, ce qui n'est pas
+une erreur : le node n'a simplement rien à dire là-dessus.
+
+| clé | sens |
+|---|---|
+| `psu` | l'**exemplaire** d'alimentation qui nourrit ce node — pas un modèle |
+| `rail` | sa sortie, quand l'alimentation en a plusieurs |
+| `driver` | le **modèle** de carte que ce node est |
+
+La distinction entre exemplaire et modèle est celle qui structure tout : le
+catalogue décrit « Meanwell LRS-350-24 », l'exemplaire décrit « l'alim jardin,
+sous le praticable ». Le second ne veut rien dire ailleurs, mais c'est lui que
+le node désigne.
+
+Un `psu` ou un `rail` peut aussi apparaître **sur une sortie** : elle l'emporte
+alors sur celui du node. C'est le cas d'une structure dont deux rubans partent
+sur un autre circuit. Même hiérarchie que le groupe, qui est du node, contre la
+fixture, qui est de la sortie.
+
+Ces trois identifiants renvoient à des choses qui vivent ailleurs. La fiche
+correspondante est déposée dans `/fleet-lib.json` (voir plus haut), pour qu'un
+node lu sur un poste qui n'a jamais vu ce spectacle ne dise pas seulement
+« alimenté par 8f97e081… ».
+
+WLED, lui, ne connaît pas la tension : `hw.led.maxpwr` est un courant en
+milliampères, et rien dans le node ne dit sous quelle tension. C'est
+précisément ce que `power` permet de retrouver.
 
 ### `product` et `prev`
 
@@ -162,12 +195,24 @@ citent — le node se décrit alors tout seul.
       "led": { "type": 22, "order": 1, "wswap": 0, "ledma": 55,
                "skip": 0, "offRefresh": false, "perM": 60 },
       "presets": [ { "label": "2 m", "px": 120, "default": true } ] }
+  ],
+  "drivers": [ /* la fiche de la carte, même forme : uid, rev, ref, board */ ],
+  "psus":    [ /* le MODÈLE d'alimentation : uid, rev, ref, psu */ ],
+  "powerNodes": [
+    { "uid": "8f97e081-6f2f-4133-bd38-ec7a91f2439b",
+      "label": "Alim jardin", "model": "…", "location": "sous le praticable" }
   ] }
 ```
 
 `led` reprend le vocabulaire de `hw.led.ins[]` : appliquer un produit à une
 sortie est une copie de champs, sans traduction. `order` est le quartet **bas**
 et `wswap` le quartet **haut** du même octet WLED.
+
+`drivers`, `psus` et `powerNodes` accompagnent le bloc `power` de
+`/fleet.json` : les deux premiers sont des fiches de catalogue, le troisième
+décrit l'**exemplaire** posé sur ce plateau — qui n'est dans aucun catalogue,
+puisqu'il n'a de sens que pour ce montage. Les trois peuvent manquer ; les clés
+inconnues d'une version plus récente sont conservées.
 
 Ce que le produit ne contient **pas**, délibérément : le sens de parcours
 (`rev`), l'index de départ, l'univers et l'adresse. Ce sont des propriétés de

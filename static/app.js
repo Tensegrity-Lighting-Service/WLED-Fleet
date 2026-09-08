@@ -231,7 +231,7 @@
   }
   function updateDmxBadge() {
     const n = unrecognizedOutputs().length;
-    const b = $('#btnDmx'); if (b) b.innerHTML = `Sorties / DMX${n ? ` <span class="n">${n}</span>` : ''}`;
+    setBadge('dmx', n ? ` <span class="n">${n}</span>` : '');
   }
   async function refresh() {
     if (editing) return; // do not repaint under the user's cursor
@@ -1020,7 +1020,7 @@
     } catch { /* server away, refresh() already shows it */ }
   }
   function renderJournal() {
-    $('#btnJournal').innerHTML = `Journal${unseen ? ` <span class="n">${unseen}</span>` : ''}`;
+    setBadge('journal', unseen ? ` <span class="n">${unseen}</span>` : '');
     if (!isOpen('journal')) return;
     $('#journalBody').innerHTML = [...changes].reverse().slice(0, 300).map(ev => {
       const col = COLS.find(c => c.id === ev.col);
@@ -1899,7 +1899,24 @@
     ahead: { cls: 'st-bad', txt: 'patchée avec une révision que ce poste n\'a pas : la bibliothèque locale est en retard, ne rien réappliquer avant de l\'avoir rafraîchie' },
   };
 
+  // Les trois catalogues partagent un onglet et un patron : liste à gauche,
+  // éditeur à droite. Les séparer en trois onglets de premier niveau les
+  // éloignerait alors qu'on passe sans cesse de l'un à l'autre — une carte se
+  // saisit en regardant ce qu'on branche dessus.
+  let libKind = (() => { try { return ['products', 'drivers', 'psus'].includes(localStorage.getItem('wf.libKind')) ? localStorage.getItem('wf.libKind') : 'products'; } catch { return 'products'; } })();
+  const LIBKINDS = { products: 'Produits LED', drivers: 'Cartes', psus: 'Alimentations' };
+  const libTabs = () => `<nav class="subtabs">${Object.entries(LIBKINDS).map(([k, l]) =>
+    `<button data-libkind="${k}" class="${k === libKind ? 'active' : ''}">${esc(l)}</button>`).join('')}</nav>`;
+  function wireLibTabs(pane) {
+    pane.querySelectorAll('[data-libkind]').forEach(b => b.onclick = () => {
+      libKind = b.dataset.libkind; libSel = null; libDraft = null;
+      try { localStorage.setItem('wf.libKind', libKind); } catch { /* ignore */ }
+      renderLib();
+    });
+  }
   async function renderLib() {
+    if (libKind === 'drivers') return renderCat('drivers');
+    if (libKind === 'psus') return renderCat('psus');
     const pane = $('#libpanel');
     try { libData = await api('/api/library'); } catch (e) { pane.innerHTML = `<div class="st-bad">${esc(e.message)}</div>`; return; }
     const d = libData;
@@ -1934,8 +1951,9 @@
     const known = new Set(d.products.map(x => x.uid));
     const orphans = Object.entries(usage).filter(([k]) => !known.has(k));
 
-    pane.innerHTML = `<h2>Bibliothèque <span class="muted">${products.length} produit${products.length > 1 ? 's' : ''}</span>
+    pane.innerHTML = `${libTabs()}<h2>Produits LED <span class="muted">${products.length}</span>
         <span class="spacer"></span>
+        <button id="libGuess" class="rowbtn" title="parcourt les sorties de la flotte et propose une fiche par combinaison distincte de type, ordre, mA et longueur. Rien n'est créé sans validation.">Déduire de la flotte…</button>
         <button id="libNew" class="rowbtn">＋ Nouveau produit</button></h2>
       <div class="muted" style="font-size:12px;margin:-4px 0 10px;max-width:900px">Un produit décrit ce qui est branché : type de LED, ordre des couleurs, échange du blanc, mA par LED, LEDs sautées, off refresh, LEDs par mètre, et une ou plusieurs longueurs types. Ce qui dépend de l'installation — sens inversé, index de départ, univers, adresse — n'y est pas : appliquer un produit ne peut donc pas casser un patch existant.</div>
       ${orphans.length ? `<div class="st-warn" style="margin-bottom:10px">${orphans.length} marqueur${orphans.length > 1 ? 's' : ''} lu${orphans.length > 1 ? 's' : ''} sur la flotte ne désigne${orphans.length > 1 ? 'nt' : ''} aucun produit d'ici : ${orphans.map(([k, v]) => `<span class="mono">${esc(k.slice(0, 8))}</span> (${v.length} sortie${v.length > 1 ? 's' : ''})`).join(', ')}. Ces nodes viennent d'un poste dont la bibliothèque est plus complète — leurs marqueurs sont conservés tels quels.</div>` : ''}
@@ -1946,12 +1964,458 @@
       <div id="libremote"></div>
       <div id="libnodes"></div>`;
 
+    wireLibTabs(pane);
     pane.querySelectorAll('[data-pick]').forEach(el => el.onclick = () => { libSel = el.dataset.pick; libDraft = null; renderLib(); });
     $('#libNew').onclick = () => { libDraft = blankProduct(); libSel = null; renderLib(); };
+    $('#libGuess').onclick = guessProducts;
     wireLibEditor();
     renderRemote();
     renderNodeLib();
   }
+
+  // ── Le schéma du plateau ──────────────────────────────────────────────────
+  // Le module de rendu vit dans graph.js et ne sait rien de l'application : on
+  // lui donne les données et deux fonctions de rappel. Tirer un câble depuis
+  // une alimentation vers un node écrit sur le NODE, comme partout ailleurs.
+  let graphApi = null, graphSig = '';
+  async function renderGraph() {
+    const pane = $('#graphpanel');
+    let d; try { d = await api('/api/power'); } catch (e) { pane.innerHTML = `<div class="st-bad">${esc(e.message)}</div>`; return; }
+    if (!pane.querySelector('.gwrap')) {
+      pane.innerHTML = `<h2>Schéma
+          <span class="muted" style="text-transform:none;letter-spacing:0" title="Alimentations à gauche, nodes au milieu, sorties à droite. La couleur d'un câble est celle du pire constat qui le concerne : le schéma est le rapport de cohérence, en plus lisible qu'un tableau. Molette pour zoomer, glisser le fond pour déplacer la vue, double-clic pour tout revoir.">ⓘ</span>
+          <span class="spacer"></span>
+          <button id="gFit" class="rowbtn">Tout voir</button>
+          <button id="gReset" class="rowbtn" title="oublier les positions déplacées à la main et revenir à la disposition calculée">Replacer</button></h2>
+        <div class="gwrap"></div>`;
+      graphApi = WF_GRAPH.mount(pane.querySelector('.gwrap'), { onWire: wireNode });
+      $('#gFit').onclick = () => graphApi.fit();
+      $('#gReset').onclick = () => graphApi.resetPos();
+      graphApi.update(d);
+      // après la frame : le panneau vient d'être affiché, il n'a pas encore sa taille
+      requestAnimationFrame(() => graphApi.fit());
+      graphSig = sigOf(d);
+      return;
+    }
+    // ne redessiner que si quelque chose a changé : un rafraîchissement qui
+    // reconstruit le schéma sous les doigts pendant qu'on déplace une boîte est
+    // insupportable
+    const sig = sigOf(d);
+    if (sig !== graphSig) { graphSig = sig; graphApi.update(d); }
+  }
+  const sigOf = d => JSON.stringify([
+    (d.psus || []).map(p => [p.uid, p.usedA, p.capA, (p.nodes || []).map(n => n.ip), (p.checks || []).length]),
+    (d.orphelins || []).map(o => o.ip),
+    (d.nodes || []).map(n => [n.ip, n.budget.maxA, n.budget.ratio, (n.budget.outputs || []).length]),
+  ]);
+
+  async function wireNode(psuUid, target) {
+    // on ne câble que vers un node, et jamais vers une sortie ou une autre alim
+    const n = (powerData && powerData.nodes || []).find(x => x.ip === target)
+      || (powerData && powerData.orphelins || []).find(x => x.ip === target);
+    if (!target.includes('.') || target.includes('#')) return;
+    try {
+      await post(`/api/node/${encodeURIComponent(target)}/power`, { psu: psuUid });
+      toast('node rattaché');
+      graphSig = ''; renderGraph();
+    } catch (e) { toast(e.message, true); }
+  }
+
+  // ── Onglet Puissance ──────────────────────────────────────────────────────
+  // La règle de partage, à tenir : Sorties / DMX répond à « où sont les
+  // pixels », Puissance répond à « d'où vient le courant ». Cet onglet ne
+  // montre donc AUCUN univers, aucune adresse, aucune fixture — dès qu'on veut
+  // savoir « quel univers », on change d'onglet. C'est ce qui empêche les deux
+  // pages de devenir deux fois la même.
+  let powerData = null, powerSel = null;
+  const LVL = { bad: 'st-bad', warn: 'st-warn', info: 'muted' };
+  const aFmt = a => (a === null || a === undefined ? '—' : `${a} A`);
+
+  async function renderPower() {
+    const pane = $('#powerpanel');
+    try { powerData = await api('/api/power'); } catch (e) { pane.innerHTML = `<div class="st-bad">${esc(e.message)}</div>`; return; }
+    const d = powerData;
+    const graves = d.checks.filter(c => c.level !== 'info');
+
+    const carte = p => {
+      const pct = p.chargePct;
+      const teinte = pct === null ? '' : pct > 100 ? 'st-bad' : pct > 80 ? 'st-warn' : 'st-ok';
+      const cs = p.checks || [];
+      return `<div class="gtable"><details data-key="pw:${esc(p.uid || p.label)}" open><summary>
+          <span class="caret">▸</span> <b>${esc(p.label || '(sans nom)')}</b>
+          <span class="muted">${p.model ? esc([p.model.ref.brand, p.model.ref.model].filter(Boolean).join(' ')) : 'modèle non renseigné'}${p.location ? ` · ${esc(p.location)}` : ''}</span>
+          ${p.capA !== null ? `<span class="${teinte}">${p.usedA} A budgétés sur ${p.capA} A${pct !== null ? ` · ${pct} %` : ''}</span>` : '<span class="muted">capacité inconnue</span>'}
+          ${cs.some(c => c.level === 'bad') ? '<span class="st-bad">✗</span>' : cs.some(c => c.level === 'warn') ? '<span class="st-warn">▲</span>' : ''}
+          <span class="spacer"></span>
+          <button class="rowbtn" data-pwedit="${esc(p.uid)}">Modifier</button>
+        </summary>
+        ${p.capA !== null ? `<div class="pwbar" title="budget utilisable : ${p.budgetA} A (${p.capA} A moins le taux d'usage et la marge)">
+          <i style="width:${Math.min(100, pct || 0)}%" class="${teinte}"></i>
+          <b style="left:${Math.min(100, Math.round((p.budgetA / p.capA) * 100))}%" title="limite conseillée"></b></div>` : ''}
+        ${cs.length ? `<div class="pwchecks">${cs.map(c => `<div class="${LVL[c.level]}">${c.level === 'bad' ? '✗' : c.level === 'warn' ? '▲' : 'ⓘ'} ${esc(c.msg)}</div>`).join('')}</div>` : ''}
+        <table class="outs" style="width:auto">
+          <thead><tr><th>Node</th><th>Carte</th><th title="ce que l'ABL autorise réellement — c'est ce chiffre qu'on somme, pas le pire cas">Budget</th><th title="blanc plein, toutes sorties : jamais atteint en pratique">Pire cas</th><th title="part du blanc plein réellement atteignable avec ce budget">Blanc</th><th>Tension</th><th></th></tr></thead>
+          <tbody>${p.nodes.length ? p.nodes.map(n => ligneNode(n)).join('') : '<tr><td colspan="7" class="muted">aucun node rattaché</td></tr>'}</tbody>
+        </table></details></div>`;
+    };
+
+    const ligneNode = n => {
+      const full = (d.nodes || []).find(x => x.ip === n.ip) || {};
+      const b = full.budget || {};
+      const r = n.ratio === null || n.ratio === undefined ? null : Math.round(n.ratio * 100);
+      return `<tr><td><b>${esc(n.name)}</b></td>
+        <td class="muted">${full.driver ? esc([full.driver.ref.brand, full.driver.ref.model].filter(Boolean).join(' ')) : '—'}</td>
+        <td>${aFmt(n.maxA)}${b.ablGoverns ? ' <span class="muted" title="le facteur d\'usage dépasse ce budget : c\'est l\'ABL qui décide ici">◂</span>' : ''}</td>
+        <td class="muted">${aFmt(n.worstA)}</td>
+        <td class="${r === null ? 'muted' : r < 50 ? 'st-warn' : 'muted'}">${r === null ? '—' : `${r} %`}</td>
+        <td class="muted">${(b.volts && b.volts.length) ? b.volts.join('/') + ' V' : '—'}</td>
+        <td><button class="rowbtn" data-detach="${esc(n.ip)}" title="détacher ce node de cette alimentation">✕</button></td></tr>`;
+    };
+
+    pane.innerHTML = `<h2>Puissance
+        <span class="muted" style="text-transform:none;letter-spacing:0" title="Cette page répond à « d'où vient le courant ». Sorties / DMX répond à « où sont les pixels » — on n'y trouve donc ici ni univers, ni adresse, ni fixture. Les budgets sommés sont les limites déclarées à WLED (son limiteur automatique), et non les pires cas théoriques : sur une flotte réelle le pire cas dépasse partout le budget, et le sommer produirait une alerte permanente.">ⓘ</span>
+        <span class="spacer"></span>
+        <button id="pwNew" class="rowbtn">＋ Alimentation</button></h2>
+      ${graves.length
+    ? `<div class="subbox" style="margin-bottom:10px">${graves.map(c => `<div class="${LVL[c.level]}">${c.level === 'bad' ? '✗' : '▲'} ${c.node ? `<b>${esc(c.node)}</b> — ` : ''}${esc(c.msg)}</div>`).join('')}</div>`
+    : '<div class="st-ok" style="margin-bottom:10px">✓ rien à signaler sur la chaîne électrique</div>'}
+      <div class="pwtotals subbox">
+        <span><span class="k">Capacité installée</span> <b>${d.totals.capaciteA} A</b></span>
+        <span><span class="k">Budgets déclarés</span> <b>${d.totals.budgetA} A</b></span>
+        <span><span class="k">Pire cas théorique</span> <b class="muted">${d.totals.pireCasA} A</b></span>
+        <span><span class="k">Nodes rattachés</span> <b>${d.totals.rattaches} / ${d.totals.nodes}</b></span>
+      </div>
+      ${d.psus.map(carte).join('') || '<div class="muted">aucune alimentation saisie — « ＋ Alimentation » pour commencer</div>'}
+      ${d.orphelins.length ? `<h2 style="margin-top:16px">Non rattachés <span class="muted">${d.orphelins.length}</span></h2>
+        <div class="muted" style="font-size:12px;margin-bottom:6px">Ces nodes ne sont reliés à aucune alimentation : impossible de dire si ce qu'ils ont le droit de tirer est couvert.</div>
+        <table class="outs" style="width:auto"><tbody>${d.orphelins.map(o => `<tr><td><b>${esc(o.name)}</b></td><td>${aFmt(o.maxA)}</td>
+          <td>${d.plan.psus.length ? `<select data-attach="${esc(o.ip)}"><option value="">rattacher à…</option>${d.plan.psus.map(x => `<option value="${esc(x.uid)}">${esc(x.label)}</option>`).join('')}</select>` : '<span class="muted">saisir d\'abord une alimentation</span>'}</td></tr>`).join('')}</tbody></table>` : ''}
+      <div id="pwEdit"></div>`;
+
+    keepDetails(pane);
+    $('#pwNew').onclick = () => editPsu(null);
+    pane.querySelectorAll('[data-pwedit]').forEach(b => b.onclick = () => editPsu(b.dataset.pwedit));
+    pane.querySelectorAll('[data-attach]').forEach(sel => sel.onchange = () => attach(sel.dataset.attach, sel.value));
+    pane.querySelectorAll('[data-detach]').forEach(b => b.onclick = () => attach(b.dataset.detach, null));
+    updatePowerBadge(d);
+  }
+
+  function updatePowerBadge(d) {
+    const n = (d.checks || []).filter(c => c.level !== 'info').length;
+    setBadge('power', n ? ` <span class="n">${n}</span>` : '');
+  }
+
+  // Rattacher écrit sur le NODE : c'est lui qui doit se raconter, y compris sur
+  // un poste qui n'a jamais vu ce showfile.
+  async function attach(ip, psu) {
+    try {
+      await post(`/api/node/${encodeURIComponent(ip)}/power`, { psu, rail: psu ? undefined : null });
+      toast(psu ? 'node rattaché' : 'node détaché');
+      renderPower();
+    } catch (e) { toast(e.message, true); }
+  }
+
+  function editPsu(uid) {
+    const cur = uid ? powerData.plan.psus.find(x => x.uid === uid) : null;
+    const box = $('#pwEdit');
+    box.innerHTML = `<h2 style="margin-top:16px">${cur ? 'Modifier' : 'Nouvelle alimentation'}</h2>
+      <div class="setrow" style="max-width:700px">
+        <label for="pwLabel">Libellé</label><div><input id="pwLabel" value="${esc(cur ? cur.label : '')}" placeholder="Alim jardin" style="width:220px"></div>
+        <div class="hint">le nom qu'on emploie sur le plateau, pas la référence du fabricant</div>
+        <label for="pwModel">Modèle</label><div><select id="pwModel"><option value="">— non renseigné —</option>${
+  (powerData.catalogue || []).filter(x => !x.retired).map(x => `<option value="${esc(x.uid)}"${cur && cur.model === x.uid ? ' selected' : ''}>${esc([x.ref.brand, x.ref.model].filter(Boolean).join(' '))} · ${x.psu.volt} V${x.psu.amps ? ` ${x.psu.amps} A` : ''}</option>`).join('')}</select></div>
+        <div class="hint">pris dans la Bibliothèque → Alimentations. Sans modèle, aucune capacité n'est connue et rien ne peut être vérifié.</div>
+        <label for="pwLoc">Emplacement</label><div><input id="pwLoc" value="${esc(cur ? cur.location : '')}" placeholder="sous le praticable jardin" style="width:100%;max-width:330px"></div>
+        <div class="hint">ce qu'on cherche quand quelque chose ne s'allume pas, et que personne ne note jamais</div>
+      </div>
+      <div style="margin-top:8px;display:flex;gap:8px">
+        <button id="pwSave" class="rowbtn primary">Enregistrer</button>
+        ${cur ? '<button id="pwDel" class="rowbtn">Retirer</button>' : ''}
+        <button id="pwCancel" class="rowbtn">Annuler</button>
+      </div>`;
+    box.scrollIntoView({ block: 'nearest' });
+    $('#pwCancel').onclick = () => { box.innerHTML = ''; };
+    $('#pwSave').onclick = async () => {
+      try {
+        await post('/api/power/psu', { uid: cur ? cur.uid : undefined, label: $('#pwLabel').value, model: $('#pwModel').value || null, location: $('#pwLoc').value });
+        box.innerHTML = ''; toast('alimentation enregistrée'); renderPower();
+      } catch (e) { toast(e.message, true); }
+    };
+    if ($('#pwDel')) $('#pwDel').onclick = async () => {
+      if (!await confirmBox(`Retirer « ${cur.label} » ?\nLes nodes qu'elle nourrit ne seront PAS détachés d'autorité : ils apparaîtront comme non rattachés, à vous de les replacer.`)) return;
+      try {
+        const r = await api(`/api/power/psu/${encodeURIComponent(cur.uid)}`, { method: 'DELETE' });
+        box.innerHTML = '';
+        toast(r.orphelins.length ? `retirée — ${r.orphelins.length} node(s) désormais sans alimentation` : 'retirée');
+        renderPower();
+      } catch (e) { toast(e.message, true); }
+    };
+  }
+
+
+  // ── Cartes et alimentations ───────────────────────────────────────────────
+  // Même patron que les produits : liste à gauche, éditeur à droite. Ce qui
+  // change d'un type à l'autre tient dans deux fonctions — la ligne de liste et
+  // le corps du formulaire — le reste est commun.
+  let catData = null;
+  const VOLT_LIST = [5, 12, 24, 48];
+  const voltBoxes = (name, cochees, titre) => `<div class="volts" title="${esc(titre)}">${VOLT_LIST.map(v =>
+    `<label class="chip"><input type="checkbox" data-volt="${name}" value="${v}"${(cochees || []).includes(v) ? ' checked' : ''}> ${v} V</label>`).join('')}</div>`;
+  const readVolts = name => [...document.querySelectorAll(`[data-volt="${name}"]`)].filter(c => c.checked).map(c => Number(c.value));
+
+  async function renderCat(kind) {
+    const pane = $('#libpanel');
+    try { catData = await api(`/api/${kind}`); } catch (e) { pane.innerHTML = `<div class="st-bad">${esc(e.message)}</div>`; return; }
+    const items = (catData[kind] || []).filter(x => !x.retired);
+    const usage = catData.usage || {};
+    if (libSel && !items.some(x => x.uid === libSel)) libSel = null;
+    if (!libSel && !libDraft && items.length) libSel = items[0].uid;
+    const cur = libDraft || items.find(x => x.uid === libSel) || null;
+
+    const byBrand = new Map();
+    for (const x of items) { const k = x.ref.brand || '(sans marque)'; if (!byBrand.has(k)) byBrand.set(k, []); byBrand.get(k).push(x); }
+    const ligne = x => {
+      const n = (usage[x.uid] || []).length;
+      const sous = kind === 'drivers'
+        ? `${x.board.outputs ? `${x.board.outputs} sortie${x.board.outputs > 1 ? 's' : ''}` : 'sorties non renseignées'}${x.board.maxA ? ` · ${x.board.maxA} A` : ''}${x.board.mcu ? ` · ${esc(x.board.mcu)}` : ''}`
+        : `${x.psu.volt} V${x.psu.amps ? ` · ${x.psu.amps} A` : ''}${x.psu.watts ? ` · ${x.psu.watts} W` : ''}${x.psu.rails.length ? ` · ${x.psu.rails.length} rails` : ''}`;
+      return `<div class="libitem${x.uid === libSel && !libDraft ? ' sel' : ''}" data-pick="${esc(x.uid)}">
+        <div><b>${esc(x.ref.model || x.slug)}</b> <span class="revchip">rev ${x.rev}</span></div>
+        <div class="muted">${sous}${n ? ` · ${n} node${n > 1 ? 's' : ''}` : ''}</div></div>`;
+    };
+    const list = [...byBrand.entries()].sort((a, b) => a[0].localeCompare(b[0])).map(([brand, xs]) =>
+      `<div class="libbrand">${esc(brand)}</div>${xs.map(ligne).join('')}`).join('')
+      || `<div class="muted" style="padding:10px 2px">aucune fiche — « ＋ Nouveau » pour commencer</div>`;
+
+    const titre = kind === 'drivers' ? 'Cartes' : 'Alimentations';
+    const intro = kind === 'drivers'
+      ? "Une carte décrit un MODÈLE — « QuinLED Dig-Quad » — et non le boîtier accroché au portique : ce qu'un exemplaire a de particulier vit sur le node. Elle apporte ce que le node ne dit pas de lui-même : combien de sorties sont réellement câblées, sur quels GPIO, et ce que le bornier supporte. C'est ce qui permet de dire si un budget de courant est réaliste."
+      : "Une alimentation décrit un MODÈLE — « Meanwell LRS-350-24 » — et non l'exemplaire n° 3 du camion : « Alim jardin » ne voudrait rien dire sur un autre poste, et le rattachement vit sur le node. Ampères et watts sont liés par la tension : saisir l'un remplit l'autre.";
+
+    pane.innerHTML = `${libTabs()}<h2>${titre} <span class="muted">${items.length}</span>
+        <span class="spacer"></span><button id="catNew" class="rowbtn">＋ Nouveau</button></h2>
+      <div class="muted" style="font-size:12px;margin:-4px 0 10px;max-width:900px">${intro}</div>
+      <div class="fwcols">
+        <div class="liblist">${list}</div>
+        <div id="libEditor">${cur ? (kind === 'drivers' ? driverForm(cur, usage[cur.uid] || []) : psuForm(cur, usage[cur.uid] || [])) : '<div class="muted">choisir une fiche à gauche</div>'}</div>
+      </div>`;
+
+    wireLibTabs(pane);
+    pane.querySelectorAll('[data-pick]').forEach(el => el.onclick = () => { libSel = el.dataset.pick; libDraft = null; renderLib(); });
+    $('#catNew').onclick = () => { libDraft = kind === 'drivers' ? blankDriver() : blankPsu(); libSel = null; renderLib(); };
+    if (cur) wireCatEditor(kind, cur);
+  }
+
+  const blankDriver = () => ({ uid: null, rev: 1, ref: { brand: '', model: '', sku: '', internal: '', note: '' },
+    board: { mcu: '', release: '', eth: 0, outputs: 0, pins: [], inputVolts: [], maxA: null, maxAPerOut: null, fused: false, levelShifter: false, psuBuiltin: false, note: '' } });
+  const blankPsu = () => ({ uid: null, rev: 1, ref: { brand: '', model: '', sku: '', internal: '', note: '' },
+    psu: { volt: 12, amps: null, watts: null, basis: 'amps', rails: [], derate: 0.8, adjustable: false, note: '' } });
+
+  const refRows = x => `
+    <label for="cBrand">Marque</label><div><input id="cBrand" value="${esc(x.ref.brand)}" style="width:190px"></div>
+    <label for="cModel">Modèle</label><div><input id="cModel" value="${esc(x.ref.model)}" style="width:190px"></div>
+    <div class="hint">marque ou modèle obligatoire</div>
+    <label for="cSku">Référence</label><div><input id="cSku" value="${esc(x.ref.sku)}" placeholder="fabricant" style="width:150px"> <input id="cInt" value="${esc(x.ref.internal)}" placeholder="interne" style="width:120px"></div>
+    <label for="cNote">Note</label><div><input id="cNote" value="${esc(x.ref.note)}" style="width:100%;max-width:330px"></div>
+    <div class="hint">corriger un nom ou une note ne fait pas monter la révision</div>`;
+  const usedBy = (used, quoi) => used.length
+    ? `<h2 style="margin-top:14px">Utilisé par <span class="muted">${used.length} node${used.length > 1 ? 's' : ''}</span></h2>
+       <div class="libused">${used.map(u => `${esc(u.name)}${u.rail ? ` · rail ${esc(u.rail)}` : ''}`).join('<br>')}</div>`
+    : `<div class="muted" style="margin-top:14px;font-size:12px">Aucun node ne déclare ${quoi} pour l'instant.</div>`;
+
+  function driverForm(x, used) {
+    const b = x.board;
+    const eth = catData.ethTypes || {};
+    return `<h2>${x.uid ? `Modifier <span class="revchip">rev ${x.rev}</span>` : 'Nouvelle carte'}
+        <span class="spacer"></span>${x.uid ? '<button id="catDel" class="rowbtn">Retirer</button>' : ''}
+        <button id="catSave" class="rowbtn primary">Enregistrer</button></h2>
+      <div class="setrow">${refRows(x)}
+        <label for="dMcu">Puce attendue</label><div><input id="dMcu" value="${esc(b.mcu)}" placeholder="esp32, ESP32-S3…" style="width:150px">
+          <input id="dRelease" value="${esc(b.release)}" placeholder="variante de build" style="width:170px"></div>
+        <div class="hint">comparés à ce que le node répond : une carte déclarée ESP32 sur un node qui répond ESP32-C3 est une fiche fausse</div>
+        <label for="dEth">Ethernet</label><div><select id="dEth">${Object.entries(eth).map(([v, l]) => `<option value="${v}"${Number(v) === Number(b.eth) ? ' selected' : ''}>${esc(l)}</option>`).join('')}</select></div>
+        <div class="hint">le type Ethernet de WLED nomme déjà de vraies cartes, et il réserve des GPIO</div>
+        <label for="dOut">Sorties</label><div><input type="number" id="dOut" value="${b.outputs || ''}" min="0" max="16" placeholder="—" style="width:70px"> <span class="muted">physiquement câblées</span></div>
+        <div class="hint">laisser vide tant qu'on ne sait pas : une fiche incomplète doit produire moins de constats, jamais des faux</div>
+        <label>Tensions d'entrée</label><div>${voltBoxes('din', b.inputVolts, 'une carte accepte souvent plusieurs tensions')}</div>
+        <div class="hint">vide = non renseigné, ce qui ne vaut jamais « c'est bon »</div>
+        <label for="dMaxA">Courant admissible</label><div><input type="number" id="dMaxA" value="${b.maxA ?? ''}" min="0" step="0.5" placeholder="—" style="width:70px"> A au total,
+          <input type="number" id="dMaxAOut" value="${b.maxAPerOut ?? ''}" min="0" step="0.5" placeholder="—" style="width:70px"> A par sortie</div>
+        <div class="hint">ce que le bornier, les pistes et le fusible laissent passer — en ampères, alors que WLED raisonne en milliampères</div>
+        <label>Options</label><div>
+          <label class="chip"><input type="checkbox" id="dFused"${b.fused ? ' checked' : ''}> fusible</label>
+          <label class="chip"><input type="checkbox" id="dShift"${b.levelShifter ? ' checked' : ''}> adaptateur de niveau</label>
+          <label class="chip"><input type="checkbox" id="dPsu"${b.psuBuiltin ? ' checked' : ''}> alimentation intégrée</label></div>
+        <div class="hint"></div>
+      </div>
+      <h2 style="margin-top:14px">Brochage <span class="muted">une ligne par sortie physique</span></h2>
+      ${b.outputs ? `<table class="outs" style="width:auto"><tbody id="dPins">${Array.from({ length: b.outputs }, (_, i) => {
+        const p = b.pins[i] || { gpio: [], label: '', level: '3v3' };
+        return `<tr><td class="muted">sortie ${i + 1}</td>
+          <td><input type="number" data-pin-gpio value="${p.gpio[0] ?? ''}" min="0" max="48" placeholder="GPIO" style="width:70px"></td>
+          <td><input data-pin-label value="${esc(p.label)}" placeholder="repère" style="width:90px"></td>
+          <td><select data-pin-level><option value="3v3"${p.level === '3v3' ? ' selected' : ''}>3,3 V</option><option value="5v"${p.level === '5v' ? ' selected' : ''}>5 V adapté</option></select></td></tr>`;
+      }).join('')}</tbody></table>
+      <div class="hint" style="margin-top:4px">Comparé au GPIO réellement lu sur le node, position par position — c'est ce qui repère une carte mal identifiée ou un câblage qui a bougé.</div>`
+    : '<div class="muted">renseigner le nombre de sorties pour saisir le brochage</div>'}
+      ${usedBy(used, 'cette carte')}`;
+  }
+
+  function psuForm(x, used) {
+    const p = x.psu;
+    return `<h2>${x.uid ? `Modifier <span class="revchip">rev ${x.rev}</span>` : 'Nouvelle alimentation'}
+        <span class="spacer"></span>${x.uid ? '<button id="catDel" class="rowbtn">Retirer</button>' : ''}
+        <button id="catSave" class="rowbtn primary">Enregistrer</button></h2>
+      <div class="setrow">${refRows(x)}
+        <label for="pVolt">Tension</label><div><select id="pVolt">${VOLT_LIST.map(v => `<option value="${v}"${v === p.volt ? ' selected' : ''}>${v} V</option>`).join('')}</select>
+          <label class="chip"><input type="checkbox" id="pAdj"${p.adjustable ? ' checked' : ''}> ajustable</label></div>
+        <div class="hint">une alimentation délivre UNE tension — c'est ce qui la distingue d'un ruban, qui existe souvent en plusieurs</div>
+        <label for="pAmps">Puissance</label><div><input type="number" id="pAmps" value="${p.amps ?? ''}" min="0" step="0.1" placeholder="—" style="width:80px"> A
+          &nbsp;ou&nbsp; <input type="number" id="pWatts" value="${p.watts ?? ''}" min="0" step="1" placeholder="—" style="width:80px"> W</div>
+        <div class="hint">saisir l'un remplit l'autre, sous la tension choisie. Le champ saisi fait foi : changer la tension recalcule le second.</div>
+        <label for="pDerate">Taux d'usage</label><div><input type="number" id="pDerate" value="${Math.round((p.derate || 0.8) * 100)}" min="10" max="100" step="5" style="width:70px"> %</div>
+        <div class="hint">80 % est la valeur du métier pour une alim à convection : au-delà elle chauffe, vieillit vite et sa tension s'affaisse — ce qui, sur du LED adressable, corrompt les données bien avant de couper</div>
+      </div>
+      <h2 style="margin-top:14px">Rails <span class="muted">laisser vide si l'alimentation n'a qu'une sortie</span></h2>
+      <table class="outs" style="width:auto"><tbody id="pRails">${(p.rails.length ? p.rails : []).map(railRow).join('')}</tbody></table>
+      <button id="pAddRail" class="rowbtn">＋ rail</button>
+      <div class="hint" style="margin-top:4px">Chaque rail se budgète séparément : un node branché sur le rail A n'est pas limité par ce que tire le rail B.</div>
+      ${usedBy(used, 'cette alimentation')}`;
+  }
+  const railRow = (r = { id: '', volt: '', amps: '', label: '' }) => `<tr>
+    <td><input data-rail-id value="${esc(r.id || '')}" placeholder="A" style="width:44px"></td>
+    <td><input type="number" data-rail-amps value="${r.amps ?? ''}" min="0" step="0.1" placeholder="A" style="width:70px"> A</td>
+    <td><select data-rail-volt><option value="">même tension</option>${VOLT_LIST.map(v => `<option value="${v}"${Number(r.volt) === v ? ' selected' : ''}>${v} V</option>`).join('')}</select></td>
+    <td><input data-rail-label value="${esc(r.label || '')}" placeholder="repère" style="width:110px"></td>
+    <td><button class="rowbtn" data-rail-del title="retirer ce rail">✕</button></td></tr>`;
+
+  function wireCatEditor(kind, cur) {
+    const save = $('#catSave'); if (!save) return;
+    const read = () => {
+      const base = { uid: libDraft ? libDraft.uid : libSel,
+        ref: { brand: $('#cBrand').value, model: $('#cModel').value, sku: $('#cSku').value, internal: $('#cInt').value, note: $('#cNote').value } };
+      if (kind === 'drivers') {
+        const outputs = Number($('#dOut').value) || 0;
+        return { ...base, board: {
+          mcu: $('#dMcu').value, release: $('#dRelease').value, eth: Number($('#dEth').value) || 0, outputs,
+          inputVolts: readVolts('din'),
+          maxA: $('#dMaxA').value === '' ? null : Number($('#dMaxA').value),
+          maxAPerOut: $('#dMaxAOut').value === '' ? null : Number($('#dMaxAOut').value),
+          fused: $('#dFused').checked, levelShifter: $('#dShift').checked, psuBuiltin: $('#dPsu').checked,
+          pins: [...document.querySelectorAll('#dPins tr')].map(tr => ({
+            gpio: tr.querySelector('[data-pin-gpio]').value === '' ? [] : [Number(tr.querySelector('[data-pin-gpio]').value)],
+            label: tr.querySelector('[data-pin-label]').value, level: tr.querySelector('[data-pin-level]').value })),
+        } };
+      }
+      return { ...base,
+        volt: Number($('#pVolt').value), basis: catBasis,
+        amps: $('#pAmps').value === '' ? null : Number($('#pAmps').value),
+        watts: $('#pWatts').value === '' ? null : Number($('#pWatts').value),
+        derate: Number($('#pDerate').value) / 100, adjustable: $('#pAdj').checked,
+        rails: [...document.querySelectorAll('#pRails tr')].map(tr => ({
+          id: tr.querySelector('[data-rail-id]').value,
+          amps: tr.querySelector('[data-rail-amps]').value === '' ? null : Number(tr.querySelector('[data-rail-amps]').value),
+          volt: tr.querySelector('[data-rail-volt]').value || null,
+          label: tr.querySelector('[data-rail-label]').value })) };
+    };
+
+    if (kind === 'drivers') {
+      // changer le nombre de sorties redessine le brochage, en gardant la saisie
+      $('#dOut').onchange = () => { libDraft = { ...blankDriver(), ...read() }; renderLib(); };
+    } else {
+      // Ampères et watts, chacun recalculant l'autre. `catBasis` retient lequel
+      // a été saisi : sans ça, changer la tension obligerait à deviner quelle
+      // grandeur l'utilisateur voulait conserver.
+      const volt = () => Number($('#pVolt').value) || 12;
+      const r1 = v => Math.round(v * 10) / 10;
+      $('#pAmps').oninput = () => { catBasis = 'amps'; $('#pWatts').value = $('#pAmps').value === '' ? '' : r1(Number($('#pAmps').value) * volt()); };
+      $('#pWatts').oninput = () => { catBasis = 'watts'; $('#pAmps').value = $('#pWatts').value === '' ? '' : r1(Number($('#pWatts').value) / volt()); };
+      $('#pVolt').onchange = () => {
+        if (catBasis === 'watts' && $('#pWatts').value !== '') $('#pAmps').value = r1(Number($('#pWatts').value) / volt());
+        else if ($('#pAmps').value !== '') $('#pWatts').value = r1(Number($('#pAmps').value) * volt());
+      };
+      $('#pAddRail').onclick = () => { $('#pRails').insertAdjacentHTML('beforeend', railRow()); wireCatEditor(kind, cur); };
+      document.querySelectorAll('[data-rail-del]').forEach(b => b.onclick = () => { b.closest('tr').remove(); });
+    }
+
+    save.onclick = async () => {
+      try {
+        const r = await post(`/api/${kind}/item`, read());
+        libDraft = null; libSel = r.item.uid;
+        toast(`« ${[r.item.ref.brand, r.item.ref.model].filter(Boolean).join(' ')} » enregistré, rev ${r.item.rev}`);
+        renderLib();
+      } catch (e) { toast(e.message, true); }
+    };
+    const del = $('#catDel');
+    if (del) del.onclick = async () => {
+      const n = ((catData.usage || {})[libSel] || []).length;
+      const quoi = kind === 'drivers' ? 'cette carte' : 'cette alimentation';
+      if (!await confirmBox(`Retirer ${quoi} ?${n ? `\n${n} node(s) la déclarent : elle sera marquée retirée, jamais effacée, pour que leurs marqueurs gardent un sens.` : '\nAucun node ne la déclare : elle peut disparaître pour de bon.'}`)) return;
+      try { await api(`/api/${kind}/item/${encodeURIComponent(libSel)}`, { method: 'DELETE' }); libSel = null; toast('fiche retirée'); renderLib(); }
+      catch (e) { toast(e.message, true); }
+    };
+  }
+  let catBasis = 'amps';
+
+  // ── Déduire les produits de ce qui est déjà branché ───────────────────────
+  // Saisir à la main une fiche par ruban quand la flotte les décrit déjà serait
+  // du travail pour rien — et une occasion de se tromper. On relève les
+  // combinaisons distinctes réellement présentes et on les propose ; rien n'est
+  // créé sans validation, et les longueurs deviennent des longueurs types.
+  async function guessProducts() {
+    let d; try { d = await api('/api/dmx-plan'); } catch (e) { return toast(e.message, true); }
+    const sig = new Map();
+    for (const n of d.nodes) {
+      // la config brute vient de la flotte, pas du plan : c'est elle qui porte
+      // le type, l'ordre et les mA — le plan n'en garde que ce qui sert au DMX
+      const rec = fleet.nodes.find(x => x.meta.ip === n.ip);
+      const ins = (rec && rec.cfg && rec.cfg.hw && rec.cfg.hw.led && rec.cfg.hw.led.ins) || [];
+      (n.plan.outputs || []).forEach((o, i) => {
+        const r = ins[i]; if (!r || o.ignored) return;
+        // une sortie d'un pixel est une sortie désactivée, pas un produit
+        if (!(o.len > 1)) return;
+        const key = [r.type, (r.order || 0) & 0x0f, (r.order || 0) >> 4, r.ledma ?? 55].join('|');
+        if (!sig.has(key)) sig.set(key, { type: r.type, order: (r.order || 0) & 0x0f, wswap: (r.order || 0) >> 4, ledma: r.ledma ?? 55, lens: new Set(), nodes: new Set() });
+        const e = sig.get(key); e.lens.add(o.len); e.nodes.add(n.name || n.ip);
+      });
+    }
+    // ce qui correspond déjà à une fiche existante n'a pas à être reproposé
+    const connus = new Set((libData ? libData.products : []).map(p => `${p.led.type}|${p.led.order}|${p.led.wswap}|${p.led.ledma}`));
+    const neufs = [...sig.values()].filter(x => !connus.has(`${x.type}|${x.order}|${x.wswap}|${x.ledma}`));
+    if (!neufs.length) return toast('rien de nouveau : toutes les combinaisons branchées ont déjà une fiche');
+
+    const lignes = neufs.map((x, i) => `<label class="chip" style="display:flex;gap:8px;align-items:flex-start;margin:4px 0">
+      <input type="checkbox" data-guess="${i}" checked>
+      <span><b>${esc(LED_TYPES[x.type] || x.type)}</b> · ordre ${esc(COLOR_ORDERS[x.order] || x.order)}${x.wswap ? ` · blanc ${esc(WHITE_SWAPS[x.wswap] || x.wswap)}` : ''} · ${x.ledma} mA/pixel
+      <br><span class="muted">longueurs : ${[...x.lens].sort((a, b) => a - b).join(', ')} px — ${[...x.nodes].slice(0, 3).join(', ')}${x.nodes.size > 3 ? '…' : ''}</span>
+      <br><input data-guessname="${i}" value="${esc([...x.nodes][0].replace(/[_ ].*$/, ''))}" placeholder="nom du produit" style="width:200px;margin-top:3px"></span></label>`).join('');
+    const box = document.createElement('div'); box.className = 'pop'; box.style.cssText = 'left:50%;top:12%;transform:translateX(-50%);max-width:560px;max-height:70vh;overflow:auto';
+    box.innerHTML = `<div class="pop-head">${neufs.length} combinaison(s) branchée(s) sans fiche</div>
+      <div class="pop-body">Chacune correspond à un ruban réellement présent sur la flotte. Les longueurs deviennent des longueurs types ; la tension et les watts restent à renseigner, ils ne sont nulle part dans la configuration des nodes.</div>
+      <div style="padding:0 10px">${lignes}</div>
+      <div class="pop-actions"><button class="pop-cancel">Annuler</button><button class="pop-act green">Créer</button></div>`;
+    document.body.appendChild(box);
+    const done = () => box.remove();
+    box.querySelector('.pop-cancel').onclick = done;
+    box.querySelector('.pop-act').onclick = async () => {
+      const choisis = neufs.filter((_, i) => box.querySelector(`[data-guess="${i}"]`).checked);
+      let n = 0;
+      for (const [i, x] of neufs.entries()) {
+        if (!box.querySelector(`[data-guess="${i}"]`).checked) continue;
+        const nom = box.querySelector(`[data-guessname="${i}"]`).value.trim() || `Ruban ${x.ledma} mA`;
+        try {
+          await post('/api/library/product', { ref: { brand: '', model: nom },
+            led: { type: x.type, order: x.order, wswap: x.wswap, ledma: x.ledma },
+            presets: [...x.lens].sort((a, b) => a - b).map(px => ({ px })) });
+          n++;
+        } catch (e) { toast(`${nom} : ${e.message}`, true); }
+      }
+      done();
+      toast(`${n} fiche(s) créée(s) sur ${choisis.length}`);
+      await loadLedProfiles(); renderLib();
+    };
+  }
+
 
   // ── Connexion GitHub, en une fois ─────────────────────────────────────────
   // GitHub rend un code court à taper sur son site ; on interroge ensuite
@@ -2015,8 +2479,8 @@
       </div>
       <div style="margin-top:8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
         <button id="ghPull" class="rowbtn"${r.repo ? '' : ' disabled'} title="tire le dépôt. Jamais destructif : un produit modifié ici et pas encore publié n'est pas écrasé.">↓ Rafraîchir</button>
-        <button id="ghPush" class="rowbtn"${r.repo && connecte && r.pending ? '' : ' disabled'} title="publie les produits modifiés ici. Sur collision, la version en ligne devient la base et la nôtre repart au-dessus : rien n'est jamais écrasé.">↑ Publier${r.pending ? ` (${r.pending})` : ''}</button>
-        <span class="muted" style="font-size:12px">${r.pending ? `${r.pending} produit(s) pas encore publié(s)` : 'tout est publié'}</span>
+        <button id="ghPush" class="rowbtn"${r.repo && connecte && r.pending ? '' : ' disabled'} title="publie les fiches modifiées ici — produits, drivers et alimentations. Sur collision, la version en ligne devient la base et la nôtre repart au-dessus : rien n'est jamais écrasé.">↑ Publier${r.pending ? ` (${r.pending})` : ''}</button>
+        <span class="muted" style="font-size:12px">${r.pending ? `${r.pending} fiche(s) pas encore publiée(s)` : 'tout est publié'}</span>
         <span class="spacer"></span>
         <details class="ghadv"><summary class="muted">autre méthode de connexion</summary>
           <div class="setrow" style="margin-top:6px">
@@ -2057,7 +2521,7 @@
       } catch (e) { toast(e.message, true); }
     };
     $('#ghPush').onclick = async () => {
-      if (!await confirmBox(`Publier ${r.pending} produit(s) vers ${r.repo} ?\nRien ne sera écrasé : un produit modifié en ligne entre-temps devient la base, et la version d'ici repart au-dessus.`)) return;
+      if (!await confirmBox(`Publier ${r.pending} fiche(s) vers ${r.repo} ?\nProduits, drivers et alimentations confondus. Rien ne sera écrasé : une fiche modifiée en ligne entre-temps devient la base, et la version d'ici repart au-dessus.`)) return;
       try {
         const x = await post('/api/library/publish', {});
         const reb = x.done.filter(y => y.action === 'rebase');
@@ -2439,7 +2903,7 @@
     const pass = enc ? prompt('Ce showfile est chiffré. Phrase secrète :') : '';
     if (enc && pass === null) return;
     const what = { settings: $('#sfW_settings').checked, antennas: $('#sfW_antennas').checked, nodes: $('#sfW_nodes').checked, snapshots: $('#sfW_snapshots').checked, firmware: $('#sfW_firmware').checked };
-    if (!await confirmBox(`Importer le showfile${doc.exportedAt ? ' du ' + new Date(doc.exportedAt).toLocaleString() : ''} ?\n\nRemplace : ${Object.entries(what).filter(([, v]) => v).map(([k]) => ({ settings: 'réglages', antennas: 'antennes + mots de passe', nodes: 'liste des nodes', snapshots: 'sauvegardes', firmware: 'catalogue firmware' })[k]).join(', ')}${what.settings ? '\n\nLe serveur redémarrera pour appliquer les réglages.' : ''}`)) return;
+    if (!await confirmBox(`Importer le showfile${doc.exportedAt ? ' du ' + new Date(doc.exportedAt).toLocaleString() : ''} ?\n\nRemplace : ${Object.entries(what).filter(([, v]) => v).map(([k]) => ({ settings: 'réglages', antennas: 'antennes + mots de passe', nodes: 'nodes, groupes, bibliothèques et plan d'alimentation', snapshots: 'sauvegardes', firmware: 'catalogue firmware' })[k]).join(', ')}${what.settings ? '\n\nLe serveur redémarrera pour appliquer les réglages.' : ''}`)) return;
     try {
       const r = await post('/api/showfile/import', { file: doc, passphrase: pass || undefined, what });
       if (r.layout && $('#sfW_layout').checked) { try { if (r.layout.colOrder) localStorage.setItem('wf.colOrder', JSON.stringify(r.layout.colOrder)); if (r.layout.colWidths) localStorage.setItem('wf.colWidths', JSON.stringify(r.layout.colWidths)); if (r.layout.hiddenGroups) localStorage.setItem('wf.hiddenGroups', JSON.stringify(r.layout.hiddenGroups)); } catch { /* ignore */ } }
@@ -2448,7 +2912,7 @@
     } catch (e) { toast(e.message, true); }
   }
   function showfileHtml() {
-    return `<div class="subbox" style="margin-bottom:10px"><h2 style="margin-top:0">Showfile <span class="muted" style="text-transform:none;letter-spacing:0" title="un seul fichier .wledfleet avec tout : réglages, antennes et leurs mots de passe, nodes et groupes, sauvegardes de configs, catalogue firmware, disposition des colonnes">tout le show dans un fichier ⓘ</span></h2>
+    return `<div class="subbox" style="margin-bottom:10px"><h2 style="margin-top:0">Showfile <span class="muted" style="text-transform:none;letter-spacing:0" title="un seul fichier .wledfleet avec tout : réglages, antennes et leurs mots de passe, nodes et groupes, les trois bibliothèques, le plan d'alimentation, sauvegardes de configs, catalogue firmware, disposition des colonnes">tout le show dans un fichier ⓘ</span></h2>
       <div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center">
         <input type="password" id="sfPass" placeholder="phrase secrète (option)" style="width:190px" title="si renseignée, le fichier est chiffré (AES-256) : à conserver, sans elle le fichier est illisible. Vide = fichier en clair, mots de passe lisibles.">
         <label class="chip" title="ajoute le journal des modifications et l'historique des scans radio (plus gros, utile pour un rapport)"><input type="checkbox" id="sfJournal"> avec le journal</label>
@@ -2458,7 +2922,7 @@
         <span class="muted">remplacer :</span>
         <label class="chip"><input type="checkbox" id="sfW_settings" checked> réglages</label>
         <label class="chip"><input type="checkbox" id="sfW_antennas" checked> antennes</label>
-        <label class="chip"><input type="checkbox" id="sfW_nodes" checked> nodes</label>
+        <label class="chip"><input type="checkbox" id="sfW_nodes" checked title="la liste des nodes, leurs groupes, les trois bibliothèques (produits, drivers, alimentations) et le plan d'alimentation — les fiches gardent leurs identifiants, les marqueurs posés sur les nodes continuent donc de désigner la bonne chose"> nodes et bibliothèques</label>
         <label class="chip"><input type="checkbox" id="sfW_snapshots" checked> sauvegardes</label>
         <label class="chip"><input type="checkbox" id="sfW_firmware" checked> catalogue firmware</label>
         <label class="chip"><input type="checkbox" id="sfW_layout" checked> colonnes</label>
@@ -2553,8 +3017,12 @@
       const [a, wz] = await Promise.all([api('/api/ap'), api('/api/wizard').catch(() => null)]);
       apData = a; if (wz) wizData = wz;
       const n = apData.ok ? apData.clients.length : 0;
-      $('#btnAp').innerHTML = `Antenne${n ? ` <span class="n">${n}</span>` : ''}${wizData && wizData.state === 'connected' ? ' <span class="n" style="background:var(--accent)" title="WiFiman Wizard connecté">W</span>' : ''}`;
-      $('#btnAp').style.color = apData.configured && !apData.ok ? 'var(--bad)' : '';
+      // Une antenne configurée mais injoignable se signalait en teintant le
+      // bouton en rouge. Le bouton est maintenant généré et n'existe pas quand
+      // on est dans une autre famille : l'écriture directe levait, et le catch
+      // ci-dessous avalait l'erreur — le panneau ne se rendait plus du tout.
+      // L'état passe donc par la pastille, comme le reste.
+      setBadge('ap', `${apData.configured && !apData.ok ? ' <span class="n" style="background:var(--bad)" title="antenne configurée mais injoignable">!</span>' : ''}${n ? ` <span class="n">${n}</span>` : ''}${wizData && wizData.state === 'connected' ? ' <span class="n" style="background:var(--accent)" title="WiFiman Wizard connecté">W</span>' : ''}`);
       if (isOpen('ap')) renderAp();
     } catch { /* server away */ }
   }
@@ -2919,7 +3387,7 @@
     try {
       fwData = await api('/api/firmware' + ($('#fwAll').checked ? '?all=1' : ''));
       const avail = fwData.nodes.filter(n => n.fw && n.fw.available).length;
-      $('#btnFw').innerHTML = `Mises à jour${avail ? ` <span class="n">${avail}</span>` : ''}`;
+      setBadge('fw', avail ? ` <span class="n">${avail}</span>` : '');
       if (isOpen('fw')) renderFw();
     } catch { /* server away */ }
   }
@@ -3153,28 +3621,106 @@
     setInterval(refresh, 2000); setInterval(pollChanges, 2000); setInterval(pollFw, 2000); setInterval(pollAp, 3000); setInterval(pollLib, 3000);
   })();
   // ── tabs: one pane at a time, full height; ⧉ opens the current tab in its own window ──
+  // ── Les onglets, en deux niveaux ──────────────────────────────────────────
+  // Onze onglets sur une ligne, ça ne se lit plus. Ils sont donc rangés par
+  // FAMILLE : ce qu'on regarde (Flotte), ce qu'on conçoit (Show), ce qu'on
+  // branche (Matériel), ce qui les relie (Réseau).
+  //
+  // Le libellé et l'infobulle vivent ici et non dans index.html : avant, l'ordre
+  // venait du HTML, le libellé aussi, et l'enregistrement d'ici — trois endroits
+  // à tenir cohérents pour un seul onglet. La barre du second niveau est
+  // maintenant DÉRIVÉE de cette table, il n'y a plus qu'une source.
   const TABS = {
-    grid:     { btn: '#btnGrid',     pane: '#tabgrid',   show: () => {} },
-    journal:  { btn: '#btnJournal',  pane: '#journal',   show: () => { unseen = 0; renderJournal(); } },
-    ap:       { btn: '#btnAp',       pane: '#appanel',   show: () => { apLastKey = ''; pollAp(); } },
-    fw:       { btn: '#btnFw',       pane: '#fwpanel',   show: () => { pollFw(); } },
-    dmx:      { btn: '#btnDmx',      pane: '#dmxpanel',  show: () => { renderDmx(); } },
-    lib:      { btn: '#btnLib',      pane: '#libpanel',  show: () => { renderLib(); } },
-    opt:      { btn: '#btnOpt',      pane: '#optpanel',  show: () => { renderOpt(); } },
-    pair:     { btn: '#btnPair',     pane: '#pairpanel', show: () => { renderPair(); if (!pairNets) scanPair(); pollPair(); if (pairRadar) setRadar(true); } },
-    snap:     { btn: '#btnSnap',     pane: '#snappanel', show: () => { pollSnap(); } },
-    settings: { btn: '#btnSettings', pane: '#setpanel',  show: () => { renderSettings(); } },
+    grid: { pane: '#tabgrid', label: "Grille",
+      title: "la grille des nodes : une ligne par node, une colonne par réglage",
+      show: () => {} },
+    journal: { pane: '#journal', label: "Journal",
+      title: "journal des modifications : chaque relevé est comparé au précédent ; toute différence est consignée avec avant / après et sa source (grille = envoyée d'ici, externe = interface WLED ou autre logiciel, statut = node apparu / disparu, maj = mise à jour firmware). Une modif externe déclenche une alerte et un liseré orange sur la cellule pendant 10 min.",
+      show: () => { unseen = 0; renderJournal(); } },
+    ap: { pane: '#appanel', label: "Antenne",
+      title: "antenne Wi‑Fi (MikroTik RouterOS, lecture seule) : radios, canaux, puissance, clients connectés et ce que l'antenne voit de chaque node. Le badge = nombre de clients Wi‑Fi associés.",
+      show: () => { apLastKey = ''; pollAp(); } },
+    opt: { pane: '#optpanel', label: "Optimisation",
+      title: "préréglages d'optimisation de la liaison radio : côté antenne (plage de canaux, fast roaming, options facultatives) et côté nodes (veille Wi‑Fi, puissance TX, paquets hors séquence), avec l'état réel et les actions",
+      show: () => { renderOpt(); } },
+    dmx: { pane: '#dmxpanel', label: "Sorties / DMX",
+      title: "sorties LED de chaque node (pin, type, ordre, départ, longueur, sens) et leur adresse console univers.canal calculée en direct ; contenu de chaque univers ; conflits d'univers entre nodes. Dans WLED l'univers d'une sortie n'est pas un réglage : il découle du point de départ du node et de la longueur des sorties précédentes. Le badge = nombre de sorties dont le profil (type/ordre/pixels) n'est pas encore dans la bibliothèque locale de profils LED.",
+      show: () => { renderDmx(); } },
+    graph: { pane: '#graphpanel', label: 'Schéma',
+      title: "le plateau vu en schéma : quelle alimentation nourrit quel node, et quelle sortie part de quel node. Les câbles prennent la couleur du pire constat qui les concerne — le schéma EST le rapport de cohérence. Tirer un câble depuis le port d'une alimentation rattache un node ; glisser une boîte la déplace, double-clic sur le fond pour tout revoir.",
+      show: () => { renderGraph(); } },
+    power: { pane: '#powerpanel', label: "Puissance",
+      title: "la chaîne électrique : quelle alimentation nourrit quel node, ce que chacun a le droit de tirer, et si ça tient. Répond à « d'où vient le courant » — Sorties / DMX répond à « où sont les pixels ». Le badge = nombre d'anomalies.",
+      show: () => { renderPower(); } },
+    lib: { pane: '#libpanel', label: "Bibliothèque",
+      title: "catalogue des produits LED de la gamme : pour chaque produit, tous ses réglages de sortie (type, ordre des couleurs, échange du blanc, mA/LED, skip, off refresh, LEDs par mètre) et ses longueurs types. Choisir un produit sur une sortie remplit tous ces champs d'un coup. Le badge = produits jamais publiés dans la bibliothèque partagée.",
+      show: () => { renderLib(); } },
+    fw: { pane: '#fwpanel', label: "Mises à jour",
+      title: "dépôt de firmwares hors-ligne (catalogue GitHub mémorisé + .bin téléchargés localement) et mise à jour OTA des nodes depuis ce dépôt. Le badge = nombre de nodes qui ont une version plus récente disponible.",
+      show: () => { pollFw(); } },
+    pair: { pane: '#pairpanel', label: "Appairage",
+      title: "appairage de nouveaux nodes : le PC se connecte à l'AP du node (WLED-AP, ou réseau ouvert), lui envoie le SSID / mot de passe du show, un nom et une IP fixe, puis revient sur son Wi‑Fi. Le node rejoint la flotte tout seul.",
+      show: () => { renderPair(); if (!pairNets) scanPair(); pollPair(); if (pairRadar) setRadar(true); } },
+    snap: { pane: '#snappanel', label: "Sauvegardes",
+      title: "sauvegardes de la configuration de toute la flotte (cfg.json + presets.json de chaque node), stockées hors ligne sur ce PC : exporter en fichier, importer, comparer avec l'état actuel, restaurer vers les nodes",
+      show: () => { pollSnap(); } },
+    settings: { pane: '#setpanel', label: "⚙ Réglages",
+      title: "réglages de l'application : sous-réseau de la flotte, accès local ou réseau, intervalles, lecture seule, parallélisme OTA. Enregistré dans settings.json, le serveur redémarre.",
+      show: () => { renderSettings(); } },
   };
+  const FAMILIES = [
+    { id: 'fleet', label: 'Flotte', tabs: ['grid', 'journal', 'snap'] },
+    { id: 'show', label: 'Show', tabs: ['dmx', 'power', 'graph'] },
+    { id: 'hw', label: 'Matériel', tabs: ['lib', 'fw', 'pair'] },
+    { id: 'net', label: 'Réseau', tabs: ['ap', 'opt'] },
+    { id: 'cfg', label: '⚙', tabs: ['settings'] },
+  ];
+  const famOf = k => FAMILIES.find(f => f.tabs.includes(k)) || FAMILIES[0];
+
+  // Les pastilles passent par un registre plutôt que d'écrire dans un bouton :
+  // le bouton d'un onglet d'une autre famille n'existe pas dans le DOM, et
+  // l'ancienne écriture directe aurait simplement perdu le compte.
+  const badges = {};
+  function setBadge(tab, html) { badges[tab] = html || ''; renderTabBar(); }
+
+  function renderTabBar() {
+    const fam = famOf(currentTab);
+    // niveau 1 : une pastille de famille = la somme de ce que ses onglets
+    // signalent, pour qu'un problème dans une famille qu'on ne regarde pas se
+    // voie quand même
+    for (const f of FAMILIES) {
+      const b = document.querySelector(`[data-fam="${f.id}"]`); if (!b) continue;
+      const n = f.tabs.reduce((a, k) => a + (Number((badges[k] || '').replace(/<[^>]*>/g, '').trim()) || 0), 0);
+      b.innerHTML = `${esc(f.label)}${n && f.id !== fam.id ? ` <span class="n">${n}</span>` : ''}`;
+      b.classList.toggle('active', f.id === fam.id);
+    }
+    const bar = $('#tabs2'); if (!bar) return;
+    bar.innerHTML = fam.tabs.map(k => `<button data-tab="${k}" class="${k === currentTab ? 'active' : ''}" title="${esc(TABS[k].title)}">${esc(TABS[k].label)}${badges[k] || ''}</button>`).join('');
+    bar.querySelectorAll('[data-tab]').forEach(b => b.onclick = () => showTab(b.dataset.tab));
+  }
+
   function showTab(name) {
     if (!TABS[name]) name = 'grid';
     if (currentTab === 'dmx' && name !== 'dmx') stopLocating();
     currentTab = name;
-    for (const [k, t] of Object.entries(TABS)) { $(t.pane).classList.toggle('open', k === name); $(t.btn).classList.toggle('active', k === name); }
+    for (const [k, t] of Object.entries(TABS)) $(t.pane).classList.toggle('open', k === name);
+    renderTabBar();
     TABS[name].show();
-    try { localStorage.setItem('wf.tab', name); } catch { /* ignore */ }
+    // Deux mémoires : le dernier onglet vu, et le dernier onglet vu DANS CHAQUE
+    // famille. Sans la seconde, revenir sur une famille rouvrirait toujours son
+    // premier onglet et il faudrait recliquer à chaque aller-retour.
+    try {
+      localStorage.setItem('wf.tab', name);
+      localStorage.setItem(`wf.tab.${famOf(name).id}`, name);
+    } catch { /* ignore */ }
     if (location.hash !== '#tab=' + name) history.replaceState(null, '', location.pathname + location.search + '#tab=' + name);
   }
-  for (const [k, t] of Object.entries(TABS)) $(t.btn).onclick = () => showTab(k);
+  // Cliquer une famille rouvre ce qu'on y regardait.
+  document.querySelectorAll('[data-fam]').forEach(b => b.onclick = () => {
+    const f = FAMILIES.find(x => x.id === b.dataset.fam);
+    let last = null; try { last = localStorage.getItem(`wf.tab.${f.id}`); } catch { /* ignore */ }
+    showTab(f.tabs.includes(last) ? last : f.tabs[0]);
+  });
   // external links: the native window's WebView cannot spawn windows, the server opens the system browser
   const openExternal = async url => { try { await post('/api/open', { url }); } catch { try { window.open(url, '_blank'); } catch { /* nothing */ } } };
   $('#tabDetach').onclick = () => openExternal(location.origin + location.pathname + '?solo=1#tab=' + currentTab);

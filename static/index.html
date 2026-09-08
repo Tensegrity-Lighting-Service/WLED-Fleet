@@ -20,21 +20,20 @@
     <button data-theme="dark" title="sombre">🌙</button>
   </span>
 </header>
+<!-- Deux niveaux : les familles ne bougent jamais, la seconde barre est
+     GÉNÉRÉE depuis TABS (app.js). Avant, l'ordre venait d'ici, le libellé aussi
+     et l'enregistrement d'app.js : trois endroits à tenir cohérents. -->
 <nav class="tabs" id="tabs">
-  <button id="btnGrid" class="active" title="la grille des nodes : une ligne par node, une colonne par réglage">Grille</button>
-  <button id="btnJournal" title="journal des modifications : chaque relevé est comparé au précédent ; toute différence est consignée avec avant / après et sa source (grille = envoyée d'ici, externe = interface WLED ou autre logiciel, statut = node apparu / disparu, maj = mise à jour firmware). Une modif externe déclenche une alerte et un liseré orange sur la cellule pendant 10 min.">Journal</button>
-  <button id="btnAp" title="antenne Wi‑Fi (MikroTik RouterOS, lecture seule) : radios, canaux, puissance, clients connectés et ce que l'antenne voit de chaque node. Le badge = nombre de clients Wi‑Fi associés.">Antenne</button>
-  <button id="btnOpt" title="préréglages d'optimisation de la liaison radio : côté antenne (plage de canaux, fast roaming, options facultatives) et côté nodes (veille Wi‑Fi, puissance TX, paquets hors séquence), avec l'état réel et les actions">Optimisation</button>
-  <button id="btnDmx" title="sorties LED de chaque node (pin, type, ordre, départ, longueur, sens) et leur adresse console univers.canal calculée en direct ; contenu de chaque univers ; conflits d'univers entre nodes. Dans WLED l'univers d'une sortie n'est pas un réglage : il découle du point de départ du node et de la longueur des sorties précédentes. Le badge = nombre de sorties dont le profil (type/ordre/pixels) n'est pas encore dans la bibliothèque locale de profils LED.">Sorties / DMX</button>
-  <button id="btnLib" title="catalogue des produits LED de la gamme : pour chaque produit, tous ses réglages de sortie (type, ordre des couleurs, échange du blanc, mA/LED, skip, off refresh, LEDs par mètre) et ses longueurs types. Choisir un produit sur une sortie remplit tous ces champs d'un coup. Le badge = produits jamais publiés dans la bibliothèque partagée.">Bibliothèque</button>
-  <button id="btnFw" title="dépôt de firmwares hors-ligne (catalogue GitHub mémorisé + .bin téléchargés localement) et mise à jour OTA des nodes depuis ce dépôt. Le badge = nombre de nodes qui ont une version plus récente disponible.">Mises à jour</button>
-  <button id="btnPair" title="appairage de nouveaux nodes : le PC se connecte à l'AP du node (WLED-AP, ou réseau ouvert), lui envoie le SSID / mot de passe du show, un nom et une IP fixe, puis revient sur son Wi‑Fi. Le node rejoint la flotte tout seul.">Appairage</button>
-  <button id="btnSnap" title="sauvegardes de la configuration de toute la flotte (cfg.json + presets.json de chaque node), stockées hors ligne sur ce PC : exporter en fichier, importer, comparer avec l'état actuel, restaurer vers les nodes">Sauvegardes</button>
-  <button id="btnSettings" title="réglages de l'application : sous-réseau de la flotte, accès local ou réseau, intervalles, lecture seule, parallélisme OTA. Enregistré dans settings.json, le serveur redémarre.">⚙ Réglages</button>
+  <button data-fam="fleet" title="ce qu'on regarde : l'état de la flotte, ce qui a changé, et les sauvegardes">Flotte</button>
+  <button data-fam="show" title="ce qu'on conçoit : l'adressage DMX des sorties, et la chaîne électrique qui les alimente">Show</button>
+  <button data-fam="hw" title="ce qu'on branche : les catalogues de matériel, les firmwares, et la mise en réseau d'un node neuf">Matériel</button>
+  <button data-fam="net" title="ce qui relie tout : l'antenne Wi-Fi et les réglages qui rendent la liaison stable">Réseau</button>
+  <button data-fam="cfg" title="les réglages de l'application elle-même">⚙</button>
   <span class="spacer"></span>
-  <button id="tabDetach" title="ouvrir l'onglet courant seul dans une fenêtre du navigateur (pour l'avoir sur un second écran)">⧉ fenêtre</button>
-  <button id="btnBrowser" title="ouvrir toute l'interface dans le navigateur par défaut de Windows (Chrome, Edge…), par exemple pour l'imprimer, la mettre sur un autre écran ou l'utiliser hors de la fenêtre native">⧉ navigateur</button>
+  <button id="tabDetach" title="ouvrir l'onglet courant dans sa propre fenêtre, sans la barre d'onglets — pratique sur un second écran pendant un montage">⧉ fenêtre</button>
+  <button id="btnBrowser" title="ouvrir cette page dans le navigateur du système : utile pour l'imprimer, la partager, ou garder plusieurs vues ouvertes">⧉ navigateur</button>
 </nav>
+<nav class="tabs tabs2" id="tabs2"></nav>
 <div id="tabgrid" class="tabpane open">
 <div class="toolbar">
   <button id="btnScan" class="primary" title="balaye le(s) sous-réseau(x) en HTTP (/json/info) puis interroge chaque node trouvé sur les autres nodes qu'il connaît. ~6 s par /24. Les nodes déjà connus restent affichés.">Rescanner le réseau</button>
@@ -63,6 +62,8 @@
 <div id="optpanel" class="tabpane"></div>
 <div id="dmxpanel" class="tabpane"></div>
 <div id="libpanel" class="tabpane"></div>
+<div id="powerpanel" class="tabpane"></div>
+<div id="graphpanel" class="tabpane"></div>
 <div id="setpanel" class="tabpane"></div>
 <div id="pairpanel" class="tabpane"></div>
 <div id="snappanel" class="tabpane"></div>
@@ -107,6 +108,7 @@
 </footer>
 <div id="toast"></div>
 
+<script src="graph.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

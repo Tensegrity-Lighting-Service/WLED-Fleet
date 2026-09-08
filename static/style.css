@@ -100,7 +100,11 @@
   .tabs button:hover{color:var(--txt);border-color:var(--line)}
   .tabs button.active{background:var(--bg);color:var(--txt);border-color:var(--line);margin-bottom:-1px;border-bottom:1px solid var(--bg)}
   .tabs #tabDetach{border:1px solid var(--line2);border-radius:7px;padding:4px 10px;font-weight:500;margin-bottom:6px}
-  body.solo .tabs{display:none}
+  body.solo .tabs, body.solo .tabs2{display:none}
+  /* second niveau : plus discret, pour qu on voie tout de suite la hiérarchie */
+  .tabs2{padding-top:0;padding-bottom:4px;border-bottom:1px solid var(--line);gap:2px}
+  .tabs2 button{font-size:12px;padding:4px 10px;opacity:.85}
+  .tabs2 button.active{opacity:1}
   #fwpanel h2,#appanel h2,#snappanel h2,#pairpanel h2,#setpanel h2{font-size:12px;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);margin:8px 0 6px;display:flex;align-items:center;gap:10px}
   #fwpanel table,#appanel table,#snappanel table,#pairpanel table,#setpanel table{font-size:12px;width:100%} #fwpanel th,#appanel th,#snappanel th,#pairpanel th,#setpanel th{position:static;background:var(--panel2)} #fwpanel td,#appanel td,#snappanel td,#pairpanel td,#setpanel td{padding:3px 8px;background:transparent}
   .setrow{display:grid;grid-template-columns:190px 1fr;gap:6px 14px;align-items:center;max-width:900px}
@@ -147,6 +151,22 @@
   .ghdevice{margin-top:8px;padding:10px 12px;border:1px solid var(--line2);border-radius:8px;max-width:460px;text-align:center;font-size:12px}
   .ghcode{font-family:ui-monospace,Consolas,monospace;font-size:26px;letter-spacing:.18em;font-weight:650;margin:8px 0;cursor:pointer;user-select:all}
   .ghadv summary{cursor:pointer;font-size:12px} .ghadv{max-width:900px}
+  /* sous-onglets des trois catalogues : plus discrets que la barre principale,
+     pour qu'on voie tout de suite qu'on est au deuxième niveau */
+  .subtabs{display:flex;gap:4px;margin-bottom:10px;border-bottom:1px solid var(--line)}
+  .subtabs button{padding:5px 12px;border:0;background:none;color:var(--muted);border-bottom:2px solid transparent;border-radius:0;font:inherit;cursor:pointer}
+  .subtabs button:hover{color:var(--txt)}
+  .subtabs button.active{color:var(--txt);border-bottom-color:var(--accent);font-weight:600}
+  .volts{display:inline-flex;gap:5px;flex-wrap:wrap}
+  /* Puissance : la barre de charge porte l'essentiel, le repère marque la
+     limite conseillée — au-delà l'alimentation chauffe bien avant de couper */
+  .pwbar{position:relative;height:8px;background:var(--line);border-radius:4px;margin:6px 10px 8px;overflow:visible}
+  .pwbar i{display:block;height:100%;border-radius:4px;background:var(--accent)}
+  .pwbar i.st-warn{background:var(--warn)} .pwbar i.st-bad{background:var(--bad)}
+  .pwbar b{position:absolute;top:-3px;width:2px;height:14px;background:var(--line2)}
+  .pwchecks{padding:0 10px 8px;font-size:12px;line-height:1.6}
+  .pwtotals{display:flex;gap:22px;flex-wrap:wrap;margin-bottom:12px;max-width:900px}
+  .pwtotals .k{color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.04em;display:block}
   .libnode{border:1px solid var(--line);border-radius:8px;padding:8px 10px;margin-bottom:8px;max-width:900px;font-size:12px}
   .libnodeitem{display:flex;align-items:center;gap:8px;margin-top:5px}
   .libnodeitem>span{flex:1}
@@ -232,3 +252,28 @@
   kbd{font:inherit;font-size:11px;background:var(--chip);border:1px solid var(--line2);border-radius:4px;padding:0 4px}
   #toast{position:fixed;bottom:44px;left:50%;transform:translateX(-50%);background:var(--panel);border:1px solid var(--line2);border-radius:10px;padding:8px 14px;box-shadow:0 8px 30px rgba(0,0,0,.35);display:none;z-index:10;max-width:80vw}
   #toast.bad{border-color:var(--bad);color:var(--bad)}
+
+  /* ── Le schéma du plateau ─────────────────────────────────────────────────
+     Tout suit les variables de thème : le SVG bascule clair/sombre comme le
+     reste, sans une ligne de plus. */
+  .gwrap{position:absolute;inset:0;top:44px;overflow:hidden}
+  #graphpanel{position:relative}
+  #graphpanel h2{position:relative;z-index:2}
+  .gsvg{width:100%;height:100%;display:block;cursor:grab;touch-action:none}
+  .gsvg.dragging{cursor:grabbing}
+  .gbox rect{fill:var(--panel);stroke:var(--line2);stroke-width:1;vector-effect:non-scaling-stroke}
+  .gbox.psu rect{fill:var(--panel2)}
+  .gbox.out rect{fill:var(--bg)}
+  .gbox.warn rect{stroke:var(--warn)} .gbox.bad rect{stroke:var(--bad);stroke-width:2}
+  .gbox.orphan rect{stroke-dasharray:4 3}
+  .gbox{cursor:move}
+  .gt1{fill:var(--txt);font:600 12px/1 -apple-system,"Segoe UI",sans-serif}
+  .gt2{fill:var(--muted);font:11px/1 -apple-system,"Segoe UI",sans-serif}
+  .gbadge{fill:var(--muted);font:600 11px/1 ui-monospace,Consolas,monospace}
+  .gcaret{fill:var(--muted);font:11px/1 sans-serif;cursor:pointer}
+  .gcaret:hover{fill:var(--txt)}
+  .gport{fill:var(--info);stroke:var(--panel);stroke-width:2;cursor:crosshair}
+  .gport:hover{r:7}
+  .gedge{fill:none;stroke:var(--line2);stroke-width:1.5;vector-effect:non-scaling-stroke}
+  .gedge.warn{stroke:var(--warn)} .gedge.bad{stroke:var(--bad);stroke-width:2.5}
+  .gghost{fill:none;stroke:var(--info);stroke-width:2;stroke-dasharray:5 4;vector-effect:non-scaling-stroke}

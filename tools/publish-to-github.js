@@ -21,7 +21,7 @@ const { execFileSync } = require('child_process');
 
 const ROOT = path.join(__dirname, '..'); // wled-fleet/
 const REPO_URL = 'https://github.com/Tensegrity-Lighting-Service/WLED-Fleet.git';
-const EXTRA_EXCLUDE = new Set(['settings.json', 'led-profiles.json', 'github.json', 'github-dev.json']);
+const EXTRA_EXCLUDE = new Set(['settings.json', 'led-profiles.json', 'drivers.json', 'psus.json', 'power-plan.json', 'github.json', 'github-dev.json']);
 
 const args = process.argv.slice(2);
 const dryRun = args.includes('--dry-run');

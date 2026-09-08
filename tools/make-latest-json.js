@@ -9,6 +9,13 @@
 // s'installe (par utilisateur, sans admin) et garde ses données dans
 // « Documents\WLED Fleet ».
 //
+// `--tag <nom>` pour une beta : elle vit sur une préversion à tag FIXE (`beta`,
+// voir CLAUDE.md § 6 bis) dont on remplace les fichiers à chaque build, et non
+// sur un tag v<version>. Sans ce drapeau, le manifeste beta désignerait
+// `releases/download/v0.11.0/…` — un tag qui n'existe pas — et l'application
+// installée sur le canal beta téléchargerait un 404 en annonçant une mise à
+// jour disponible. C'est le seul endroit où le nom du tag est écrit.
+//
 // If release/latest.json already exists for the SAME version (e.g. a
 // windows-x86_64 entry written earlier, and now a darwin-* entry added from a
 // Mac build), its other platform entries are kept — a later run never drops
@@ -31,6 +38,8 @@ const plat = PLATFORMS[process.platform];
 if (!plat) { console.error(`plateforme non supportée pour la release : ${process.platform}`); process.exit(1); }
 
 const { version } = JSON.parse(fs.readFileSync(path.join(ROOT, 'desktop', 'tauri.conf.json'), 'utf8'));
+const tagFlag = process.argv.indexOf('--tag');
+const TAG = tagFlag !== -1 && process.argv[tagFlag + 1] ? process.argv[tagFlag + 1] : `v${version}`;
 const assetName = plat.name(version);
 const assetPath = path.join(RELEASE_DIR, assetName);
 const sigPath = assetPath + '.sig';
@@ -40,15 +49,19 @@ if (!fs.existsSync(sigPath)) { console.error(`introuvable : ${sigPath} (signatur
 const signature = fs.readFileSync(sigPath, 'utf8').trim();
 
 const latestPath = path.join(RELEASE_DIR, 'latest.json');
-let manifest = { version, notes: `WLED Fleet ${version} — voir ${REPO_URL}/releases/tag/v${version}`, pub_date: new Date().toISOString(), platforms: {} };
+let manifest = { version, notes: `WLED Fleet ${version} — voir ${REPO_URL}/releases/tag/${TAG}`, pub_date: new Date().toISOString(), platforms: {} };
 try {
   const prev = JSON.parse(fs.readFileSync(latestPath, 'utf8'));
-  if (prev.version === version && prev.platforms) manifest.platforms = prev.platforms; // même release : on garde les autres plateformes déjà signées
+  // même version ET même tag : on garde les autres plateformes déjà signées.
+  // Le tag compte : un latest.json stable relu pour une beta recyclerait des
+  // URL pointant sur l'autre canal.
+  const sameTag = !prev.platforms || Object.values(prev.platforms).every(p => String(p.url || '').includes(`/download/${TAG}/`));
+  if (prev.version === version && prev.platforms && sameTag) manifest.platforms = prev.platforms;
 } catch { /* pas de latest.json précédent, ou version différente : on repart de zéro */ }
 
 manifest.pub_date = new Date().toISOString();
-manifest.platforms[plat.target] = { signature, url: `${REPO_URL}/releases/download/v${version}/${assetName}` };
+manifest.platforms[plat.target] = { signature, url: `${REPO_URL}/releases/download/${TAG}/${assetName}` };
 
 fs.mkdirSync(RELEASE_DIR, { recursive: true });
 fs.writeFileSync(latestPath, JSON.stringify(manifest, null, 2));
-console.log(`OK : ${latestPath} (version ${version}, plateformes : ${Object.keys(manifest.platforms).join(', ')})`);
+console.log(`OK : ${latestPath} (version ${version}, tag ${TAG}, plateformes : ${Object.keys(manifest.platforms).join(', ')})`);

@@ -49,3 +49,16 @@ test('docs/api.md est à jour', () => {
     assert.fail(`${String(e.stderr || '').trim()}\n(docs/api.md doit être régénéré et commité avec le changement)`);
   }
 });
+
+// ── Le showfile ─────────────────────────────────────────────────────────────
+test('le showfile emporte tout ce que ce poste sait du montage', () => {
+  // Le showfile est la seule sauvegarde d'un spectacle : ce qu'il n'emporte pas
+  // est perdu au remontage. Le plan d'alimentation en particulier n'a AUCUN
+  // autre véhicule — il ne va ni dans le dépôt partagé (« Alim jardin » ne veut
+  // rien dire ailleurs) ni sur les nodes. L'oublier ici, c'est le perdre.
+  const doc = /format: 'wledfleet-showfile',[\s\S]*?\n      \};/.exec(source);
+  assert.ok(doc, 'l\'export de showfile est introuvable — ce test doit être remis à jour avec le code');
+  for (const clef of ['library', 'drivers', 'psus', 'powerPlan', 'knownNodes', 'antennas', 'snapshots']) {
+    assert.ok(doc[0].includes(clef), `le showfile n'emporte plus « ${clef} »`);
+  }
+});

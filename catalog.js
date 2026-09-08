@@ -134,7 +134,11 @@ function makeCatalog(spec) {
       list[i] = { ...p, dirty: true };
     } else {
       p.uid = p.uid || randomUUID();
-      p.rev = 1;
+      // La révision reçue est CONSERVÉE (normOne la ramène à 1 quand il n'y en a
+      // pas). L'écraser à 1 était le défaut : une fiche arrivée par showfile ou
+      // reprise depuis un node à la révision 7 redémarrait à 1 ici, et les nodes
+      // déjà patchés se signalaient alors en avance sur le catalogue — un écart
+      // que rien ne pouvait plus résorber, puisque ce poste se croyait à jour.
       list.push(p);
     }
     list.sort((a, b) => labelOf(a).localeCompare(labelOf(b)));

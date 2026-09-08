@@ -50,6 +50,20 @@ test('deux catalogues de types différents ne se marchent pas dessus', () => {
   assert.notStrictEqual(w.widgets[0].uid, g.gadgets[0].uid);
 });
 
+test('une fiche qui arrive d\'ailleurs GARDE sa révision', () => {
+  // le défaut : upsert écrasait la révision à 1 pour toute entrée inconnue.
+  // Un showfile ou un node porteur d'une fiche en rev 7 la voyait redémarrer à
+  // 1 sur ce poste, qui se croyait alors à jour pendant que tous les nodes
+  // déjà patchés se signalaient en avance — sans aucun moyen de résorber
+  // l'écart.
+  const venue = { ...W('A'), uid: 'a4e1c2d0-1111-4222-8333-444455556666', rev: 7 };
+  const { product } = widgets.upsert({ widgets: [] }, venue);
+  assert.strictEqual(product.uid, venue.uid, 'l\'identifiant reçu fait foi');
+  assert.strictEqual(product.rev, 7);
+  // et une création ordinaire, elle, démarre bien à 1
+  assert.strictEqual(widgets.upsert({ widgets: [] }, W('B')).product.rev, 1);
+});
+
 test('la révision suit la substance DU TYPE, pas un champ imposé', () => {
   let { store, product } = widgets.upsert({ widgets: [] }, W('A'));
   assert.strictEqual(product.rev, 1);

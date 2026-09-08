@@ -125,3 +125,55 @@ test('le chemin d\'un produit est son uuid, jamais son nom', () => {
   assert.strictEqual(gh.pathFor('11111111-2222-4333-8444-555555555555'),
     'products/11111111-2222-4333-8444-555555555555.json');
 });
+
+// ── Trois types dans un même dépôt ─────────────────────────────────────────
+const drivers = require('../drivers');
+const psus = require('../psus');
+
+test('chaque type a son répertoire, et les produits ne bougent pas', () => {
+  // déplacer les produits invaliderait le blobSha mémorisé de chacun : le
+  // premier rafraîchissement retéléchargerait tout, et une publication créerait
+  // un doublon au nouveau chemin sans supprimer l'ancien.
+  const uid = '11111111-2222-4333-8444-555555555555';
+  assert.strictEqual(gh.pathFor(uid), `products/${uid}.json`, 'chemin historique inchangé');
+  assert.strictEqual(gh.pathFor(uid, 'drivers'), `drivers/${uid}.json`);
+  assert.strictEqual(gh.pathFor(uid, 'psus'), `psus/${uid}.json`);
+});
+
+test('un fichier lu au mauvais endroit est REFUSÉ, pas normalisé de travers', () => {
+  // c'est le défaut que la vérification de format corrige : sans elle, un
+  // driver passé au normalisateur des produits lève sur un champ manquant,
+  // rend null, et l'entrée disparaît du catalogue sans un mot.
+  const d = drivers.normDriver({ ref: { brand: 'QuinLED', model: 'Dig-Quad' }, board: { outputs: 4 } });
+  const blob = gh.encode(d, 'drivers');
+  assert.ok(gh.decodeBlob(blob, 'drivers'), 'relu dans son propre répertoire');
+  assert.strictEqual(gh.decodeBlob(blob, 'products'), null, 'refusé ailleurs');
+  assert.strictEqual(gh.decodeBlob(blob), null, 'refusé par défaut, qui vaut « products »');
+});
+
+test('chaque type écrit son propre format', () => {
+  const lire = (obj, space) => JSON.parse(Buffer.from(gh.encode(obj, space), 'base64').toString('utf8')).format;
+  const d = drivers.normDriver({ ref: { brand: 'Q', model: 'Quad' } });
+  const a = psus.normPsu({ ref: { brand: 'Meanwell', model: 'LRS' }, volt: 12, amps: 20 });
+  assert.strictEqual(lire(P(), 'products'), 'wled-led-product');
+  assert.strictEqual(lire(d, 'drivers'), 'wled-fleet-driver');
+  assert.strictEqual(lire(a, 'psus'), 'wled-fleet-psu');
+});
+
+test('la décision de publication utilise la substance DU TYPE', () => {
+  // une alimentation dont seule la note change ne doit pas être republiée,
+  // exactement comme un produit dont seul le nom change.
+  const base = { ref: { brand: 'Meanwell', model: 'LRS-350' }, volt: 12, amps: 20 };
+  const a = { ...psus.normPsu(base), uid: '22222222-2222-4333-8444-555555555555', rev: 3 };
+  const b = { ...psus.normPsu({ ...base, ref: { brand: 'Meanwell', model: 'LRS-350', note: 'du camion' } }), uid: a.uid, rev: 3 };
+  assert.strictEqual(gh.decide(b, a, 'psus').action, 'skip');
+  const c = { ...psus.normPsu({ ...base, amps: 30 }), uid: a.uid, rev: 3 };
+  assert.strictEqual(gh.decide(c, a, 'psus').action, 'rebase', 'changer l\'ampérage, si');
+});
+
+test('un aller-retour préserve chaque type', () => {
+  const d = drivers.normDriver({ ref: { brand: 'Q', model: 'Quad' }, board: { outputs: 4, maxA: 8, inputVolts: [5, 12] } });
+  assert.deepStrictEqual(gh.decodeBlob(gh.encode(d, 'drivers'), 'drivers').board, d.board);
+  const a = psus.normPsu({ ref: { brand: 'M', model: 'LRS' }, volt: 24, watts: 350, basis: 'watts' });
+  assert.deepStrictEqual(gh.decodeBlob(gh.encode(a, 'psus'), 'psus').psu, a.psu);
+});

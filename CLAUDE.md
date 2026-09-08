@@ -126,23 +126,55 @@ La version vit à **quatre** endroits, qui doivent rester identiques :
 `desktop/embed/package.json`. En manquer un donne une app qui se croit à une
 version et s'annonce à une autre.
 
+Un cinquième suit tout seul, mais seulement au prochain `cargo build` :
+`desktop/Cargo.lock`. Le mettre à jour dans le même commit évite de découvrir
+l'écart en pleine compilation de release — c'est ce qui a valu un commit de
+rattrapage (`394db84`).
+
 Numérotation : `MAJEUR.MINEUR.CORRECTIF`.
 **Mineur** dès qu'une surface exposée change — une route, `/fleet.json`, le
 schéma d'un produit, le showfile. **Correctif** pour ce qui ne change rien de ce
 qu'un satellite voit.
 
-Dans l'ordre :
+## 6 bis. Les deux canaux
+
+L'application choisit son canal à l'exécution (⚙ Réglages → Application → Canal),
+et le réglage vit sur le poste : basculer ne réinstalle rien.
+
+| canal | code source | manifeste suivi |
+|---|---|---|
+| **stable** | branche `main` | `releases/latest/download/latest.json` |
+| **beta** | branche `beta` | `releases/download/beta/latest.json` |
+
+GitHub garantit l'essentiel : `/releases/latest/` ne résout **jamais** vers une
+préversion. Le canal stable ne peut donc pas attraper une beta par accident,
+même plus récente — et cette garantie ne repose sur rien qu'on ait écrit.
+
+La beta suit une préversion à **tag fixe `beta`** dont on remplace les fichiers à
+chaque build (`gh release upload --clobber`). Le tag ne bouge pas, l'URL non
+plus, et l'application n'a rien à découvrir. **Ne jamais publier une beta sans
+`--prerelease`** : elle deviendrait la « latest » et partirait à tout le monde.
+
+Le travail en cours vit sur `beta` : `node tools/publish-to-github.js --branch beta`.
+
+## Dans l'ordre
 
 1. Tests au vert, `docs/api.md` régénéré, documentation à jour.
 2. Bump des quatre versions, commité à part.
 3. `cd desktop && build-release.cmd` — compile, signe, écrit `latest.json`.
    Le script **échoue** si la clé de signature ou le `.sig` manquent : c'est
    voulu, une release non signée ne peut pas être installée par l'updater.
-4. Publier le code source : `node tools/publish-to-github.js`.
+   **Pour une beta, réécrire le manifeste ensuite** :
+   `node tools/make-latest-json.js --tag beta`. Sans ce drapeau il désigne
+   `releases/download/v<version>/…`, un tag qui n'existe pas sur ce canal :
+   l'app annoncerait la mise à jour puis téléchargerait un 404.
+4. Publier le code source : `node tools/publish-to-github.js` (ajouter
+   `--branch beta` pour une beta).
 5. Publier la release, **trois fichiers** (`setup.exe`, `.sig`, `latest.json`) :
    sans `latest.json` aucune app installée ne voit la mise à jour, sans `.sig`
-   elle la refuse.
-6. Vérifier depuis une app installée que la mise à jour est proposée.
+   elle la refuse. Pour une beta, sur le tag `beta`, avec `--prerelease`.
+6. Vérifier depuis une app installée, **sur le bon canal**, que la mise à jour
+   est proposée — et qu'elle ne l'est PAS sur l'autre.
 
 **La clé de signature ne se perd pas.** `%USERPROFILE%\.tauri\wled-fleet-updater.key`
 et son mot de passe : sans elle, plus aucune installation existante ne peut être

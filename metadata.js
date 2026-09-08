@@ -31,7 +31,16 @@
 
 const FILE = '/fleet.json';
 const FORMAT = 'wled-fleet-node';
-const FORMAT_VERSION = 1;
+// v2 : ajout de `power` — quelle carte est ce node, et quelle alimentation le
+// nourrit. Pas dans `extra` : `extra` est la boîte de ce que Fleet ne connaît
+// PAS, et build() l'étale en tête sans validation. Y ranger ce que Fleet écrit
+// lui-même mentirait sur sa fonction, et un satellite doit trouver le
+// rattachement dans le schéma publié.
+//
+// Compatibilité gratuite dans les deux sens : une v1 donne un `power` vide, et
+// un Fleet plus ancien conserve `power` par `extra` — c'est exactement ce pour
+// quoi `extra` existe.
+const FORMAT_VERSION = 2;
 
 // Le marqueur de produit est OPAQUE : un uuid depuis la v3 du catalogue, un
 // identifiant court à 2 caractères pour ce que Fleet a écrit avant. On accepte
@@ -60,6 +69,11 @@ function normOutput(o, i) {
     // qui permet de dire « ce node a été patché avec la v3, le catalogue est en
     // v5 » plutôt que de supposer qu'un même produit veut dire mêmes réglages.
     prev: intOrNull(x.prev),
+    // Alimentation de CETTE sortie, quand elle diffère de celle du node : le cas
+    // des grandes structures dont deux rubans partent sur un autre circuit.
+    // Absent = la sortie suit le node, comme un groupe suit son node.
+    psu: isProductId(x.psu) ? x.psu : null,
+    rail: typeof x.rail === 'string' && x.rail ? x.rail.slice(0, 8) : null,
     fixture: intOrNull(x.fixture),       // Fixture ID console
     instance: intOrNull(x.instance) || 0,// décalage de la 1re instance dans la fixture
     order: intOrNull(x.order),           // ordre voulu par l'utilisateur
@@ -78,6 +92,7 @@ function parse(doc) {
     format: FORMAT,
     formatVersion: Number(d.formatVersion) || FORMAT_VERSION,
     group: typeof d.group === 'string' ? d.group : '',
+    power: normPower(d.power),
     updatedAt: Number(d.updatedAt) || 0,
     updatedBy: typeof d.updatedBy === 'string' ? d.updatedBy.slice(0, 40) : '',
     outputs: outs.map(normOutput),
@@ -88,8 +103,22 @@ function parse(doc) {
       ...Object.fromEntries(Object.entries(d).filter(([k]) => !RESERVED.includes(k))) },
   };
 }
-const RESERVED = ['format', 'formatVersion', 'group', 'updatedAt', 'updatedBy', 'outputs', 'extra'];
-const empty = () => ({ format: FORMAT, formatVersion: FORMAT_VERSION, group: '', updatedAt: 0, updatedBy: '', outputs: [], extra: {} });
+const RESERVED = ['format', 'formatVersion', 'group', 'power', 'updatedAt', 'updatedBy', 'outputs', 'extra'];
+const empty = () => ({ format: FORMAT, formatVersion: FORMAT_VERSION, group: '', power: normPower(null), updatedAt: 0, updatedBy: '', outputs: [], extra: {} });
+
+// Ce qui alimente et ce qui pilote ce node. Le boîtier est alimenté en tant que
+// boîtier ; une sortie peut déclarer autre chose et l'emporte alors (voir
+// normOutput). Même patron que le groupe, qui est du node, contre la fixture,
+// qui est de la sortie.
+function normPower(p) {
+  const x = p && typeof p === 'object' ? p : {};
+  return {
+    psu: isProductId(x.psu) ? x.psu : null,        // exemplaire d'alimentation
+    rail: typeof x.rail === 'string' && x.rail ? x.rail.slice(0, 8) : null,
+    driver: isProductId(x.driver) ? x.driver : null,  // modèle de carte
+  };
+}
+const powerEmpty = p => !p || (!p.psu && !p.driver);
 
 // Ce qu'on écrit sur le node. Les sorties sans rien à dire sont omises : un node
 // dont aucune sortie n'est renseignée n'a pas besoin du fichier du tout.
@@ -101,6 +130,8 @@ function build(meta) {
       if (o.pin) out.pin = o.pin;
       if (o.product) out.product = o.product;
       if (o.product && o.prev !== null) out.prev = o.prev;   // sans produit, une révision ne veut rien dire
+      if (o.psu) out.psu = o.psu;
+      if (o.psu && o.rail) out.rail = o.rail;                // un rail sans alimentation ne désigne rien
       if (o.fixture !== null) out.fixture = o.fixture;
       if (o.instance) out.instance = o.instance;
       if (o.order !== null) out.order = o.order;
@@ -109,9 +140,12 @@ function build(meta) {
       return out;
     })
     .filter(o => Object.keys(o).length > 1); // « i » seul ne dit rien
-  return { ...m.extra, format: FORMAT, formatVersion: FORMAT_VERSION, group: m.group, updatedAt: Date.now(), updatedBy: m.updatedBy, outputs };
+  const doc = { ...m.extra, format: FORMAT, formatVersion: FORMAT_VERSION, group: m.group, updatedAt: Date.now(), updatedBy: m.updatedBy, outputs };
+  // omis quand il ne dit rien : un node sans rattachement n'a pas besoin du bloc
+  if (!powerEmpty(m.power)) doc.power = { ...(m.power.psu ? { psu: m.power.psu } : {}), ...(m.power.psu && m.power.rail ? { rail: m.power.rail } : {}), ...(m.power.driver ? { driver: m.power.driver } : {}) };
+  return doc;
 }
-const isEmpty = meta => { const b = build(meta); return !b.outputs.length && !b.group; };
+const isEmpty = meta => { const b = build(meta); return !b.outputs.length && !b.group && !b.power; };
 
 // ── Fixtures ────────────────────────────────────────────────────────────────
 // Une fixture n'est stockée nulle part en tant que telle : elle se RECONSTITUE

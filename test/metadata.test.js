@@ -151,3 +151,42 @@ test('le nom de fichier évite ceux auxquels WLED donne un sens', () => {
     assert.notStrictEqual(md.FILE, reserved, `${reserved} a un effet de bord dans WLED`);
   }
 });
+
+// ── v2 : le rattachement électrique ────────────────────────────────────────
+test('le bloc power vit au premier rang, pas dans extra', () => {
+  // `extra` est la boîte de ce que Fleet ne connaît PAS, et build() l'étale en
+  // tête SANS validation. Y ranger ce que Fleet écrit lui-même mentirait sur sa
+  // fonction — et un satellite doit trouver le rattachement dans le schéma.
+  const uid = '8f97e081-6f2f-4133-bd38-ec7a91f2439b';
+  const b = md.build({ power: { psu: uid, rail: 'A', driver: 'ab' } });
+  assert.deepStrictEqual(b.power, { psu: uid, rail: 'A', driver: 'ab' });
+  assert.strictEqual(b.formatVersion, 2);
+  assert.strictEqual(md.parse(b).extra.power, undefined, 'jamais recopié dans extra');
+});
+
+test('un rail sans alimentation ne désigne rien, et n\'est pas écrit', () => {
+  assert.strictEqual(md.build({ power: { rail: 'A' } }).power, undefined);
+  assert.strictEqual(md.build({ power: { psu: 'ab', rail: 'A' } }).power.rail, 'A');
+});
+
+test('une sortie peut avoir son alimentation à elle, et elle l\'emporte', () => {
+  // le cas des grandes structures dont deux rubans partent sur un autre circuit
+  const b = md.build({ power: { psu: 'aa' }, outputs: [{ i: 0, psu: 'bb', rail: 'B' }] });
+  assert.strictEqual(b.power.psu, 'aa');
+  assert.strictEqual(b.outputs[0].psu, 'bb');
+  assert.strictEqual(b.outputs[0].rail, 'B');
+});
+
+test('une v1 donne un power vide, pas une erreur', () => {
+  const v1 = { format: 'wled-fleet-node', formatVersion: 1, group: 'Boule', outputs: [{ i: 0, product: 'ab' }] };
+  const m = md.parse(v1);
+  assert.deepStrictEqual(m.power, { psu: null, rail: null, driver: null });
+  assert.strictEqual(md.build(m).power, undefined, 'et rien n\'est ajouté au fichier');
+  assert.strictEqual(md.build(m).outputs[0].product, 'ab', 'le reste survit');
+});
+
+test('un node qui n\'a QUE du power n\'est pas considéré comme vide', () => {
+  // sinon la restauration après reformatage le laisserait tomber
+  assert.strictEqual(md.isEmpty(md.parse({ power: { psu: 'ab' } })), false);
+  assert.strictEqual(md.isEmpty(md.empty()), true);
+});

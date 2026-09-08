@@ -25,6 +25,9 @@ const dmx = require('./dmx');
 const metadata = require('./metadata');
 const library = require('./library');
 const github = require('./github');
+const drivers = require('./drivers');
+const psus_ = require('./psus');
+const power = require('./power');
 const firmware = require('./firmware');
 const ap = require('./ap');
 const snapshots = require('./snapshots');
@@ -495,13 +498,42 @@ async function writeNodeMeta(rec, list, ins) {
 async function writeNodeLibrary(rec, meta) {
   const markers = (meta.outputs || []).map(o => o.product).filter(Boolean);
   const slice = library.nodeSlice(libraryStore, markers);
-  if (!slice.products.length) return;         // rien à décrire : ne pas encombrer le LittleFS
+  const pw = meta.power || {};
+  // La carte et le modèle d'alimentation aussi : sans eux, un node lu sur un
+  // poste neuf dirait « alimenté par 7e3f… » sans que personne ne sache ce que
+  // c'est. C'est le même problème que les produits, et la même réponse.
+  Object.assign(slice, drivers.nodeSlice(driverStore, [pw.driver].filter(Boolean)));
+  const inst = powerPlan.psus.find(x => x.uid === pw.psu);
+  Object.assign(slice, psus_.nodeSlice(psuStore, [inst && inst.model].filter(Boolean)));
+  // et l'exemplaire lui-même, qui n'est dans aucun catalogue puisqu'il est
+  // propre à ce montage
+  if (inst) slice.powerNodes = [{ uid: inst.uid, label: inst.label, model: inst.model, location: inst.location }];
+  if (!slice.products.length && !slice.drivers.length && !slice.psus.length) return;   // rien à décrire
+  slice.format = library.NODE_FORMAT;
   try {
     await metadata.writeFile(rec.meta.ip, library.NODE_FILE, slice, 8000);
     rec.meta.nodeLib = slice;
   } catch (e) {
     console.log(`${rec.meta.ip}: bibliothèque embarquée non écrite (${e.message})`);
   }
+}
+
+// Le rattachement d'un node, écrit sur le node lui-même. `undefined` = « la
+// grille n'a pas d'avis » ; `null` = « détache ». La distinction compte :
+// enregistrer un formulaire où le champ carte est absent ne doit pas effacer la
+// carte déclarée.
+async function writeNodePower(rec, b) {
+  const cur = metadata.parse(rec.meta.nodeMeta || metadata.empty());
+  const next = metadata.parse({ ...cur, power: {
+    psu: b.psu === undefined ? cur.power.psu : b.psu,
+    rail: b.rail === undefined ? cur.power.rail : b.rail,
+    driver: b.driver === undefined ? cur.power.driver : b.driver,
+  } });
+  await metadata.write(rec.meta.ip, next, 8000);
+  rec.meta.nodeMeta = next;
+  if (!metadata.isEmpty(next)) rec.meta.nodeMetaSeen = next;
+  await writeNodeLibrary(rec, next);
+  derive(rec);
 }
 
 async function restoreNodeMeta(rec, reason = 'maj') {
@@ -995,6 +1027,131 @@ function saveLibrary() {
   } catch { /* ignore */ }
 }
 loadLibrary();
+
+// ── Les deux autres catalogues ──────────────────────────────────────────────
+// Fichiers séparés, et non un seul qui les porterait tous les trois : chaque
+// enregistrement réécrit son fichier en entier, et un fichier abîmé ne doit pas
+// emporter les deux autres catalogues avec lui.
+const DRIVERS_FILE = dataFile('drivers.json');
+const PSUS_FILE = dataFile('psus.json');
+// Un seul chargeur pour les deux : même mécanique, mêmes pièges, et un seul
+// endroit à corriger le jour où l'écriture doit changer.
+function loadCat(file, cat, empty) {
+  let raw = null;
+  try { raw = JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return empty; }
+  try { return cat.normStore(raw); } catch { return empty; }
+}
+function saveCat(file, store) {
+  try {
+    const tmp = file + '.part';
+    fs.writeFileSync(tmp, JSON.stringify(store, null, 2));
+    fs.renameSync(tmp, file);
+  } catch { /* ignore */ }
+}
+let driverStore = loadCat(DRIVERS_FILE, drivers, { drivers: [] });
+let psuStore = loadCat(PSUS_FILE, psus_, { psus: [] });
+
+// Les trois catalogues vus d'un seul endroit : chaque route les désigne par leur
+// nom plutôt que de répéter trois fois la même logique.
+const CATS = {
+  products: { cat: library, file: PROFILES_FILE, collection: 'products', get store() { return libraryStore; }, set store(v) { libraryStore = v; } },
+  drivers: { cat: drivers, file: DRIVERS_FILE, collection: 'drivers', get store() { return driverStore; }, set store(v) { driverStore = v; } },
+  psus: { cat: psus_, file: PSUS_FILE, collection: 'psus', get store() { return psuStore; }, set store(v) { psuStore = v; } },
+};
+
+// Enregistrer un catalogue désigné par son nom : les produits ont leur écriture
+// historique, les deux autres passent par saveCat.
+const saveKind = kind => { if (kind === 'products') saveLibrary(); else saveCat(CATS[kind].file, CATS[kind].store); };
+
+// Quels nodes portent quel driver, quelle alimentation. Sans ce relevé, on ne
+// sait ni ce qu'on peut retirer sans casse, ni ce qui n'est rattaché à rien.
+function catUsage(kind) {
+  if (kind === 'products') return productUsage();
+  const by = {};
+  const c = CATS[kind]; if (!c) return by;
+  for (const rec of fleet.values()) {
+    const pw = (rec.meta.nodeMeta && rec.meta.nodeMeta.power) || {};
+    const uid = kind === 'drivers' ? pw.driver : pw.psu;
+    if (!uid) continue;
+    const it = c.cat.resolve(c.store, uid);
+    const key = it ? it.uid : uid;                     // marqueur inconnu : gardé tel quel
+    (by[key] = by[key] || []).push({ ip: rec.meta.ip, name: (rec.info && rec.info.name) || rec.meta.ip, rail: pw.rail || null });
+  }
+  return by;
+}
+
+// ── Le plan d'alimentation ──────────────────────────────────────────────────
+// Les EXEMPLAIRES posés sur le plateau, par opposition aux modèles du
+// catalogue. Propre au spectacle, donc jamais dans le dépôt partagé — mais
+// dans le showfile, puisqu'il décrit ce montage-là.
+const POWER_FILE = dataFile('power-plan.json');
+let powerPlan = (() => {
+  try { return power.normPlan(JSON.parse(fs.readFileSync(POWER_FILE, 'utf8'))); } catch { return power.normPlan(null); }
+})();
+const savePlan = () => saveCat(POWER_FILE, powerPlan);
+
+// Ce que le module de cohérence attend : un budget par node, et les
+// exemplaires avec la liste des nodes qui les désignent.
+function powerAudit() {
+  const nodes = [];
+  for (const rec of fleet.values()) {
+    const led = (rec.cfg && rec.cfg.hw && rec.cfg.hw.led) || null;
+    if (!led || !Array.isArray(led.ins)) continue;
+    const meta = rec.meta.nodeMeta || metadata.empty();
+    const byPos = []; for (const o of meta.outputs) byPos[o.i] = o;
+    const driver = drivers.resolve(driverStore, (meta.power && meta.power.driver) || null);
+    nodes.push({
+      ip: rec.meta.ip, name: (rec.info && rec.info.name) || rec.meta.ip, driver,
+      online: !!rec.meta.online,
+      power: meta.power || { psu: null, rail: null, driver: null },
+      budget: power.nodeBudget({
+        maxpwr: led.maxpwr, ins: led.ins, ignored: rec.meta.ignoredOutputs || [], driver,
+        product: i => library.resolve(libraryStore, (byPos[i] || {}).product),
+      }),
+    });
+  }
+  // un exemplaire rassemble les nodes qui le désignent — au niveau node, ou par
+  // une sortie qui déclare autre chose que son node
+  const psus = powerPlan.psus.map(inst => ({
+    ...inst,
+    model: psus_.resolve(psuStore, inst.model),
+    rail: null,
+    nodes: nodes.filter(n => n.power.psu === inst.uid).map(n => n.ip),
+  }));
+  return power.audit({ psus, nodes });
+}
+
+// Le corps commun des routes de catalogue. Les trois types se comportent
+// pareil ; seul leur contenu diffère.
+function catView(kind) {
+  const c = CATS[kind];
+  const { VOLTAGES, ETH_TYPES } = require('./columns');
+  return { ...c.store, usage: catUsage(kind), voltages: VOLTAGES, ethTypes: ETH_TYPES, readonly: READONLY };
+}
+function catUpsert(res, kind, body) {
+  if (READONLY) return send(res, 403, { error: 'lecture seule' });
+  const c = CATS[kind];
+  try {
+    const r = c.cat.upsert(c.store, { ...body, updatedBy: ghConf.login || body.updatedBy || '' });
+    c.store = r.store; saveCat(c.file, c.store); autoSyncSoon();
+    return send(res, 200, { ok: true, item: r.product, ...c.store });
+  } catch (e) { return send(res, 400, { error: e.message }); }
+}
+function catRetire(res, kind, uid) {
+  if (READONLY) return send(res, 403, { error: 'lecture seule' });
+  const c = CATS[kind];
+  try {
+    const it = c.cat.resolve(c.store, uid);
+    // ce que personne ne déclare et qui n'a jamais été publié peut disparaître ;
+    // le reste est marqué retiré, sinon les marqueurs déjà posés ne désignent
+    // plus rien
+    const purge = it ? !(catUsage(kind)[it.uid] || []).length : false;
+    c.store = c.cat.retire(c.store, uid, { purge });
+    saveCat(c.file, c.store);
+    return send(res, 200, { ok: true, purged: purge, ...c.store });
+  } catch (e) { return send(res, 400, { error: e.message }); }
+}
+
 // ── Dépôt partagé de la bibliothèque ────────────────────────────────────────
 // Le jeton d'écriture vit dans son propre fichier, JAMAIS dans le showfile ni
 // dans l'archive publiée : c'est un secret d'une autre classe que les mots de
@@ -1143,7 +1300,9 @@ const githubView = () => ({
   hasToken: ghHasAuth(), tail: ghConf.source === 'token' && ghConf.token ? `…${ghConf.token.slice(-4)}` : '',
   lastSyncAt: ghConf.lastSyncAt || 0, lastError: ghConf.lastError || '',
   auto: ghConf.auto !== false, autoBusy: ghBusy,
-  pending: libraryStore.products.filter(p => p.dirty && !p.retired).length,
+  // en attente de publication, les trois catalogues confondus : le badge doit
+  // dire qu'il reste quelque chose à pousser, pas seulement des produits
+  pending: Object.keys(CATS).reduce((s, k) => s + CATS[k].store[CATS[k].collection].filter(p => p.dirty && !p.retired).length, 0),
 });
 
 // ── Synchronisation automatique ─────────────────────────────────────────────
@@ -1167,28 +1326,38 @@ async function autoSync(reason = 'périodique') {
   if (!ghConf.repo || ghConf.auto === false) return;
   ghBusy = true;
   try {
-    const r = await github.pull(ghConf.repo, libraryStore, { token: ghToken(), branch: ghConf.branch });
+    // Les TROIS catalogues, pas seulement les produits : un driver ou une alim
+    // qui reste sur un poste ne vaut rien, et c'est justement ce que le dépôt
+    // partagé est censé résoudre.
+    const stores = { products: libraryStore, drivers: driverStore, psus: psuStore };
+    const r = await github.pull(ghConf.repo, stores, { token: ghToken(), branch: ghConf.branch });
+    const touched = new Set();
     let n = 0;
     for (const remote of r.fetched) {
-      const mine = library.resolve(libraryStore, remote.uid);
-      if (!mine) { libraryStore.products.push(library.normProduct({ ...remote, dirty: false })); n++; continue; }
+      const c = CATS[remote.kind]; if (!c) continue;          // type inconnu : laissé au dépôt
+      const norm = x => c.cat.catalog.normOne(x);
+      const mine = c.cat.resolve(c.store, remote.uid);
+      if (!mine) { c.store[c.collection].push(norm({ ...remote, dirty: false })); n++; touched.add(remote.kind); continue; }
       // ce qui est modifié ici et pas encore publié n'est jamais écrasé par le
       // dépôt : la publication juste après saura se replacer au-dessus
-      if (mine.dirty && library.substance(mine) !== library.substance(remote)) continue;
-      Object.assign(mine, library.normProduct({ ...remote, dirty: false })); n++;
+      if (mine.dirty && c.cat.substance(mine) !== c.cat.substance(remote)) continue;
+      Object.assign(mine, norm({ ...remote, dirty: false })); n++; touched.add(remote.kind);
     }
     let pushed = 0;
     if (ghHasAuth()) {
-      for (const prod of libraryStore.products.filter(x => x.dirty && !x.retired)) {
-        const res = await github.publish(ghConf.repo, prod, { token: ghToken(), branch: ghConf.branch });
-        Object.assign(prod, library.normProduct({ ...res.product, origin: 'library', dirty: false }), { blobSha: res.sha || null });
-        if (res.action !== 'skip' && res.action !== 'adopt') pushed++;
+      for (const kind of Object.keys(CATS)) {
+        const c = CATS[kind];
+        for (const item of c.store[c.collection].filter(x => x.dirty && !x.retired)) {
+          const res = await github.publish(ghConf.repo, item, { token: ghToken(), branch: ghConf.branch, space: kind });
+          Object.assign(item, c.cat.catalog.normOne({ ...res.product, origin: 'library', dirty: false }), { blobSha: res.sha || null });
+          if (res.action !== 'skip' && res.action !== 'adopt') { pushed++; touched.add(kind); }
+        }
       }
     }
-    libraryStore = library.normStore(libraryStore);
+    for (const kind of touched) { CATS[kind].store = CATS[kind].cat.normStore(CATS[kind].store); saveKind(kind); }
     ghConf.lastSyncAt = Date.now(); ghConf.lastError = '';
-    saveGithub(); if (n || pushed) saveLibrary();
-    if (n || pushed) console.log(`bibliothèque (${reason}) : ${n} repris du dépôt, ${pushed} publié(s)`);
+    saveGithub();
+    if (n || pushed) console.log(`bibliothèques (${reason}) : ${n} repris du dépôt, ${pushed} publié(s)`);
   } catch (e) {
     ghConf.lastError = e.message; saveGithub();
     console.log(`bibliothèque (${reason}) : ${e.message}`);
@@ -1589,19 +1758,29 @@ const server = http.createServer(async (req, res) => {
     // passwords, node list, config backups, firmware catalogue, optional journal),
     // optionally encrypted with a passphrase (scrypt + AES-256-GCM). The UI adds
     // its own column layout before saving the file.
-    // @api Exporte un showfile : groupes, sorties non câblées, bibliothèque
-    // de produits, métadonnées des nodes, réglages retenus. Jamais de
-    // secrets.
+    // @api Exporte un showfile : groupes, sorties non câblées, les trois
+    // bibliothèques, le plan d'alimentation, les métadonnées des nodes et les
+    // réglages retenus. Jamais de secrets.
     if (p === '/api/showfile' && req.method === 'POST') {
       const b = await readBody(req);
       const inc = b.include || {};
       const doc = {
-        format: 'wledfleet-showfile', formatVersion: 1, app: APP_VERSION, exportedAt: new Date().toISOString(),
+        // v2 : ajout de `drivers`, `psus` et `powerPlan`. Purement additif — un
+        // Fleet antérieur ignore ces clés et lit le reste comme avant, un Fleet
+        // récent trouve simplement un plan vide dans un showfile v1.
+        format: 'wledfleet-showfile', formatVersion: 2, app: APP_VERSION, exportedAt: new Date().toISOString(),
         // `library` porte le catalogue complet (avec ses identifiants) ;
         // `ledProfiles` reste pour qu'une version antérieure sache encore lire
         // ce showfile.
         settings, antennas: ap.exportStore(), knownNodes: knownEntries(), groups: declaredGroups,
         library: libraryStore, ledProfiles: legacyProfiles(),
+        // Les modèles voyagent avec le montage : sans eux, un showfile rouvert
+        // sur un autre poste désigne des drivers et des alims que ce poste ne
+        // connaît pas, et le rapport de cohérence ne conclut plus rien.
+        drivers: driverStore, psus: psuStore,
+        // Le plan, lui, n'existe QUE là : « Alim jardin » ne veut rien dire dans
+        // le dépôt partagé, donc le showfile est son seul véhicule.
+        powerPlan,
         snapshots: snapshots.list().map(s => { try { return snapshots.load(s.id); } catch { return null; } }).filter(Boolean),
         firmwareIndex: (() => { try { return JSON.parse(fs.readFileSync(dataFile('firmware', 'index.json'), 'utf8')); } catch { return null; } })(),
         journal: inc.journal ? changes.slice(-2000) : undefined,
@@ -1620,9 +1799,11 @@ const server = http.createServer(async (req, res) => {
       recordChangeFleet(`showfile exporté (${b.passphrase ? 'chiffré' : 'en clair'}, ${doc.snapshots.length} sauvegarde(s), ${doc.knownNodes.length} node(s))`);
       return send(res, 200, out);
     }
-    // @api Importe un showfile. Les identifiants de produits sont conservés
-    // tels quels, sinon les marqueurs déjà posés sur les nodes désigneraient
-    // autre chose.
+    // @api Importe un showfile. Les identifiants des fiches — produits,
+    // drivers, alimentations — et leurs révisions sont conservés tels quels,
+    // sinon les marqueurs déjà posés sur les nodes désigneraient autre chose.
+    // Les catalogues et le plan d'alimentation sont FUSIONNÉS, jamais
+    // remplacés : importer le showfile d'un autre plateau n'efface rien d'ici.
     if (p === '/api/showfile/import' && req.method === 'POST') {
       if (READONLY) return send(res, 403, { error: 'lecture seule' });
       const b = await readBody(req);
@@ -1654,6 +1835,26 @@ const server = http.createServer(async (req, res) => {
           try { libraryStore = library.upsert(libraryStore, p).store; } catch { /* produit illisible : ignoré */ }
         }
         if (incoming.length) { saveLibrary(); done.push(`${incoming.length} produit(s) LED`); }
+        // Drivers et alimentations : même règle que les produits, et pour la
+        // même raison — les nodes de ce showfile portent leurs uid.
+        for (const kind of ['drivers', 'psus']) {
+          const c = CATS[kind];
+          let n = 0;
+          for (const it of (doc[kind] ? c.cat.normStore(doc[kind])[c.collection] : [])) {
+            try { c.store = c.cat.upsert(c.store, it).store; n++; } catch { /* fiche illisible : ignorée */ }
+          }
+          if (n) { saveKind(kind); done.push(`${n} ${kind === 'drivers' ? 'driver(s)' : 'alimentation(s)'}`); }
+        }
+        // Le plan d'alimentation est fusionné exemplaire par exemplaire, pas
+        // remplacé : importer le showfile d'un autre plateau ne doit pas faire
+        // disparaître les alims déjà décrites ici.
+        if (doc.powerPlan) {
+          let n = 0;
+          for (const inst of power.normPlan(doc.powerPlan).psus) {
+            try { powerPlan = power.planUpsert(powerPlan, inst, require('crypto').randomUUID()).plan; n++; } catch { /* ignorée */ }
+          }
+          if (n) { savePlan(); done.push(`${n} alimentation(s) du plateau`); }
+        }
         for (const e of doc.knownNodes) { const ip = typeof e === 'string' ? e : e.ip; if (!ip) continue; const r = addNode(ip); if (e.info && !r.info) { r.info = e.info; r.state = e.state || null; r.cfg = e.cfg || null; r.meta.lastSeen = e.lastSeen || null; r.meta.fails = 2; } if (typeof e.group === 'string' && e.group) r.meta.group = e.group; if (Array.isArray(e.ignoredOutputs)) r.meta.ignoredOutputs = e.ignoredOutputs; derive(r); }
         saveKnown(); pollAll(); done.push(`${doc.knownNodes.length} node(s)`);
       }
@@ -1676,6 +1877,78 @@ const server = http.createServer(async (req, res) => {
     // Remplace /api/led-profiles : identité structurée, tous les réglages du
     // produit, plusieurs longueurs types, et des identifiants qui ne bougent
     // plus (voir library.js).
+    // ── La chaîne électrique ──────────────────────────────────────────────
+    // @api Le rapport de cohérence électrique : pour chaque alimentation posée
+    // sur le plateau, sa capacité, la somme des budgets des nodes qu'elle
+    // nourrit, et les constats. Plus les nodes rattachés à rien — la seule
+    // liste que personne ne peut produire autrement. Les seuils et
+    // l'arithmétique de l'ABL sont dans power.js, vérifiés dans le firmware.
+    if (p === '/api/power' && req.method === 'GET') {
+      return send(res, 200, { ...powerAudit(), plan: powerPlan, catalogue: psuStore.psus, drivers: driverStore.drivers });
+    }
+    // @api Crée ou met à jour un EXEMPLAIRE d'alimentation : son libellé, le
+    // modèle du catalogue qu'il suit, et où il se trouve. Propre au spectacle —
+    // « Alim jardin » ne veut rien dire sur un autre poste — donc jamais publié
+    // dans le dépôt partagé, mais présent dans le showfile.
+    if (p === '/api/power/psu' && req.method === 'POST') {
+      if (READONLY) return send(res, 403, { error: 'lecture seule' });
+      const b = await readBody(req);
+      try {
+        const r = power.planUpsert(powerPlan, b, require('crypto').randomUUID());
+        powerPlan = r.plan; savePlan();
+        return send(res, 200, { ok: true, psu: r.psu, plan: powerPlan });
+      } catch (e) { return send(res, 400, { error: e.message }); }
+    }
+    // @api Retire un exemplaire d'alimentation. Les nodes qui le désignent sont
+    // renvoyés : c'est à l'utilisateur de les rattacher ailleurs, on ne les
+    // détache pas d'autorité.
+    if ((m = /^\/api\/power\/psu\/([0-9a-z][0-9a-z-]{1,39})$/.exec(p)) && req.method === 'DELETE') {
+      if (READONLY) return send(res, 403, { error: 'lecture seule' });
+      const orphelins = [...fleet.values()]
+        .filter(r => r.meta.nodeMeta && r.meta.nodeMeta.power && r.meta.nodeMeta.power.psu === m[1])
+        .map(r => ({ ip: r.meta.ip, name: (r.info && r.info.name) || r.meta.ip }));
+      try { powerPlan = power.planRemove(powerPlan, m[1]); savePlan(); return send(res, 200, { ok: true, plan: powerPlan, orphelins }); }
+      catch (e) { return send(res, 400, { error: e.message }); }
+    }
+    // @api Rattache un node : quelle alimentation le nourrit, sur quel rail, et
+    // quelle carte il est. Écrit dans son /fleet.json, donc le node se raconte
+    // ensuite tout seul — y compris sur un autre poste.
+    if ((m = /^\/api\/node\/([^/]+)\/power$/.exec(p)) && req.method === 'POST') {
+      if (READONLY) return send(res, 403, { error: 'lecture seule' });
+      const rec = fleet.get(decodeURIComponent(m[1])); if (!rec) return send(res, 404, { error: 'node inconnu' });
+      if (!rec.meta.online) return send(res, 409, { error: 'node hors ligne' });
+      const b = await readBody(req);
+      try { await writeNodePower(rec, b); return send(res, 200, { ok: true, power: rec.meta.nodeMeta.power }); }
+      catch (e) { return send(res, 502, { error: e.message }); }
+    }
+    // ── Drivers et alimentations ──────────────────────────────────────────
+    // Même mécanique que les produits (catalog.js) : uuid stable, révisions,
+    // retrait sans effacement. Le travail est fait par catView / catUpsert /
+    // catRetire ; les routes restent écrites une par une pour que chaque point
+    // d'entrée soit visible dans docs/api.md, et non caché derrière une boucle.
+    //
+    // @api Catalogue de cartes : pour chaque modèle, son brochage, ses tensions
+    // d'entrée et ses courants admissibles, plus la liste des nodes qui le
+    // déclarent. Sert à dire si un budget de courant est réaliste pour ce
+    // matériel — ce que le node lui-même ne sait pas.
+    if (p === '/api/drivers' && req.method === 'GET') return send(res, 200, catView('drivers'));
+    // @api Crée ou met à jour une carte. L'uid est frappé à la création et ne
+    // change jamais ; la révision monte quand le matériel change, pas quand on
+    // corrige le nom.
+    if (p === '/api/drivers/item' && req.method === 'POST') return catUpsert(res, 'drivers', await readBody(req));
+    // @api Retire une carte. Marquée retirée — jamais effacée — dès qu'un node
+    // la déclare, pour que son marqueur garde un sens.
+    if ((m = /^\/api\/drivers\/item\/([0-9a-z][0-9a-z-]{1,39})$/.exec(p)) && req.method === 'DELETE') return catRetire(res, 'drivers', m[1]);
+    // @api Catalogue d'alimentations : tension, ampères et watts (liés par la
+    // tension), rails, taux d'usage conseillé, plus les nodes rattachés. Décrit
+    // un MODÈLE, jamais un exemplaire — l'exemplaire vit sur le node.
+    if (p === '/api/psus' && req.method === 'GET') return send(res, 200, catView('psus'));
+    // @api Crée ou met à jour une alimentation. Ampères et watts sont
+    // réconciliés par la tension ; `basis` retient lequel a été saisi, pour que
+    // changer la tension sache quelle grandeur tenir constante.
+    if (p === '/api/psus/item' && req.method === 'POST') return catUpsert(res, 'psus', await readBody(req));
+    // @api Retire une alimentation, selon les mêmes règles que les cartes.
+    if ((m = /^\/api\/psus\/item\/([0-9a-z][0-9a-z-]{1,39})$/.exec(p)) && req.method === 'DELETE') return catRetire(res, 'psus', m[1]);
     // @api Catalogue de produits LED, avec pour chaque produit le relevé des
     // sorties qui l'utilisent et l'état de leur révision (à jour, en retard,
     // en avance, inconnue).
@@ -1775,57 +2048,68 @@ const server = http.createServer(async (req, res) => {
         return send(res, 409, { error: `${e.message}. Installer GitHub CLI (https://cli.github.com) puis lancer « gh auth login », ou utiliser la connexion normale.` });
       }
     }
-    // @api Tire le dépôt partagé (jamais destructif). Un produit modifié
-    // localement et pas encore publié n'est PAS écrasé : il est signalé comme
-    // divergent, à publier — c'est la publication qui saura se replacer
-    // au-dessus de la version en ligne.
+    // @api Tire le dépôt partagé (jamais destructif), les trois catalogues.
+    // Une fiche modifiée localement et pas encore publiée n'est PAS écrasée :
+    // elle est signalée comme divergente, à publier — c'est la publication qui
+    // saura se replacer au-dessus de la version en ligne.
     if (p === '/api/library/pull' && req.method === 'POST') {
       if (READONLY) return send(res, 403, { error: 'lecture seule' });
       if (!ghConf.repo) return send(res, 400, { error: 'aucun dépôt partagé configuré' });
       try {
-        const r = await github.pull(ghConf.repo, libraryStore, { token: ghToken(), branch: ghConf.branch });
-        const added = [], updated = [], kept = [];
+        const stores = { products: libraryStore, drivers: driverStore, psus: psuStore };
+        const r = await github.pull(ghConf.repo, stores, { token: ghToken(), branch: ghConf.branch });
+        const added = [], updated = [], kept = [], touched = new Set();
         for (const remote of r.fetched) {
-          const mine = library.resolve(libraryStore, remote.uid);
-          if (!mine) { libraryStore.products.push(library.normProduct({ ...remote, dirty: false })); added.push(library.label(remote)); continue; }
-          // un produit retouché ici et pas encore publié ne se fait pas écraser
+          const c = CATS[remote.kind]; if (!c) continue;      // type inconnu : laissé au dépôt
+          const norm = x => c.cat.catalog.normOne(x);
+          const mine = c.cat.resolve(c.store, remote.uid);
+          if (!mine) { c.store[c.collection].push(norm({ ...remote, dirty: false })); added.push(c.cat.label(remote)); touched.add(remote.kind); continue; }
+          // une fiche retouchée ici et pas encore publiée ne se fait pas écraser
           // par le dépôt : ce serait perdre le travail local sans un mot
-          if (mine.dirty && library.substance(mine) !== library.substance(remote)) { kept.push(library.label(mine)); continue; }
-          Object.assign(mine, library.normProduct({ ...remote, dirty: false }));
-          updated.push(library.label(remote));
+          if (mine.dirty && c.cat.substance(mine) !== c.cat.substance(remote)) { kept.push(c.cat.label(mine)); continue; }
+          Object.assign(mine, norm({ ...remote, dirty: false }));
+          updated.push(c.cat.label(remote)); touched.add(remote.kind);
         }
-        libraryStore = library.normStore(libraryStore);
-        ghConf.lastSyncAt = Date.now(); ghConf.lastError = ''; saveGithub(); saveLibrary();
-        if (added.length || updated.length) recordChangeFleet(`bibliothèque : ${added.length} produit(s) ajouté(s), ${updated.length} mis à jour depuis ${ghConf.repo}`);
+        for (const kind of touched) { CATS[kind].store = CATS[kind].cat.normStore(CATS[kind].store); saveKind(kind); }
+        ghConf.lastSyncAt = Date.now(); ghConf.lastError = ''; saveGithub();
+        if (added.length || updated.length) recordChangeFleet(`bibliothèques : ${added.length} fiche(s) ajoutée(s), ${updated.length} mise(s) à jour depuis ${ghConf.repo}`);
         return send(res, 200, { ok: true, added, updated, kept, unchanged: r.unchanged.length, ...githubView() });
       } catch (e) { ghConf.lastError = e.message; saveGithub(); return send(res, 502, { error: e.message }); }
     }
-    // @api Publie vers le dépôt partagé : un produit si `uid` est donné, sinon
-    // tous ceux qui ont changé localement. Rien n'est jamais écrasé — sur
-    // collision, la version en ligne devient la base et la nôtre repart
-    // au-dessus, de sorte qu'aucun numéro de révision ne désigne deux contenus.
+    // @api Publie vers le dépôt partagé : une fiche si `uid` est donné (dans le
+    // catalogue `kind`, produits par défaut), sinon tout ce qui a changé
+    // localement dans les trois. Rien n'est jamais écrasé — sur collision, la
+    // version en ligne devient la base et la nôtre repart au-dessus, de sorte
+    // qu'aucun numéro de révision ne désigne deux contenus.
     if (p === '/api/library/publish' && req.method === 'POST') {
       if (READONLY) return send(res, 403, { error: 'lecture seule' });
       if (!ghConf.repo) return send(res, 400, { error: 'aucun dépôt partagé configuré' });
       if (!ghHasAuth()) return send(res, 400, { error: 'pas connecté à GitHub : la publication demande un droit d\'écriture' });
       const b = await readBody(req);
-      const todo = b.uid ? [library.resolve(libraryStore, b.uid)].filter(Boolean)
-        : libraryStore.products.filter(x => x.dirty && !x.retired);
+      const kinds = b.kind && CATS[b.kind] ? [b.kind] : Object.keys(CATS);
+      const todo = [];
+      for (const kind of kinds) {
+        const c = CATS[kind];
+        const items = b.uid ? [c.cat.resolve(c.store, b.uid)].filter(Boolean)
+          : c.store[c.collection].filter(x => x.dirty && !x.retired);
+        for (const item of items) todo.push({ kind, c, item });
+      }
       if (!todo.length) return send(res, 200, { ok: true, done: [], note: 'rien à publier' });
-      const done = [], failed = [];
-      for (const prod of todo) {
+      const done = [], failed = [], touched = new Set();
+      for (const { kind, c, item } of todo) {
         try {
-          const r = await github.publish(ghConf.repo, prod, { token: ghToken(), branch: ghConf.branch });
+          const r = await github.publish(ghConf.repo, item, { token: ghToken(), branch: ghConf.branch, space: kind });
           // ce que le dépôt a accepté fait foi : on s'aligne dessus, y compris
           // quand notre révision a été replacée au-dessus d'une autre
-          Object.assign(prod, library.normProduct({ ...r.product, origin: 'library', dirty: false }), { blobSha: r.sha || null });
-          done.push({ uid: prod.uid, label: library.label(prod), action: r.action, rev: prod.rev });
-        } catch (e) { failed.push({ uid: prod.uid, label: library.label(prod), error: e.message }); }
+          Object.assign(item, c.cat.catalog.normOne({ ...r.product, origin: 'library', dirty: false }), { blobSha: r.sha || null });
+          done.push({ uid: item.uid, kind, label: c.cat.label(item), action: r.action, rev: item.rev });
+          touched.add(kind);
+        } catch (e) { failed.push({ uid: item.uid, kind, label: c.cat.label(item), error: e.message }); }
       }
-      libraryStore = library.normStore(libraryStore);
-      ghConf.lastSyncAt = Date.now(); ghConf.lastError = failed.length ? failed[0].error : ''; saveGithub(); saveLibrary();
+      for (const kind of touched) { CATS[kind].store = CATS[kind].cat.normStore(CATS[kind].store); saveKind(kind); }
+      ghConf.lastSyncAt = Date.now(); ghConf.lastError = failed.length ? failed[0].error : ''; saveGithub();
       const rebased = done.filter(x => x.action === 'rebase');
-      if (done.length) recordChangeFleet(`bibliothèque : ${done.length} produit(s) publié(s) vers ${ghConf.repo}${rebased.length ? `, dont ${rebased.length} replacé(s) au-dessus d'une version en ligne` : ''}`);
+      if (done.length) recordChangeFleet(`bibliothèques : ${done.length} fiche(s) publiée(s) vers ${ghConf.repo}${rebased.length ? `, dont ${rebased.length} replacée(s) au-dessus d'une version en ligne` : ''}`);
       return send(res, failed.length && !done.length ? 502 : 200, { ok: !failed.length, done, failed, ...githubView() });
     }
     // @api Ce que les nodes portent de la bibliothèque : chaque node cite les

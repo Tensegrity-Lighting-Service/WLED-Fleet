@@ -1,6 +1,6 @@
 {
   "name": "wled-fleet",
-  "version": "0.10.0",
+  "version": "0.11.0",
   "description": "Gestionnaire de flotte WLED : grille de réglages, journal, mises à jour hors ligne, antenne MikroTik, appairage.",
   "main": "server.js",
   "private": true,
