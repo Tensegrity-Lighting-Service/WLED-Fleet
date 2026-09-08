@@ -27,12 +27,13 @@ const ap = require('./ap');
 const snapshots = require('./snapshots');
 const provision = require('./provision');
 const wizard = require('./wizard');
+const { dataFile, codeFile, DATA_DIR, CODE_DIR } = require('./paths');
 
 // ── Settings: settings.json (standalone app) overridden by CLI flags ─────────
 // settings.json = { "subnet": "192.168.88", "listen": "127.0.0.1:8792", "interval": 3000,
 //                   "cfgInterval": 20000, "readonly": false, "otaParallel": 1 }
 // (keys are the camelCase form of the CLI flags; "listen": "0.0.0.0:8792" opens the page to the LAN)
-const SETTINGS_FILE = path.join(__dirname, 'settings.json');
+const SETTINGS_FILE = dataFile('settings.json');
 let settings = {};
 try { settings = JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf8')); } catch { /* none: CLI flags / defaults */ }
 const args = process.argv.slice(2);
@@ -57,16 +58,16 @@ if (process.env.WLED_FLEET_PARENT_PID) {
   const ppid = Number(process.env.WLED_FLEET_PARENT_PID);
   setInterval(() => { try { process.kill(ppid, 0); } catch { console.log('fenêtre disparue, arrêt du serveur'); process.exit(0); } }, 2000).unref();
 }
-const KNOWN_FILE = path.join(__dirname, 'known-nodes.json');
+const KNOWN_FILE = dataFile('known-nodes.json');
 // The launcher restarts the server silently after a crash: keep the reason on disk.
-const ERROR_FILE = path.join(__dirname, 'server-errors.log');
+const ERROR_FILE = dataFile('server-errors.log');
 for (const ev of ['uncaughtException', 'unhandledRejection']) process.on(ev, err => {
   const line = `${new Date().toISOString()} ${ev}: ${(err && err.stack) || err}\n`;
   try { fs.appendFileSync(ERROR_FILE, line); } catch { /* ignore */ }
   console.error(line);
   if (ev === 'uncaughtException') process.exit(1);
 });
-const APP_VERSION = (() => { try { return JSON.parse(fs.readFileSync(path.join(__dirname, 'package.json'), 'utf8')).version; } catch { return 'dev'; } })();
+const APP_VERSION = (() => { try { return JSON.parse(fs.readFileSync(codeFile('package.json'), 'utf8')).version; } catch { return 'dev'; } })();
 
 // ── HTTP helpers toward the nodes ────────────────────────────────────────────
 function splitHost(ip) {
@@ -283,7 +284,7 @@ function dmxPlan(rec) {
 // (columns.js: watch !== false). A change is tagged 'grille' when this server
 // just wrote that cell, 'externe' otherwise (WLED UI, another tool, a preset…).
 // a fixed --ip list (dev / mock runs) journals apart from the real fleet
-const CHANGES_FILE = path.join(__dirname, FIXED_IPS.length ? 'changes-dev.log' : 'changes.log');
+const CHANGES_FILE = dataFile(FIXED_IPS.length ? 'changes-dev.log' : 'changes.log');
 let changes = [];
 const WATCHED = columns.filter(c => c.watch !== false && c.path.split('.')[0] !== 'meta');
 const getPath = (o, p) => p.split('.').reduce((a, k) => (a == null ? undefined : a[k]), o);
@@ -759,7 +760,7 @@ const recentPcNets = new Map(); // Wi-Fi networks seen by the PC's card in the l
 // entries only (tools/espressif-oui.json, 344 prefixes). A BSSID outside this
 // list is NEVER a WLED; inside it is "probable" until verified by reading
 // /json/info through its AP (POST /api/pair/test), which is the only proof.
-const ESPRESSIF_OUIS = (() => { try { return new Set(JSON.parse(fs.readFileSync(path.join(__dirname, 'tools', 'espressif-oui.json'), 'utf8')).ouis); } catch { return new Set(); } })();
+const ESPRESSIF_OUIS = (() => { try { return new Set(JSON.parse(fs.readFileSync(codeFile('tools', 'espressif-oui.json'), 'utf8')).ouis); } catch { return new Set(); } })();
 const verifiedAps = new Map(); // ssid -> { info, at } once /json/info was read through that AP
 
 // ── Maintenance window: the Wi-Fi card is busy elsewhere ─────────────────────
@@ -866,7 +867,7 @@ async function scan() {
 const knownEntries = () => [...fleet.values()].map(r => ({ ip: r.meta.ip, lastSeen: r.meta.lastSeen, info: r.info, state: r.state, cfg: r.cfg, ignoredOutputs: r.meta.ignoredOutputs || [], group: r.meta.group || '', offlineQueue: r.meta.offlineQueue || null }));
 let declaredGroups = []; // Fleet-only group names, kept even when no node is in them
 // LED profiles: what gets plugged on an output (type, colour order, pixels), reusable from the Sorties tab
-const PROFILES_FILE = path.join(__dirname, 'led-profiles.json');
+const PROFILES_FILE = dataFile('led-profiles.json');
 let ledProfiles = [];
 const newProfileId = () => { const used = new Set(ledProfiles.map(x => x.id)); for (let n = 10; n < 1296; n++) { const id = n.toString(36).padStart(2, '0'); if (!used.has(id)) return id; } throw new Error('trop de profils'); };
 function loadProfiles() {
@@ -1003,7 +1004,7 @@ function startApPolling() {
 }
 
 // ── Web server ───────────────────────────────────────────────────────────────
-const STATIC = path.join(__dirname, 'static');
+const STATIC = codeFile('static');
 
 function send(res, code, obj) {
   const b = Buffer.from(JSON.stringify(obj));
@@ -1164,7 +1165,7 @@ const server = http.createServer(async (req, res) => {
         return send(res, 200, { ok: true, url: u });
       } catch (e) { return send(res, 500, { error: e.message }); }
     }
-    if (p === '/api/about') return send(res, 200, { version: APP_VERSION, node: process.version, dir: __dirname, settingsFile: SETTINGS_FILE, settings, launcher: !!process.env.WLED_FLEET_LAUNCHER, pid: process.pid, uptime: Math.round(process.uptime()) });
+    if (p === '/api/about') return send(res, 200, { version: APP_VERSION, node: process.version, dir: CODE_DIR, dataDir: DATA_DIR, settingsFile: SETTINGS_FILE, settings, launcher: !!process.env.WLED_FLEET_LAUNCHER, pid: process.pid, uptime: Math.round(process.uptime()) });
     if (p === '/api/restart' && req.method === 'POST') {
       // reload edited source files: exit with the code the launcher restarts on
       if (!process.env.WLED_FLEET_LAUNCHER) return send(res, 409, { error: 'serveur lancé sans WLED-Fleet.cmd : le relancer à la main' });
@@ -1185,7 +1186,7 @@ const server = http.createServer(async (req, res) => {
         format: 'wledfleet-showfile', formatVersion: 1, app: APP_VERSION, exportedAt: new Date().toISOString(),
         settings, antennas: ap.exportStore(), knownNodes: knownEntries(), groups: declaredGroups, ledProfiles,
         snapshots: snapshots.list().map(s => { try { return snapshots.load(s.id); } catch { return null; } }).filter(Boolean),
-        firmwareIndex: (() => { try { return JSON.parse(fs.readFileSync(path.join(__dirname, 'firmware', 'index.json'), 'utf8')); } catch { return null; } })(),
+        firmwareIndex: (() => { try { return JSON.parse(fs.readFileSync(dataFile('firmware', 'index.json'), 'utf8')); } catch { return null; } })(),
         journal: inc.journal ? changes.slice(-2000) : undefined,
         rfScans: inc.journal ? ap.scanHistory(200) : undefined,
         layout: b.layout || null,
@@ -1228,7 +1229,7 @@ const server = http.createServer(async (req, res) => {
         saveKnown(); pollAll(); done.push(`${doc.knownNodes.length} node(s)`);
       }
       if (what.snapshots && Array.isArray(doc.snapshots)) { let n = 0; for (const s of doc.snapshots) { try { snapshots.importFile(Buffer.from(JSON.stringify(s)), (s.name || s.id || 'snapshot') + '.json'); n++; } catch { /* skip bad one */ } } done.push(`${n} sauvegarde(s)`); }
-      if (what.firmware && doc.firmwareIndex) { try { fs.mkdirSync(path.join(__dirname, 'firmware'), { recursive: true }); fs.writeFileSync(path.join(__dirname, 'firmware', 'index.json'), JSON.stringify(doc.firmwareIndex, null, 2)); done.push('catalogue firmware'); } catch { /* ignore */ } }
+      if (what.firmware && doc.firmwareIndex) { try { fs.mkdirSync(dataFile('firmware'), { recursive: true }); fs.writeFileSync(dataFile('firmware', 'index.json'), JSON.stringify(doc.firmwareIndex, null, 2)); done.push('catalogue firmware'); } catch { /* ignore */ } }
       let restart = false;
       if (what.settings && doc.settings) { try { fs.writeFileSync(SETTINGS_FILE, JSON.stringify(doc.settings, null, 2) + '\n'); done.push('réglages'); restart = !!process.env.WLED_FLEET_LAUNCHER; } catch { /* ignore */ } }
       recordChangeFleet(`showfile importé : ${done.join(', ')}`);

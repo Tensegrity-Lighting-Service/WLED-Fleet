@@ -73,14 +73,14 @@ fn extract_embedded(d: &Dir, dst: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// The app's folder: a `WLED-Fleet\` subfolder next to this exe, self-extracted
-/// there if missing or out of date — never loose files dropped straight into
-/// whatever folder (Downloads…) the exe happens to sit in. `WLED_FLEET_DIR`
-/// (dev only) points at a live source tree instead and skips extraction
-/// entirely — the escape hatch for editing server.js/static/* without losing
-/// the changes to a re-extract on the next build; WLED-Fleet.cmd (console
-/// launch) never goes through any of this, it always runs the folder's own
-/// files (wherever that .cmd itself was placed).
+/// Où l'app dépose son CODE : `%LOCALAPPDATA%\WLED-Fleet\app`, réextrait quand
+/// la version embarquée change. Volontairement hors du dossier d'installation,
+/// que l'installeur remplace à chaque mise à jour et efface à la
+/// désinstallation. Contenu jetable : rien d'autre que les fichiers embarqués
+/// n'y vit, on peut le supprimer sans rien perdre.
+/// `WLED_FLEET_DIR` (dev) pointe sur un arbre source vivant et saute
+/// l'extraction — l'échappatoire pour éditer server.js/static/* sans se faire
+/// écraser au build suivant.
 fn ensure_app_dir() -> Option<PathBuf> {
     if let Ok(dir) = std::env::var("WLED_FLEET_DIR") {
         let p = PathBuf::from(dir);
@@ -88,7 +88,7 @@ fn ensure_app_dir() -> Option<PathBuf> {
             return Some(p);
         }
     }
-    let dir = std::env::current_exe().ok()?.parent()?.join("WLED-Fleet");
+    let dir = local_app_data()?.join("WLED-Fleet").join("app");
     let marker = dir.join(".wf-embedded-version");
     let up_to_date = std::fs::read_to_string(&marker).map(|v| v.trim() == APP_VERSION).unwrap_or(false);
     if !up_to_date {
@@ -106,16 +106,63 @@ fn ensure_app_dir() -> Option<PathBuf> {
     }
 }
 
+#[cfg(windows)]
+fn local_app_data() -> Option<PathBuf> {
+    std::env::var_os("LOCALAPPDATA").map(PathBuf::from)
+}
+#[cfg(not(windows))]
+fn local_app_data() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local").join("share"))
+}
+
+/// Où l'app garde SES DONNÉES : « Documents\WLED Fleet ». Volontairement à un
+/// endroit que l'utilisateur voit, ouvre et sauvegarde — réglages, flotte
+/// connue, profils de LED, sauvegardes, dépôt de firmwares, journaux. Une mise
+/// à jour ou une désinstallation n'y touche pas.
+/// `WLED_FLEET_DATA` permet de le déplacer (tests, plusieurs configurations).
+fn ensure_data_dir() -> PathBuf {
+    if let Ok(d) = std::env::var("WLED_FLEET_DATA") {
+        let p = PathBuf::from(d);
+        let _ = std::fs::create_dir_all(&p);
+        return p;
+    }
+    let docs = documents_dir().unwrap_or_else(|| PathBuf::from("."));
+    let dir = docs.join("WLED Fleet");
+    let _ = std::fs::create_dir_all(&dir);
+    dir
+}
+
+#[cfg(windows)]
+fn documents_dir() -> Option<PathBuf> {
+    // USERPROFILE\Documents couvre le cas courant ; si le dossier Documents a été
+    // déplacé (OneDrive, redirection de profil), on suit ce que Windows a posé.
+    if let Some(one) = std::env::var_os("OneDrive") {
+        let p = PathBuf::from(one).join("Documents");
+        if p.is_dir() {
+            return Some(p);
+        }
+    }
+    std::env::var_os("USERPROFILE").map(|h| PathBuf::from(h).join("Documents"))
+}
+#[cfg(not(windows))]
+fn documents_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(|h| PathBuf::from(h).join("Documents"))
+}
+
 fn port_open() -> bool {
     let addr: SocketAddr = ([127, 0, 0, 1], PORT).into();
     TcpStream::connect_timeout(&addr, Duration::from_millis(300)).is_ok()
 }
 
-fn spawn_node(dir: &Path) -> std::io::Result<Child> {
+fn spawn_node(dir: &Path, data: &Path) -> std::io::Result<Child> {
     let mut c = find_node();
     // WLED_FLEET_PARENT_PID: the server exits by itself if this window process
     // disappears without a clean close (killed from the task manager…)
-    c.arg("server.js").current_dir(dir).env("WLED_FLEET_LAUNCHER", "1").env("WLED_FLEET_PARENT_PID", std::process::id().to_string())
+    // WLED_FLEET_DATA : où écrire l'état (voir paths.js côté node) — sans elle,
+    // server.js retombe sur son propre dossier, c'est-à-dire l'ancien
+    // comportement portable.
+    c.arg("server.js").current_dir(dir).env("WLED_FLEET_LAUNCHER", "1").env("WLED_FLEET_DATA", data)
+        .env("WLED_FLEET_PARENT_PID", std::process::id().to_string())
         .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
     #[cfg(windows)]
     {
@@ -131,14 +178,15 @@ struct Sidecar {
     stop: Mutex<bool>,
 }
 
-// ── Portable updater ─────────────────────────────────────────────────────────
-// No installer, no zip: a release is just the signed exe (see
-// desktop/build-release.cmd). `Update::download()` already verifies the
-// minisign signature against the pubkey in tauri.conf.json against the raw
-// exe bytes; we deliberately never call `Update::install()` (it expects a
-// platform installer, which we don't have) and instead swap the running
-// executable ourselves. The new exe re-extracts its own (newer) embedded
-// files next to itself the moment it starts, via ensure_app_dir() above.
+// ── Mise à jour par l'installeur ─────────────────────────────────────────────
+// (2026-09-08) L'app est désormais installée (NSIS, par utilisateur, sans
+// admin) : le remplacement d'exe fait maison a laissé place à `Update::install`,
+// le chemin standard du plugin. Il vérifie la signature minisign contre la clé
+// publique de tauri.conf.json, puis lance l'installeur téléchargé, qui remplace
+// le dossier d'installation et relance l'app.
+// Les données de l'utilisateur ne sont jamais concernées : elles vivent dans
+// « Documents\WLED Fleet » (voir ensure_data_dir), pas dans le dossier
+// d'installation.
 #[derive(Clone, serde::Serialize)]
 struct UpdateInfo {
     version: String,
@@ -156,48 +204,16 @@ async fn check_update(app: tauri::AppHandle) -> Result<Option<UpdateInfo>, Strin
 async fn install_update(app: tauri::AppHandle) -> Result<(), String> {
     let updater = app.updater().map_err(|e| e.to_string())?;
     let update = updater.check().await.map_err(|e| e.to_string())?.ok_or("aucune mise à jour disponible")?;
-    let bytes = update.download(|_, _| {}, || {}).await.map_err(|e| e.to_string())?;
-    let current_exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    swap_and_relaunch(&current_exe, &bytes).map_err(|e| e.to_string())?;
-    // the supervisor's RunEvent::Exit handler stops node cleanly before quitting
+    update.download_and_install(|_, _| {}, || {}).await.map_err(|e| e.to_string())?;
+    // l'installeur relance l'app ; on ferme proprement (RunEvent::Exit arrête node)
     app.exit(0);
     Ok(())
 }
 
-/// Windows allows renaming a running executable's file (just not overwriting
-/// it in place), so: rename the current exe aside as `<name>.old.exe`
-/// (cleaned up on the next launch, see `main()`), write the new bytes in its
-/// place, launch it, and let the caller exit this process. On macOS/Linux the
-/// running binary's inode stays valid after its path is overwritten, so a
-/// plain overwrite + relaunch is enough — left as the fallback branch below;
-/// worth re-checking once this runs as a macOS .app bundle (a directory, not
-/// a single file) rather than a bare binary.
-fn swap_and_relaunch(current_exe: &Path, new_bytes: &[u8]) -> std::io::Result<()> {
-    #[cfg(windows)]
-    {
-        let old = current_exe.with_extension("old.exe");
-        let _ = std::fs::remove_file(&old);
-        std::fs::rename(current_exe, &old)?;
-        std::fs::write(current_exe, new_bytes)?;
-    }
-    #[cfg(not(windows))]
-    {
-        std::fs::write(current_exe, new_bytes)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(current_exe)?.permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(current_exe, perms)?;
-        }
-    }
-    Command::new(current_exe).spawn()?;
-    Ok(())
-}
-
 fn main() {
-    // best-effort cleanup of a previous update's renamed-away executable: by
-    // now nothing has it open any more
+    // reliquat d'une mise à jour de l'ancienne version portable, qui renommait
+    // l'exe en cours en .old.exe — l'installeur ne fait plus ça, mais un poste
+    // migré peut encore en traîner un
     if let Ok(exe) = std::env::current_exe() {
         let old = exe.with_extension("old.exe");
         if old.is_file() {
@@ -207,6 +223,7 @@ fn main() {
 
     let reuse = port_open();
     let dir = if reuse { None } else { ensure_app_dir() };
+    let data = ensure_data_dir();
     let sidecar = Arc::new(Sidecar { child: Mutex::new(None), stop: Mutex::new(false) });
 
     if !reuse {
@@ -216,7 +233,7 @@ fn main() {
                 // or after a crash, stop when the window closes
                 let sc = sidecar.clone();
                 std::thread::spawn(move || loop {
-                    match spawn_node(&dir) {
+                    match spawn_node(&dir, &data) {
                         Ok(child) => {
                             *sc.child.lock().unwrap() = Some(child);
                             let status = loop {

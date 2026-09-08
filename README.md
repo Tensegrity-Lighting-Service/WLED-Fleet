@@ -39,17 +39,25 @@ d'abord l'API WLED et le modèle de données.
   l'enlever). Sans `-Autostart`, le script ne fait que le raccourci du Bureau.
 - Seul prérequis : Node.js 18+ (aucune dépendance npm, rien à installer
   d'autre). Tout le code reste en fichiers clairs dans ce dossier.
-- **Téléchargement** : la [release GitHub](https://github.com/Tensegrity-Lighting-Service/WLED-Fleet/releases)
-  n'a qu'un seul fichier, `WLED-Fleet.exe` — pas de zip, pas d'installateur.
-  Au premier lancement (ou après une mise à jour), il s'extrait lui-même à
-  côté de lui (`server.js`, `columns.js`, `static/`…, l'app y est compilée)
-  et devient alors le même dossier portable qu'avant : l'exe à côté de
-  `settings.json`, `known-nodes.json`, `snapshots/`, `firmware/`… Le dossier
-  entier reste déplaçable à volonté ; rien n'est écrit ailleurs sur le PC.
+- **Installation** (depuis la 0.9.0) : la [release GitHub](https://github.com/Tensegrity-Lighting-Service/WLED-Fleet/releases)
+  fournit `WLED-Fleet_<version>_x64-setup.exe`, un installeur **par
+  utilisateur** — aucun droit administrateur, ni à l'installation ni aux mises
+  à jour. Trois dossiers, chacun avec un rôle net :
+  | | |
+  |---|---|
+  | `%LOCALAPPDATA%\WLED Fleet` | l'app installée, remplacée à chaque mise à jour |
+  | `%LOCALAPPDATA%\WLED-Fleet\app` | le code (server.js, static/…) réextrait de l'exe à chaque nouvelle version — jetable |
+  | `Documents\WLED Fleet` | **tes données** : réglages, flotte connue, profils de LED, sauvegardes, firmwares, journaux |
+  Les données sont volontairement dans Documents : visibles, sauvegardables,
+  et jamais touchées par une mise à jour ni par une désinstallation.
+  `WLED_FLEET_DATA` permet de les mettre ailleurs (tests, plusieurs
+  configurations) ; sans cette variable — donc en lançant `node server.js`
+  directement — tout retombe à côté du code comme avant, ce qui garde le mode
+  portable et les tests inchangés.
 - **Mise à jour** : au démarrage, l'app vérifie discrètement s'il y a une
-  nouvelle version et propose de l'installer : le nouvel exe remplace
-  l'actuel (redémarrage automatique), puis se réextrait lui-même — jamais tes
-  réglages / la flotte connue / les sauvegardes / le dépôt de firmwares. Rien
+  nouvelle version et propose de l'installer ; l'installeur signé remplace le
+  dossier d'installation et relance l'app — jamais tes réglages / la flotte
+  connue / les sauvegardes / le dépôt de firmwares, qui vivent ailleurs. Rien
   de silencieux ni de forcé : un clic pour installer, un clic pour ignorer.
   **Réglages → Application** affiche la version installée et un bouton
   « Vérifier maintenant » qui dit explicitement *à jour*, *version X

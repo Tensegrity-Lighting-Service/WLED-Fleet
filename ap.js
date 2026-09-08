@@ -19,10 +19,11 @@ const dgram = require('dgram');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const { dataFile, codeFile, DATA_DIR, CODE_DIR } = require('./paths');
 
-let CONFIG_FILE = path.join(__dirname, 'ap.json');
+let CONFIG_FILE = dataFile('ap.json');
 // dev/mock runs keep their credentials apart from the real antenna's ap.json
-function setConfigFile(f) { CONFIG_FILE = path.isAbsolute(f) ? f : path.join(__dirname, f); }
+function setConfigFile(f) { CONFIG_FILE = path.isAbsolute(f) ? f : dataFile(f); }
 
 // ── Config: one credential set PER AP, keyed by host ─────────────────────────
 // ap.json = { "active": "192.168.88.1", "interval": 5000, "bindAddress": null,
@@ -318,7 +319,7 @@ function audit(st) {
 // It is the ONE disruptive call of this module: the radio leaves its channel
 // for the scan duration (a few seconds) and clients drop, then re-associate
 // on their own (WLED does within ~5-10 s). Never run it during a show.
-const SCAN_FILE = path.join(__dirname, 'rf-scans.log');
+const SCAN_FILE = dataFile('rf-scans.log');
 let lastScan = null;
 let scanning = false;
 // networks seen by any scan in the last 15 min (a WLED-AP beacons slowly and a

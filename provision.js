@@ -19,6 +19,7 @@ const http = require('http');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const { dataFile, codeFile, DATA_DIR, CODE_DIR } = require('./paths');
 
 const NODE_AP_IP = '4.3.2.1';
 const run = (args, timeout = 15000) => new Promise((resolve, reject) => {
@@ -38,7 +39,7 @@ const grab = (block, re) => { const m = re.exec(block); return m ? m[1].trim() :
 // staying connected, the way NetSpot does. Refreshes the netsh list in ~4 s.
 function triggerScan(waitMs = 4000) {
   return new Promise(resolve => {
-    execFile('powershell', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', path.join(__dirname, 'tools', 'wlan-scan.ps1'), '-WaitMs', String(waitMs)], { timeout: 20000, windowsHide: true }, (err, out) => {
+    execFile('powershell', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', codeFile('tools', 'wlan-scan.ps1'), '-WaitMs', String(waitMs)], { timeout: 20000, windowsHide: true }, (err, out) => {
       let r = null; try { r = JSON.parse(String(out).trim().split('\n').pop()); } catch { /* ignore */ }
       resolve(!err && r && r.ok);
     });
@@ -184,7 +185,7 @@ let job = null; // { status, ssid, log: [], startedAt, result }
 // after a restart, rebuild the last job's trace from pairing.log so the panel still shows it
 (() => {
   try {
-    const lines = fs.readFileSync(path.join(__dirname, 'pairing.log'), 'utf8').trim().split('\n').slice(-60);
+    const lines = fs.readFileSync(dataFile('pairing.log'), 'utf8').trim().split('\n').slice(-60);
     const last = lines.map(l => /^(\S+) \[(\w+) (.*?)\] (.*)$/.exec(l)).filter(Boolean);
     if (!last.length) return;
     const key = last[last.length - 1][3], mode = last[last.length - 1][2];
@@ -206,7 +207,7 @@ async function start(opts, mode = 'pair') {
   if (mode === 'pair' && (!opts.target || !opts.target.ssid)) throw new Error('SSID du réseau cible manquant');
   job = { status: 'running', mode, ssid: opts.ssid, log: [], startedAt: Date.now(), result: null };
   // every line also goes to pairing.log: a server restart must not erase the trace of what happened
-  const logFile = path.join(__dirname, 'pairing.log');
+  const logFile = dataFile('pairing.log');
   const log = m => { job.log.push({ at: Date.now(), m }); console.log(`[appairage] ${m}`); fs.appendFile(logFile, `${new Date().toISOString()} [${mode} ${opts.ssid}] ${m}\n`, () => {}); };
   (async () => {
     let previous = null, staticCfg = null;

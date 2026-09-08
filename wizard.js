@@ -27,11 +27,12 @@ const fs = require('fs');
 const path = require('path');
 const readline = require('readline');
 const ap = require('./ap');
+const { dataFile, codeFile, DATA_DIR, CODE_DIR } = require('./paths');
 
-const BRIDGE = path.join(__dirname, 'tools', 'wizard', 'wizard_bridge.py');
-let CONFIG_FILE = path.join(__dirname, 'wizard.json');
-const SURVEY_FILE = path.join(__dirname, 'wizard-surveys.log');
-const LIVE_FILE = path.join(__dirname, 'wizard-live.log');
+const BRIDGE = codeFile('tools', 'wizard', 'wizard_bridge.py');
+let CONFIG_FILE = dataFile('wizard.json');
+const SURVEY_FILE = dataFile('wizard-surveys.log');
+const LIVE_FILE = dataFile('wizard-live.log');
 const STALE_MS = 60000;        // a network not heard for a minute is out of the snapshot (we moved, or it went off)
 const FORGET_MS = 15 * 60000;  // …and dropped from memory after 15 min
 const SAMPLES = 180;           // per-BSSID RSSI history kept in RAM (~3 min at 1 Hz)
@@ -39,7 +40,7 @@ const LIVE_EVERY_MS = 5000;
 
 // ── Config (wizard.json, git-ignored like ap.json) ───────────────────────────
 let config = { enabled: null, python: null, address: null, name: null, autoconnect: false };
-function setConfigFile(f) { CONFIG_FILE = path.isAbsolute(f) ? f : path.join(__dirname, f); }
+function setConfigFile(f) { CONFIG_FILE = path.isAbsolute(f) ? f : dataFile(f); }
 function loadConfig() {
   try { config = { ...config, ...JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8')) }; } catch { /* none yet */ }
   if (config.enabled == null) config.enabled = !!config.address;   // before the toggle existed: a paired Wizard meant "in use"
@@ -64,7 +65,7 @@ let pythonError = '';
 // system Python to drive pip) bundles a full, bleak-preinstalled Python next to
 // the app ; when present (always, once desktop/build.rs picks it up into the
 // exe) it's tried FIRST, so WiFiman needs no system Python install at all.
-const BUNDLED_PYTHON = path.join(__dirname, 'tools', 'python-embed', 'python.exe');
+const BUNDLED_PYTHON = codeFile('tools', 'python-embed', 'python.exe');
 function candidates() {
   const list = [];
   if (fs.existsSync(BUNDLED_PYTHON)) list.push([BUNDLED_PYTHON]);

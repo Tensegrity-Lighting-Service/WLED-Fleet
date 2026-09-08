@@ -16,8 +16,9 @@
 const fs = require('fs');
 const path = require('path');
 const http = require('http');
+const { dataFile, codeFile, DATA_DIR, CODE_DIR } = require('./paths');
 
-const DIR = path.join(__dirname, 'snapshots');
+const DIR = dataFile('snapshots');
 const safeId = s => String(s || '').replace(/[^\w.-]+/g, '_').slice(0, 80);
 
 function ensureDir() { fs.mkdirSync(DIR, { recursive: true }); }

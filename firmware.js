@@ -19,9 +19,10 @@ const https = require('https');
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
+const { dataFile, codeFile, DATA_DIR, CODE_DIR } = require('./paths');
 
 const REPO = 'wled/WLED';
-const STORE = path.join(__dirname, 'firmware');
+const STORE = dataFile('firmware');
 const INDEX = path.join(STORE, 'index.json');
 const ASSET_RE = /^WLED_([^_]+)_(.+)\.bin$/; // WLED_<version>_<env>.bin (skip .bin.gz)
 
