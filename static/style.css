@@ -170,6 +170,7 @@
   table.outs.noadv th.adv,table.outs.noadv td.adv{display:none}
   /* chaînage : ⛓ = pixels collés à la sortie du dessus (une seule fixture), ⊘ = sortie seule */
   table.outs td.pickcell{width:24px;text-align:center;padding:0 2px} table.outs td.pickcell input{margin:0;cursor:pointer}
+  .gtable>details>summary .gpick{padding:2px 8px;font-size:11px}
   table.outs tr.selected>td:not(.ncell){background:var(--sel)}
   table.outs td.chaincell{width:26px;text-align:center;padding:0 2px;cursor:pointer;color:var(--muted);user-select:none} table.outs td.chaincell:hover{background:var(--chip)}
   table.outs td.chaincell.linked{color:var(--info)} table.outs tr.chained td.oc-addr .addr{opacity:.72}

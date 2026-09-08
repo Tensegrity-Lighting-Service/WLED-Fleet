@@ -1187,7 +1187,9 @@
       const gi = gCards.indexOf(gc);
       const ap = ns.length ? `<button class="rowbtn" data-autopatch="${gi}" title="recalcule les départs, les univers et les adresses de ce groupe — et de lui seul. Un récapitulatif node par node s'affiche d'abord : rien n'est modifié tant que tu n'as pas choisi, et rien n'est écrit tant que tu n'as pas cliqué Enregistrer.">⚡ Patcher…</button>` : '';
       const advBtn = `<button class="rowbtn" data-adv="${gi}" title="afficher / masquer les colonnes de réglage rares : pin, mA/LED, skip, off refresh">⚙</button>`;
-      const pickBtn = `<button class="rowbtn" data-pickall="${gi}" title="cocher / décocher toutes les sorties de ce groupe, pour les régler d'un coup">☑</button>`;
+      // vraie case (et pas un bouton) : elle montre aussi l'état du groupe —
+      // cochée = tout, trait = une partie, vide = rien
+      const pickBtn = `<label class="chip gpick" title="cocher / décocher toutes les sorties de ce groupe, pour les régler d'un coup"><input type="checkbox" data-pickall="${gi}"> tout</label>`;
       const summary = `<summary><span class="caret">▸</span> ${gc.g ? `<b>${esc(gc.g)}</b> <span class="muted">${gc.nodes.length} node${gc.nodes.length > 1 ? 's' : ''}${ns.length ? ` · univers ${minU}–${maxU} · ${total} px` : ''}</span>` : `<span class="muted">node solo${ns.length ? ` · univers ${minU}–${maxU} · ${total} px` : ''}</span>`} <span class="st-bad gcf" data-gi="${gi}" ${conf ? '' : 'hidden'}>✗ conflit</span> ${ap}${pickBtn}${advBtn}</summary>`;
       return `<div class="gtable"><details data-key="dmx:${esc(gc.g || ('solo:' + gc.nodes[0].ip))}" open>${summary}<div style="overflow-x:auto"><table class="outs noadv" data-gi="${gi}">${head}<tbody>${body}</tbody></table></div></details></div>`;
     };
@@ -1342,23 +1344,36 @@
       const html = `<b>☑ ${rows.length} sortie${rows.length > 1 ? 's' : ''}</b> <span class="muted">sur ${nodes} node${nodes > 1 ? 's' : ''} · modifier un champ sur une ligne cochée l'applique à toutes</span><span class="spacer"></span><button id="pickClear">Tout décocher</button>`;
       if (bar) bar.innerHTML = html;
       else { const b2 = document.createElement('div'); b2.id = 'pickbar'; b2.className = 'locbar'; b2.style.bottom = locating ? '62px' : '10px'; b2.innerHTML = html; document.body.appendChild(b2); }
-      $('#pickClear').onclick = () => { picks.clear(); p.querySelectorAll('input[data-pick]').forEach(c => { c.checked = false; c.closest('tr').classList.remove('selected'); }); refreshPickBar(); };
+      $('#pickClear').onclick = () => { picks.clear(); p.querySelectorAll('input[data-pick]').forEach(c => { c.checked = false; c.closest('tr').classList.remove('selected'); }); syncGroupPicks(); refreshPickBar(); };
     };
+    const groupBoxes = gi => { const ips = new Set(gCards[gi].nodes.map(n => n.ip)); return [...p.querySelectorAll('input[data-pick]')].filter(c => ips.has(c.dataset.pick.slice(0, c.dataset.pick.lastIndexOf('|')))); };
+    // la case du groupe reflète ses lignes : cochée si toutes le sont, indéterminée si une partie
+    const syncGroupPicks = () => p.querySelectorAll('input[data-pickall]').forEach(cb => {
+      const boxes = groupBoxes(Number(cb.dataset.pickall));
+      const n = boxes.filter(c => c.checked).length;
+      cb.checked = boxes.length > 0 && n === boxes.length;
+      cb.indeterminate = n > 0 && n < boxes.length;
+    });
     p.querySelectorAll('input[data-pick]').forEach(cb => cb.onchange = () => {
       cb.checked ? picks.add(cb.dataset.pick) : picks.delete(cb.dataset.pick);
       cb.closest('tr').classList.toggle('selected', cb.checked);
-      refreshPickBar();
+      syncGroupPicks(); refreshPickBar();
     });
-    p.querySelectorAll('button[data-pickall]').forEach(b => b.onclick = e => {
-      e.preventDefault(); e.stopPropagation(); // dans un <summary> : ne pas replier le groupe
-      const gc = gCards[Number(b.dataset.pickall)];
-      const ips = new Set(gc.nodes.map(n => n.ip));
-      const boxes = [...p.querySelectorAll('input[data-pick]')].filter(c => ips.has(c.dataset.pick.split('|')[0]));
-      const on = !boxes.every(c => c.checked); // tout coché -> on décoche
-      boxes.forEach(c => { c.checked = on; on ? picks.add(c.dataset.pick) : picks.delete(c.dataset.pick); c.closest('tr').classList.toggle('selected', on); });
-      refreshPickBar();
+    p.querySelectorAll('input[data-pickall]').forEach(cb => {
+      // dans un <summary> : empêcher le repli du groupe, sans preventDefault qui
+      // annulerait la coche elle-même
+      cb.onclick = e => e.stopPropagation();
+      cb.onchange = e => {
+        e.stopPropagation();
+        const on = cb.checked;
+        groupBoxes(Number(cb.dataset.pickall)).forEach(c => {
+          c.checked = on; on ? picks.add(c.dataset.pick) : picks.delete(c.dataset.pick);
+          c.closest('tr').classList.toggle('selected', on);
+        });
+        syncGroupPicks(); refreshPickBar();
+      };
     });
-    refreshPickBar();
+    syncGroupPicks(); refreshPickBar();
     // "comptée" checkboxes: Fleet-only, saved at once, conflicts recomputed
     p.querySelectorAll('input[data-ignore]').forEach(cb => cb.onchange = async () => {
       const ip = cb.closest('tr').dataset.node;
