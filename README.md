@@ -51,6 +51,12 @@ d'abord l'API WLED et le modèle de données.
   l'actuel (redémarrage automatique), puis se réextrait lui-même — jamais tes
   réglages / la flotte connue / les sauvegardes / le dépôt de firmwares. Rien
   de silencieux ni de forcé : un clic pour installer, un clic pour ignorer.
+  **Réglages → Application** affiche la version installée et un bouton
+  « Vérifier maintenant » qui dit explicitement *à jour*, *version X
+  disponible*, ou **l'erreur exacte**. Sans ça, « déjà à jour » et « cassé » se
+  ressemblaient trait pour trait (aucune fenêtre dans les deux cas), ce qui a
+  fait conclure plusieurs fois à une panne alors que l'app était simplement à
+  jour — ajouté le 2026-09-08.
 
 ## Réseau : changement de carte, perte de connexion, nodes égarés
 
@@ -274,14 +280,36 @@ recalculée en direct pendant la saisie. « Enregistrer les sorties » renvoie l
 bloc `hw.led.ins` complet (WLED le reconstruit ; les champs non édités d'une
 sortie existante sont conservés) après une sauvegarde automatique de la
 flotte. Endpoint : `POST /api/node/:ip/outputs {ins}`.
-- **📍 Repérer le dernier pixel** (à côté du champ Pixels) : allume la sortie
-  en vrai sur le node — dernier pixel en blanc, le reste en bleu léger —
-  pour voir où il tombe physiquement pendant qu'on ajuste le nombre de
-  pixels (les sorties collées après celle-ci sont décalées d'autant, pour ne
-  jamais empiéter dessus ; le sens *inversé* est pris en compte, le marqueur
-  reste le pixel physiquement le plus loin). Un nouvel « Enregistrer » ou un
-  changement d'onglet restaure l'état exact d'avant repérage.
-  Endpoints : `POST`/`DELETE /api/node/:ip/locate-pixel`.
+- **📍 Repérer le dernier pixel** (à côté du champ Pixels) : allume la sortie en
+  vrai sur le node pour compter ses pixels en direct. À l'activation, la sortie
+  est portée **une seule fois** à une longueur d'exploration qui couvre tout le
+  ruban (défaut : le double de la longueur actuelle, minimum 200 px, réglable
+  dans la barre) ; le ruban est alors découpé en **trois zones** — en dessous du
+  repère, le repère, et au-delà en 3ᵉ couleur, qui montre où le ruban continue.
+  Une **barre flottante** apparaît : boutons −10 / −1 / +1 / +10, les trois
+  couleurs, la luminosité, la longueur explorée, et Arrêter. Les couleurs sont
+  mémorisées par navigateur (`localStorage`), pas dans `settings.json` : celui-ci
+  impose un redémarrage du serveur, impensable pour régler une couleur en
+  regardant le ruban.
+  Comme le bus couvre tout le ruban en permanence, **aucun pixel ne peut rester
+  allumé** en sortant de la chaîne — c'était le défaut d'avant, où chaque
+  changement réécrivait la longueur et abandonnait les pixels au-delà avec leur
+  dernière couleur (corrigé le 2026-09-08). Effet de bord bienvenu : plus aucune
+  écriture de config à chaque frappe, donc un repère bien plus réactif et deux
+  écritures flash par session au lieu d'une par frappe.
+  Les sorties collées après celle-ci sont décalées le temps du repérage (leurs
+  rubans restent éteints) ; le sens *inversé* est pris en compte, les trois zones
+  étant alors l'image miroir exacte. Un nouvel « Enregistrer », un changement
+  d'onglet ou 90 s sans commande restaurent l'état exact d'avant repérage.
+  Endpoints : `POST`/`DELETE /api/node/:ip/locate-pixel`
+  (`{index, len, rev, hi, lo, over, bri, probe}`).
+- **Édition en lot** : la colonne de cases à cocher tout à gauche (et le ☑ d'un
+  groupe pour tout cocher). Dès qu'une ligne est cochée, modifier un champ sur
+  l'une d'elles applique la valeur à **toutes les lignes cochées** : type,
+  mA/LED, ordre, swap W, pixels, inversée, skip, off refresh — et mode DMX /
+  mA max côté node. Le **départ** ne se propage jamais (chaque sortie a le sien :
+  c'est le rôle de ⚡ Patcher), ni l'univers ni l'adresse. Comme partout ici,
+  rien n'est écrit : c'est « Enregistrer les modifications » qui décide.
 Dans WLED l'univers d'une sortie **n'est pas un réglage** : il découle du point
 de départ du node (`dmx.uni` / `dmx.addr`) et de la longueur des sorties qui
 précèdent. **Sorties non comptées** (case « sortie N » décochée) : purement

@@ -131,6 +131,25 @@
   .sig{display:inline-block;width:46px;height:8px;background:var(--line);border-radius:4px;overflow:hidden;vertical-align:middle;margin-right:6px}
   .sig i{display:block;height:100%}
   .fwcols{display:grid;grid-template-columns:1fr 1fr;gap:18px}
+  /* en-tête de l'onglet figée : .tabpane est le conteneur de défilement, donc un
+     sticky suffit — les marges négatives couvrent son padding latéral, sinon le
+     contenu défile visiblement dans les 14 px de marge */
+  /* top:-8px, pas 0 : le sticky s'ancre sur la boîte de padding du conteneur, donc
+     top:0 laissait défiler le contenu dans les 8 px de padding au-dessus de l'en-tête */
+  #dmxpanel h2{position:sticky;top:-8px;z-index:6;background:var(--panel);margin:-8px -14px 8px;padding:8px 14px;border-bottom:1px solid var(--line)}
+  .mono{font-family:ui-monospace,Consolas,monospace;font-size:11px}
+  /* barre du repérage / de la sélection : contrairement aux .pop, elle survit aux
+     clics dans la page — on édite le tableau pendant qu'elle est ouverte */
+  .locbar{position:fixed;left:50%;transform:translateX(-50%);bottom:10px;z-index:20;display:flex;align-items:center;gap:12px;flex-wrap:wrap;max-width:calc(100vw - 24px);
+    background:var(--panel);border:1px solid var(--line2);border-radius:10px;padding:7px 12px;box-shadow:0 8px 26px rgba(0,0,0,.45);font-size:12px}
+  .locbar .locgrp{display:inline-flex;align-items:center;gap:5px}
+  .locbar label{display:inline-flex;align-items:center;gap:4px;color:var(--muted)}
+  .locbar button{padding:3px 9px;font-size:12px;border-radius:6px}
+  .locbar button[data-step]{min-width:34px;font-variant-numeric:tabular-nums}
+  .locbar input[type=number]{width:64px;height:24px;padding:0 5px;font:inherit;text-align:right}
+  .locbar #locLen{width:70px;font-weight:600}
+  .locbar input[type=color]{width:26px;height:22px;padding:0;border:1px solid var(--line2);border-radius:4px;background:none;cursor:pointer}
+  .locbar input[type=range]{width:80px}
   .gtable{margin:0 0 12px} .gtable .gc-title{padding:6px 2px;font-size:13px}
   /* groupes repliables : le résumé reste lisible une fois fermé */
   .gtable>details>summary{list-style:none;cursor:pointer;padding:6px 2px;border-radius:6px} .gtable>details>summary::-webkit-details-marker{display:none}
@@ -150,6 +169,8 @@
   /* colonnes avancées : masquées tant que ⚙ n'est pas coché */
   table.outs.noadv th.adv,table.outs.noadv td.adv{display:none}
   /* chaînage : ⛓ = pixels collés à la sortie du dessus (une seule fixture), ⊘ = sortie seule */
+  table.outs td.pickcell{width:24px;text-align:center;padding:0 2px} table.outs td.pickcell input{margin:0;cursor:pointer}
+  table.outs tr.selected>td:not(.ncell){background:var(--sel)}
   table.outs td.chaincell{width:26px;text-align:center;padding:0 2px;cursor:pointer;color:var(--muted);user-select:none} table.outs td.chaincell:hover{background:var(--chip)}
   table.outs td.chaincell.linked{color:var(--info)} table.outs tr.chained td.oc-addr .addr{opacity:.72}
   .chainmark{font-size:13px;line-height:1}

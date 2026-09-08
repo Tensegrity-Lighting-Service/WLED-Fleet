@@ -120,17 +120,37 @@
   // Pas d'installateur : main.rs télécharge l'archive signée, l'extrait et remplace les
   // fichiers de code sur place, puis relance l'app. Un seul essai au démarrage, silencieux
   // hors ligne / hors app native / sans manifeste publié.
-  async function checkAppUpdate() {
-    if (!window.__TAURI__) return;
+  // Le résultat est CONSERVÉ ici, pas jeté : sans lui, « déjà à jour » et « cassé »
+  // se ressemblent exactement (aucune popup dans les deux cas), ce qui a fait
+  // conclure trois fois à une panne alors que l'app était simplement à jour.
+  // Le panneau Réglages l'affiche et permet de revérifier à la demande.
+  let updateState = { at: 0, status: 'jamais', version: null, notes: '', error: '' };
+  async function runUpdateCheck() {
+    if (!window.__TAURI__) { updateState = { at: Date.now(), status: 'navigateur', version: null, notes: '', error: '' }; return updateState; }
     try {
       const info = await window.__TAURI__.core.invoke('check_update');
-      if (!info) return;
-      const notes = (info.notes || '').trim().slice(0, 300);
-      const go = await confirmBox(`Mise à jour WLED Fleet ${info.version} disponible${notes ? '\n' + notes : ''}`, { tone: 'green', label: 'Installer' });
-      if (!go) return;
-      toast('téléchargement et installation de la mise à jour…', false, 15000);
-      await window.__TAURI__.core.invoke('install_update'); // l'app relance elle-même une fois prête
-    } catch (e) { /* hors ligne, pas de manifeste publié, ou déjà à jour : silencieux */ }
+      updateState = info
+        ? { at: Date.now(), status: 'disponible', version: info.version, notes: (info.notes || '').trim(), error: '' }
+        : { at: Date.now(), status: 'ajour', version: null, notes: '', error: '' };
+    } catch (e) {
+      updateState = { at: Date.now(), status: 'erreur', version: null, notes: '', error: e && e.message ? e.message : String(e) };
+    }
+    return updateState;
+  }
+  async function installAppUpdate() {
+    toast('téléchargement et installation de la mise à jour…', false, 15000);
+    await window.__TAURI__.core.invoke('install_update'); // l'app relance elle-même une fois prête
+  }
+  // au démarrage : propose seulement s'il y a vraiment quelque chose, sans jamais
+  // ouvrir de popup d'erreur au lancement (hors ligne = silencieux, mais consigné)
+  async function checkAppUpdate() {
+    if (!window.__TAURI__) return;
+    const st = await runUpdateCheck();
+    if (st.status !== 'disponible') return;
+    const notes = st.notes.slice(0, 300);
+    const go = await confirmBox(`Mise à jour WLED Fleet ${st.version} disponible${notes ? '\n' + notes : ''}`, { tone: 'green', label: 'Installer' });
+    if (!go) return;
+    try { await installAppUpdate(); } catch (e) { toast(`mise à jour : ${e.message || e}`, true); }
   }
 
   // ── data ───────────────────────────────────────────────────────────────────
@@ -1011,15 +1031,66 @@
 
   // ── DMX plan: universe.address of every output, content of every universe ──
   let dmxOpen = false;
-  // « localiser » : allume juste le dernier pixel d'une sortie (blanc, le reste
-  // en bleu léger) sur le vrai node, pour compter en direct en ajustant Pixels.
-  // Une seule sortie à la fois ; le serveur restaure tout seul après 90 s
-  // d'inactivité si on part sans cliquer Arrêter.
+  // « repérer » : le serveur porte la sortie à une longueur d'exploration et
+  // découpe le ruban en trois tons — en dessous du repère, le repère, au-delà —
+  // pour compter en direct en ajustant Pixels. Une seule sortie à la fois ; le
+  // serveur restaure tout seul après 90 s d'inactivité si on part sans arrêter.
+  // Les couleurs vivent dans localStorage : settings.json impose un redémarrage
+  // du serveur et réécrit tout le fichier, impensable pour régler une couleur en
+  // regardant le ruban.
+  const LOC_DEF = { hi: '#ffffff', lo: '#3060ff', over: '#3a0a00', bri: 255, probe: 0 };
+  const locPref = (k) => { try { const v = localStorage.getItem('wf.locate' + k); return v === null ? LOC_DEF[k.toLowerCase()] : (k === 'Bri' || k === 'Probe' ? Number(v) : v); } catch { return LOC_DEF[k.toLowerCase()]; } };
+  const setLocPref = (k, v) => { try { localStorage.setItem('wf.locate' + k, String(v)); } catch { /* ignore */ } };
+  let locOpts = { hi: locPref('Hi'), lo: locPref('Lo'), over: locPref('Over'), bri: locPref('Bri'), probe: locPref('Probe') };
   let locating = null; // { ip, index }
+  let locBar = null;   // poignée de la barre flottante (setLen / setProbe)
+  // Édition en lot : lignes cochées, clés "ip|outrow". Survit aux re-rendus du
+  // panneau, comme `locating`. Modifier un champ sur une ligne cochée applique la
+  // même valeur à toutes les autres — sans jamais écrire : c'est « Enregistrer les
+  // modifications » qui décide, exactement comme ⚡ Patcher.
+  const picks = new Set();
   async function stopLocating() {
     if (!locating) return;
+    closeLocBar(); locBar = null;
     const ip = locating.ip; locating = null;
     try { await api(`/api/node/${encodeURIComponent(ip)}/locate-pixel`, { method: 'DELETE' }); } catch { /* déjà éteint, ou node parti */ }
+  }
+  // Barre du repérage : elle doit survivre pendant qu'on édite le tableau, donc pas
+  // un .pop (tous se ferment au premier clic extérieur). Les ± sont le geste
+  // principal du mode : on regarde le ruban, pas l'écran.
+  function closeLocBar() { const b = $('#locbar'); if (b) b.remove(); }
+  function openLocBar(name, outNo, onStep, onOpts, onStop) {
+    closeLocBar();
+    const bar = document.createElement('div');
+    bar.id = 'locbar'; bar.className = 'locbar';
+    bar.innerHTML = `<b>📍 ${esc(name)}</b> <span class="muted">sortie ${outNo}</span>
+      <span class="locgrp"><button data-step="-10" title="−10 pixels">−10</button><button data-step="-1" title="−1 pixel">−1</button>
+        <input type="number" id="locLen" min="1" title="nombre de pixels comptés"><button data-step="1" title="+1 pixel">+1</button><button data-step="10" title="+10 pixels">+10</button></span>
+      <span class="locgrp" title="couleurs du repérage, mémorisées pour la prochaine fois">
+        <label>repère <input type="color" id="locHi" value="${esc(locOpts.hi)}"></label>
+        <label>en dessous <input type="color" id="locLo" value="${esc(locOpts.lo)}"></label>
+        <label>au-delà <input type="color" id="locOver" value="${esc(locOpts.over)}"></label></span>
+      <label class="locgrp" title="luminosité du node pendant le repérage">lum. <input type="range" id="locBri" min="8" max="255" value="${Number(locOpts.bri) || 255}"></label>
+      <label class="locgrp" title="longueur temporairement déclarée sur la sortie pour pouvoir piloter tout le ruban : monter si le ruban est plus long">explorer <input type="number" id="locProbe" min="1" max="2048" style="width:64px"> px</label>
+      <span class="spacer"></span><button id="locStop" class="primary">Arrêter</button>`;
+    document.body.appendChild(bar);
+    const lenEl = bar.querySelector('#locLen');
+    bar.querySelectorAll('button[data-step]').forEach(b => {
+      let rep = null, timer = null;
+      const fire = () => onStep(Number(b.dataset.step));
+      b.onmousedown = () => { fire(); timer = setTimeout(() => { rep = setInterval(fire, 90); }, 420); }; // répétition si on maintient
+      const stop = () => { clearTimeout(timer); clearInterval(rep); rep = null; };
+      b.onmouseup = b.onmouseleave = stop;
+    });
+    lenEl.oninput = () => onStep(0, Number(lenEl.value));
+    const pushOpts = () => {
+      locOpts = { hi: bar.querySelector('#locHi').value, lo: bar.querySelector('#locLo').value, over: bar.querySelector('#locOver').value, bri: Number(bar.querySelector('#locBri').value), probe: Number(bar.querySelector('#locProbe').value) || 0 };
+      setLocPref('Hi', locOpts.hi); setLocPref('Lo', locOpts.lo); setLocPref('Over', locOpts.over); setLocPref('Bri', locOpts.bri); setLocPref('Probe', locOpts.probe);
+      onOpts();
+    };
+    ['#locHi', '#locLo', '#locOver', '#locBri', '#locProbe'].forEach(s => { bar.querySelector(s).oninput = pushOpts; });
+    bar.querySelector('#locStop').onclick = onStop;
+    return { setLen: v => { lenEl.value = String(v); }, setProbe: v => { const e = bar.querySelector('#locProbe'); if (document.activeElement !== e) e.value = String(v); } };
   }
   async function renderDmx() {
     const p = $('#dmxpanel');
@@ -1081,7 +1152,9 @@
       const wsw = (r.order || 0) >> 4, hasW = WHITE_SWAP_TYPES.includes(Number(r.type));
       // la colonne de chaînage passe AVANT la cellule de node (qui porte le rowspan) :
       // l'ordre doit suivre celui des <th>, sinon tout le tableau glisse d'une colonne
-      return `<tr data-outrow="${i}" data-node="${esc(n.ip)}" class="${o.ignored ? 'offline' : ''}${first ? ' first' : ''}${linked ? ' chained' : ''}">
+      const pk = `${n.ip}|${i}`, picked = picks.has(pk);
+      return `<tr data-outrow="${i}" data-node="${esc(n.ip)}" class="${o.ignored ? 'offline' : ''}${first ? ' first' : ''}${linked ? ' chained' : ''}${picked ? ' selected' : ''}">
+        <td class="pickcell"><input type="checkbox" data-pick="${esc(pk)}" ${picked ? 'checked' : ''} title="cocher plusieurs lignes, puis modifier un champ sur l'une d'elles : la valeur part sur toutes les lignes cochées"></td>
         <td class="chaincell${linked ? ' linked' : ''}" data-chain="${i}" title="${i === 0 ? 'première sortie du node : rien au-dessus à quoi la chaîner' : linked ? 'chaînée : ses pixels reprennent juste après ceux de la sortie du dessus, les deux forment une seule fixture continue à la console. Cliquer pour la détacher (elle repartira sur un début d\'univers).' : 'sortie seule. Cliquer pour la chaîner à celle du dessus : ses pixels reprendront juste après, sans trou — le cas de deux sorties d\'un même assemblage (tournette int + ext).'}">${i === 0 ? '' : `<span class="chainmark">${linked ? '⛓' : '⊘'}</span>`}</td>
         ${first ? nodeCell(n, span) : ''}
         <td><label class="chip" title="utilisée = câblée. Décocher une sortie qui existe dans WLED mais n'est pas branchée : grisée, et les canaux qu'elle occuperait ne sont plus réservés (hors conflits). Mémorisé sur le node (marqueur dans son MQTT device topic), rien d'autre n'est écrit."><input type="checkbox" data-ignore="${i}" ${o.ignored ? '' : 'checked'}> Sortie ${o.i + 1}</label></td>
@@ -1099,13 +1172,13 @@
         <td class="oc-addr"><span class="addr"><b>${esc(o.from || '')}</b> → <b>${esc(o.to || '')}</b></span> <span class="straddle">${uniTxt}</span></td></tr>`;
     };
     const groupTable = gc => {
-      const head = `<thead><tr><th title="chaînage : ⛓ pixels collés à la sortie du dessus (une seule fixture), ⊘ sortie seule"></th><th>Node</th><th>Sortie</th><th title="profil de LED : type + ordre + pixels mémorisés sous un nom">Profil</th><th class="adv">Pin</th><th>Type</th><th class="adv" title="Auto Brightness Limiter : mA par LED à pleine luminosité, pour estimer/limiter la consommation">mA/LED</th><th>Ordre</th><th title="échange du canal blanc (WLED : Swap) — proposé seulement sur les types numériques à canal blanc">Swap W</th><th title="index du premier pixel dans le node (0 = premier)">Départ</th><th title="pixels sur ce câble ; 📏 = calculateur, 📍 = repérer le dernier pixel">Pixels</th><th title="sens de parcours du ruban">Inv.</th><th class="adv">Skip</th><th class="adv">Off Refresh</th><th title="univers.canal du premier et du dernier pixel : ce qu'il faut patcher à la console (recalculé en direct)">Adresse console (de → à)</th></tr></thead>`;
+      const head = `<thead><tr><th title="sélection pour l'édition en lot"></th><th title="chaînage : ⛓ pixels collés à la sortie du dessus (une seule fixture), ⊘ sortie seule"></th><th>Node</th><th>Sortie</th><th title="profil de LED : type + ordre + pixels mémorisés sous un nom">Profil</th><th class="adv">Pin</th><th>Type</th><th class="adv" title="Auto Brightness Limiter : mA par LED à pleine luminosité, pour estimer/limiter la consommation">mA/LED</th><th>Ordre</th><th title="échange du canal blanc (WLED : Swap) — proposé seulement sur les types numériques à canal blanc">Swap W</th><th title="index du premier pixel dans le node (0 = premier)">Départ</th><th title="pixels sur ce câble ; 📏 = calculateur, 📍 = repérer le dernier pixel">Pixels</th><th title="sens de parcours du ruban">Inv.</th><th class="adv">Skip</th><th class="adv">Off Refresh</th><th title="univers.canal du premier et du dernier pixel : ce qu'il faut patcher à la console (recalculé en direct)">Adresse console (de → à)</th></tr></thead>`;
       const NCOL = 15; // colonnes après la cellule Node
       const body = gc.nodes.map(n => {
         const pl = n.plan; const rec = nodeRec(n.ip); const rawIns = (rec && rec.cfg && rec.cfg.hw && rec.cfg.hw.led && rec.cfg.hw.led.ins) || [];
-        if (!pl.multi) return `<tr data-node="${esc(n.ip)}"><td class="chaincell"></td>${nodeCell(n, 1)}<td colspan="${NCOL - 1}" class="muted">mode ${esc(modeName(pl.mode))} : ${esc(pl.note)}</td></tr>`;
+        if (!pl.multi) return `<tr data-node="${esc(n.ip)}"><td class="pickcell"></td><td class="chaincell"></td>${nodeCell(n, 1)}<td colspan="${NCOL - 1}" class="muted">mode ${esc(modeName(pl.mode))} : ${esc(pl.note)}</td></tr>`;
         const outs = pl.outputs; const span = Math.max(1, outs.length);
-        if (!outs.length) return `<tr data-node="${esc(n.ip)}"><td class="chaincell"></td>${nodeCell(n, 1)}<td colspan="${NCOL - 1}" class="muted">aucune sortie déclarée</td></tr>`;
+        if (!outs.length) return `<tr data-node="${esc(n.ip)}"><td class="pickcell"></td><td class="chaincell"></td>${nodeCell(n, 1)}<td colspan="${NCOL - 1}" class="muted">aucune sortie déclarée</td></tr>`;
         return outs.map((o, i) => outRow(n, o, rawIns[i] || {}, i, i === 0, span)).join('');
       }).join('');
       const ns = gc.nodes.filter(n => n.plan.multi);
@@ -1114,7 +1187,8 @@
       const gi = gCards.indexOf(gc);
       const ap = ns.length ? `<button class="rowbtn" data-autopatch="${gi}" title="recalcule les départs, les univers et les adresses de ce groupe — et de lui seul. Un récapitulatif node par node s'affiche d'abord : rien n'est modifié tant que tu n'as pas choisi, et rien n'est écrit tant que tu n'as pas cliqué Enregistrer.">⚡ Patcher…</button>` : '';
       const advBtn = `<button class="rowbtn" data-adv="${gi}" title="afficher / masquer les colonnes de réglage rares : pin, mA/LED, skip, off refresh">⚙</button>`;
-      const summary = `<summary><span class="caret">▸</span> ${gc.g ? `<b>${esc(gc.g)}</b> <span class="muted">${gc.nodes.length} node${gc.nodes.length > 1 ? 's' : ''}${ns.length ? ` · univers ${minU}–${maxU} · ${total} px` : ''}</span>` : `<span class="muted">node solo${ns.length ? ` · univers ${minU}–${maxU} · ${total} px` : ''}</span>`} <span class="st-bad gcf" data-gi="${gi}" ${conf ? '' : 'hidden'}>✗ conflit</span> ${ap}${advBtn}</summary>`;
+      const pickBtn = `<button class="rowbtn" data-pickall="${gi}" title="cocher / décocher toutes les sorties de ce groupe, pour les régler d'un coup">☑</button>`;
+      const summary = `<summary><span class="caret">▸</span> ${gc.g ? `<b>${esc(gc.g)}</b> <span class="muted">${gc.nodes.length} node${gc.nodes.length > 1 ? 's' : ''}${ns.length ? ` · univers ${minU}–${maxU} · ${total} px` : ''}</span>` : `<span class="muted">node solo${ns.length ? ` · univers ${minU}–${maxU} · ${total} px` : ''}</span>`} <span class="st-bad gcf" data-gi="${gi}" ${conf ? '' : 'hidden'}>✗ conflit</span> ${ap}${pickBtn}${advBtn}</summary>`;
       return `<div class="gtable"><details data-key="dmx:${esc(gc.g || ('solo:' + gc.nodes[0].ip))}" open>${summary}<div style="overflow-x:auto"><table class="outs noadv" data-gi="${gi}">${head}<tbody>${body}</tbody></table></div></details></div>`;
     };
     const cards = gCards.map(groupTable).join('');
@@ -1217,13 +1291,74 @@
         boundary += rowVals(rows[j]).len;
       }
     };
+    // ── édition en lot : la valeur saisie sur une ligne cochée part sur toutes les autres
+    // `start` ne se propage JAMAIS (chaque sortie a le sien : c'est le rôle de ⚡ Patcher),
+    // ni dmxuni / dmxaddr côté node, pour la même raison.
+    const BULK_OUT = ['type', 'ledma', 'order', 'wswap', 'len', 'rev', 'skip', 'ref'];
+    const BULK_NB = ['dmxmode', 'maxpwr'];
+    const pickedRows = () => [...p.querySelectorAll('tr[data-outrow]')].filter(tr => picks.has(`${tr.dataset.node}|${tr.dataset.outrow}`));
+    const propagate = (el, tr) => {
+      const field = el.dataset.out, nb = el.dataset.nb;
+      if (!picks.size) return 0;
+      const isCb = el.type === 'checkbox';
+      const val = isCb ? el.checked : el.value;
+      let n = 0;
+      if (field && BULK_OUT.includes(field) && picks.has(`${tr.dataset.node}|${tr.dataset.outrow}`)) {
+        for (const other of pickedRows()) {
+          if (other === tr) continue;
+          const t = other.querySelector(`[data-out=${field}]`); if (!t) continue;
+          if (isCb) { if (t.checked === val) continue; t.checked = val; } else { if (String(t.value) === String(val)) continue; t.value = String(val); }
+          if (field === 'len') pushChained(other);
+          n++;
+        }
+      } else if (nb && BULK_NB.includes(nb)) {
+        const ips = new Set(pickedRows().map(x => x.dataset.node));
+        const me = (el.closest('[data-nodecell]') || {}).dataset;
+        if (!me || !ips.has(me.nodecell)) return 0;
+        for (const ip of ips) {
+          if (ip === me.nodecell) continue;
+          const t = p.querySelector(`[data-nodecell="${CSS.escape(ip)}"] [data-nb="${nb}"]`); if (!t) continue;
+          if (String(t.value) === String(val)) continue;
+          t.value = String(val); n++;
+        }
+      }
+      if (n) { for (const ip of new Set(pickedRows().map(x => x.dataset.node))) recompute(ip); toast(`appliqué à ${n + 1} ligne(s)`); }
+      return n;
+    };
     p.querySelectorAll('[data-out],[data-nb]').forEach(el => { el.oninput = el.onchange = () => {
       const tr = el.closest('tr');
       if (tr && tr.dataset.node && (el.dataset.out === 'len' || el.dataset.out === 'start')) pushChained(tr);
+      if (tr) propagate(el, tr);
       if (tr && tr.dataset.node) recompute(tr.dataset.node);
       refreshDirty(); renderConflicts();
       if (tr && (el.dataset.out === 'len' || el.dataset.out === 'rev')) sendLocateUpdate(tr);
     }; });
+    // cases de sélection : ligne par ligne, et ☑ par groupe
+    const refreshPickBar = () => {
+      const rows = pickedRows();
+      const bar = $('#pickbar');
+      if (!rows.length) { if (bar) bar.remove(); return; }
+      const nodes = new Set(rows.map(r => r.dataset.node)).size;
+      const html = `<b>☑ ${rows.length} sortie${rows.length > 1 ? 's' : ''}</b> <span class="muted">sur ${nodes} node${nodes > 1 ? 's' : ''} · modifier un champ sur une ligne cochée l'applique à toutes</span><span class="spacer"></span><button id="pickClear">Tout décocher</button>`;
+      if (bar) bar.innerHTML = html;
+      else { const b2 = document.createElement('div'); b2.id = 'pickbar'; b2.className = 'locbar'; b2.style.bottom = locating ? '62px' : '10px'; b2.innerHTML = html; document.body.appendChild(b2); }
+      $('#pickClear').onclick = () => { picks.clear(); p.querySelectorAll('input[data-pick]').forEach(c => { c.checked = false; c.closest('tr').classList.remove('selected'); }); refreshPickBar(); };
+    };
+    p.querySelectorAll('input[data-pick]').forEach(cb => cb.onchange = () => {
+      cb.checked ? picks.add(cb.dataset.pick) : picks.delete(cb.dataset.pick);
+      cb.closest('tr').classList.toggle('selected', cb.checked);
+      refreshPickBar();
+    });
+    p.querySelectorAll('button[data-pickall]').forEach(b => b.onclick = e => {
+      e.preventDefault(); e.stopPropagation(); // dans un <summary> : ne pas replier le groupe
+      const gc = gCards[Number(b.dataset.pickall)];
+      const ips = new Set(gc.nodes.map(n => n.ip));
+      const boxes = [...p.querySelectorAll('input[data-pick]')].filter(c => ips.has(c.dataset.pick.split('|')[0]));
+      const on = !boxes.every(c => c.checked); // tout coché -> on décoche
+      boxes.forEach(c => { c.checked = on; on ? picks.add(c.dataset.pick) : picks.delete(c.dataset.pick); c.closest('tr').classList.toggle('selected', on); });
+      refreshPickBar();
+    });
+    refreshPickBar();
     // "comptée" checkboxes: Fleet-only, saved at once, conflicts recomputed
     p.querySelectorAll('input[data-ignore]').forEach(cb => cb.onchange = async () => {
       const ip = cb.closest('tr').dataset.node;
@@ -1240,19 +1375,34 @@
       const px = await calcBox(b, per, rgbw); if (px == null) return;
       const len = tr.querySelector('[data-out=len]'); len.value = px; len.dispatchEvent(new Event('input'));
     });
-    // 📍 localiser : allume le dernier pixel de la sortie (blanc, reste en bleu léger) sur le
-    // vrai node ; ajuster Pixels (ci-dessous) déplace le repère en direct — écrit réellement la
-    // longueur sur le node (et décale la sortie suivante si elle est collée, sans trou) le temps
-    // du repérage, sinon dépasser l'ancienne longueur allumait la sortie suivante au lieu de
-    // déplacer le repère (les index au-delà appartiennent physiquement à son fil, pas au nôtre).
-    // Tout est restauré à l'identique à l'arrêt. Un 2e clic sur 📍 arrête.
+    // 📍 repérer : le serveur porte la sortie à sa longueur d'exploration une fois, puis
+    // ne fait plus que recolorer trois zones (en dessous / repère / au-delà). Ajuster
+    // Pixels — au clavier ou avec les ± de la barre — déplace le repère en direct, sans
+    // réécrire la config du node. Tout est restauré à l'identique à l'arrêt ; un 2e clic
+    // sur 📍 arrête aussi.
     let locateTimer = null;
+    const locateRow = () => locating && p.querySelector(`tr[data-node="${CSS.escape(locating.ip)}"][data-outrow="${locating.index}"]`);
     const sendLocateUpdate = tr => {
       if (!locating || locating.ip !== tr.dataset.node || locating.index !== Number(tr.dataset.outrow)) return;
       const len = Number(tr.querySelector('[data-out=len]').value), rev = tr.querySelector('[data-out=rev]').checked;
       if (!(len > 0)) return;
+      if (locBar) locBar.setLen(len);
       clearTimeout(locateTimer);
-      locateTimer = setTimeout(() => { post(`/api/node/${encodeURIComponent(locating.ip)}/locate-pixel`, { index: locating.index, len, rev }).catch(e => toast(e.message, true)); }, 400);
+      locateTimer = setTimeout(() => {
+        post(`/api/node/${encodeURIComponent(locating.ip)}/locate-pixel`, { index: locating.index, len, rev, ...locOpts })
+          .then(r => { if (locBar && r && r.probe) locBar.setProbe(r.probe); })
+          .catch(e => toast(e.message, true));
+      }, 400);
+    };
+    // les ± de la barre écrivent dans le champ Pixels et dispatchent un input : tout le
+    // reste (chaînage, adresse console, bouton Enregistrer, envoi) suit sans code en double
+    const locStep = (delta, absolute) => {
+      const tr = locateRow(); if (!tr) return;
+      const el = tr.querySelector('[data-out=len]');
+      const max = (locOpts.probe && locOpts.probe > 0) ? locOpts.probe : 4096;
+      const next = Math.max(1, Math.min(max, absolute !== undefined ? absolute : Number(el.value) + delta));
+      if (Number(el.value) === next) return;
+      el.value = String(next); el.dispatchEvent(new Event('input'));
     };
     p.querySelectorAll('button[data-locate]').forEach(b => b.onclick = async () => {
       const tr = b.closest('tr'); const ip = tr.dataset.node, index = Number(tr.dataset.outrow);
@@ -1267,8 +1417,17 @@
       if (!(len > 0)) { toast('pixels invalide', true); return; }
       locating = { ip, index };
       b.classList.add('primary');
-      try { await post(`/api/node/${encodeURIComponent(ip)}/locate-pixel`, { index, len, rev }); toast('sortie repérée : dernier pixel en blanc sur le node — ajuster Pixels pour le déplacer (la sortie suivante collée se décale le temps du repérage), 📍 pour arrêter'); }
-      catch (e) { toast(e.message, true); locating = null; b.classList.remove('primary'); }
+      const n = d.nodes.find(x => x.ip === ip);
+      locBar = openLocBar((n && n.name) || ip, index + 1,
+        (delta, abs) => locStep(delta, abs),
+        () => { const t = locateRow(); if (t) sendLocateUpdate(t); },
+        () => { b.classList.remove('primary'); stopLocating(); });
+      locBar.setLen(len);
+      try {
+        const r = await post(`/api/node/${encodeURIComponent(ip)}/locate-pixel`, { index, len, rev, ...locOpts });
+        if (r && r.probe) { locBar.setProbe(r.probe); locOpts.probe = r.probe; setLocPref('Probe', r.probe); }
+        toast('repérage : le ruban entier est piloté — en dessous du repère, le repère, et au-delà en 3ᵉ couleur. Ajuster avec ± ou le champ Pixels.', false, 5000);
+      } catch (e) { toast(e.message, true); locating = null; b.classList.remove('primary'); closeLocBar(); locBar = null; }
     });
     // ⚙ colonnes avancées (pin, mA/LED, skip, off refresh) : repliées par défaut
     p.querySelectorAll('button[data-adv]').forEach(b => b.onclick = e => {
@@ -1521,7 +1680,46 @@
       <div style="margin-top:10px;display:flex;gap:8px;align-items:center">
         <button id="sSave" class="primary" title="écrit settings.json puis ${d.launcher ? 'redémarre le serveur (7 s), la page se reconnecte seule' : 'attend un redémarrage manuel (pas de lanceur)'}">Enregistrer${d.launcher ? ' et redémarrer' : ''}</button>
         ${d.launcher ? '' : '<span class="st-warn">serveur lancé sans WLED-Fleet.cmd : après enregistrement, le relancer à la main</span>'}
+      </div>
+      <h2 style="margin-top:18px">Application</h2>
+      <div class="setrow">
+        <label>Version</label>
+        <div><b id="sVer">…</b> <span class="muted" style="font-size:11px">· <a href="https://github.com/Tensegrity-Lighting-Service/WLED-Fleet/releases" target="_blank" rel="noopener">releases</a></span></div>
+        <div class="hint">dossier de l'app : <span class="mono" id="sDir">…</span></div>
+        <label>Mise à jour</label>
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+          <button id="sUpd" class="rowbtn">Vérifier maintenant</button>
+          <span id="sUpdMsg" class="muted"></span>
+          <button id="sUpdGo" class="rowbtn primary" hidden>Installer</button>
+        </div>
+        <div class="hint" id="sUpdHint">l'app se vérifie aussi toute seule quelques secondes après son démarrage, et ne propose rien quand elle est déjà à jour.</div>
       </div>`;
+    // ── état de la mise à jour : dire explicitement « à jour » plutôt que de ne rien dire
+    (async () => {
+      try { const a = await api('/api/about'); $('#sVer').textContent = a.version || '?'; $('#sDir').textContent = a.dir || ''; } catch { /* pas grave */ }
+    })();
+    const showUpdate = st => {
+      const msg = $('#sUpdMsg'), go = $('#sUpdGo'); if (!msg) return;
+      const when = st.at ? ` (${new Date(st.at).toLocaleTimeString()})` : '';
+      go.hidden = st.status !== 'disponible';
+      msg.className = st.status === 'erreur' ? 'st-bad' : st.status === 'disponible' ? 'st-ok' : 'muted';
+      msg.textContent = {
+        jamais: 'pas encore vérifié',
+        navigateur: 'ouvert dans un navigateur : la mise à jour n\'existe que dans l\'app native',
+        ajour: `à jour${when}`,
+        disponible: `version ${st.version} disponible${when}`,
+        erreur: `échec : ${st.error}${when}`,
+      }[st.status] || '';
+    };
+    showUpdate(updateState);
+    $('#sUpd').onclick = async () => {
+      const b = $('#sUpd'); b.disabled = true; b.textContent = 'vérification…';
+      showUpdate(await runUpdateCheck());
+      b.disabled = false; b.textContent = 'Vérifier maintenant';
+    };
+    $('#sUpdGo').onclick = async () => {
+      try { await installAppUpdate(); } catch (e) { toast(`mise à jour : ${e.message || e}`, true); showUpdate({ ...updateState, status: 'erreur', error: e.message || String(e) }); }
+    };
     p.querySelectorAll('button[data-sub]').forEach(b => b.onclick = () => { $('#sSubnet').value = b.dataset.sub; });
     $('#sSave').onclick = async () => {
       const port = $('#sPort').value.trim();
