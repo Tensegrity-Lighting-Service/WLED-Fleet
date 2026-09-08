@@ -128,3 +128,24 @@ test('une sortie à cheval sur deux univers est signalée comme telle', () => {
   assert.strictEqual(p.outputs[0].from, '10.1');
   assert.strictEqual(p.outputs[0].to, '11.90', '30 pixels débordent sur l\'univers 11 : 30 × 3 = 90 canaux');
 });
+
+// Le jour où quelqu'un touche à l'arithmétique, ce test tombe AVANT que
+// docs/fixture-mapping.md ne se mette à mentir aux outils qui s'y fient.
+test('les exemples de docs/fixture-mapping.md disent vrai', () => {
+  const one = dmx.plan({ mode: 4, uni: 121, addr: 109, ins: [{ pin: [10], start: 0, len: 36, type: 22 }] });
+  assert.strictEqual(`${one.outputs[0].from} → ${one.outputs[0].to}`, '121.109 → 121.216');
+  assert.strictEqual(dmx.locator(4, 121, 109).firstUniPx, 134, 'à l\'adresse 109 le 1er univers ne porte que 134 px');
+
+  const boules = [1, 109, 217, 325].map((addr, i) =>
+    ({ name: `boule ${i}`, plan: dmx.plan({ mode: 4, uni: 121, addr, ins: [{ pin: [2], start: 0, len: 36, type: 22 }] }) }));
+  assert.deepStrictEqual(dmx.conflicts(boules), [], '4 nodes de 36 px tiennent dans un univers');
+
+  const chain = dmx.plan({ mode: 4, uni: 122, addr: 1, ins: [{ pin: [2], start: 0, len: 36, type: 22 }, { pin: [3], start: 36, len: 36, type: 22 }] });
+  assert.strictEqual(`${chain.outputs[0].from} → ${chain.outputs[0].to}`, '122.1 → 122.108');
+  assert.strictEqual(`${chain.outputs[1].from} → ${chain.outputs[1].to}`, '122.109 → 122.216');
+
+  const straddle = dmx.plan({ mode: 4, uni: 10, addr: 1, ins: [{ pin: [2], start: 0, len: 200, type: 22 }] });
+  assert.strictEqual(`${straddle.outputs[0].from} → ${straddle.outputs[0].to}`, '10.1 → 11.90');
+  assert.strictEqual(dmx.locator(4, 1, 1).pxPerUni, 170);
+  assert.strictEqual(dmx.locator(6, 1, 1).pxPerUni, 128);
+});
