@@ -8,7 +8,7 @@ messages de commit ; ici on garde ce qu'il faut savoir avant de mettre à jour.
 | canal | version | ce qu'on y trouve |
 |---|---|---|
 | **stable** | **0.9.0** | la dernière version éprouvée en exploitation |
-| **beta** | **0.12.0** | toute la chaîne électrique, le schéma du plateau, les trois bibliothèques |
+| **beta** | **0.13.0** | toute la chaîne électrique, le schéma du plateau, les trois bibliothèques |
 
 Tout ce qui suit la 0.9.0 vit donc **uniquement sur le canal beta** (⚙ Réglages →
 Application → Canal). Le canal stable ne peut pas l'attraper par accident :
@@ -16,10 +16,14 @@ GitHub ne résout jamais `releases/latest` vers une préversion.
 
 ---
 
-## Non publié — sur la branche `beta`
+## 0.13.0
 
-Ce qui est écrit et éprouvé, mais pas encore compilé en installeur. Le format
-`/fleet.json` change de version : ce sera une **0.13.0**.
+> **Mettre à jour depuis la 0.12.0 débloque les nodes en firmware 0.14.** La
+> 0.12.0 laissait leur plateforme vide et ne proposait aucune mise à jour.
+
+Le format `/fleet.json` passe en **version 3** : `power.psu` désigne désormais
+le **modèle** d'alimentation au catalogue et non plus un exemplaire. Rien à
+migrer — aucun node ne portait de rattachement.
 
 ### La chaîne électrique passe dans la grille
 

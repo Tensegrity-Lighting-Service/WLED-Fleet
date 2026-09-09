@@ -8,7 +8,7 @@ Référence des surfaces exposées par WLED Fleet, à l'usage des logiciels
 satellites — plugin MA3, scripts, outils tiers. Générée depuis le code : elle ne
 peut pas diverger de ce que le serveur fait réellement.
 
-Version de l'application au moment de la génération : **0.12.0** · 100 points
+Version de l'application au moment de la génération : **0.13.0** · 100 points
 d'entrée.
 
 ## Ce qui fait autorité, et ce qui n'en fait pas
