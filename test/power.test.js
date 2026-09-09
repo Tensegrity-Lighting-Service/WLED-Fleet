@@ -232,3 +232,148 @@ test('le sens inverse : c\'est la FICHE qui est fausse, pas le node', () => {
   assert.ok(!b.checks.some(x => x.code === 'abl-sous-declaree'), 'surtout pas le contraire');
   assert.match(c[0].msg, /lianes/, 'le produit à corriger est nommé');
 });
+
+// ── Les deux générations de firmware ───────────────────────────────────────
+// Les deux formes viennent d'un relevé en direct : un ESP32-C3 en 0.14.4
+// (vid 2405180) et une boule en 16.0.0 (vid 2605030).
+const LED_014 = { total: 32, maxpwr: 1500, ledma: 55, cct: false, fps: 42, rgbwm: 255, ld: true,
+  ins: [{ start: 0, len: 32, pin: [10], order: 0, rev: false, skip: 0, type: 22, ref: false, rgbwm: 0, freq: 0 }] };
+const LED_16 = { total: 36, maxpwr: 850, cct: false, fps: 42, rgbwm: 255,
+  ins: [{ start: 0, len: 36, pin: [10], order: 0, rev: false, skip: 0, type: 22, ref: false, rgbwm: 0, freq: 0, maxpwr: 850, ledma: 55, drv: 0, text: '' }] };
+
+test('la génération se lit sur la FORME de la config, pas sur le numéro de version', () => {
+  // un build maison peut porter n'importe quel numéro ; la forme, elle, ne ment pas
+  assert.strictEqual(power.ablScheme(LED_014), power.SCHEME_GLOBAL);
+  assert.strictEqual(power.ablScheme(LED_16), power.SCHEME_PER_OUT);
+});
+
+test('sans rien pour trancher, on suppose le firmware courant', () => {
+  assert.strictEqual(power.ablScheme({ ins: [{ len: 10 }] }), power.SCHEME_PER_OUT);
+  assert.strictEqual(power.ablScheme(null), power.SCHEME_PER_OUT);
+});
+
+test('le mA/pixel en vigueur se lit où il se trouve', () => {
+  // c'est tout l'enjeu : sur un node 0.14, lire ins[i].ledma ne rend RIEN, et
+  // Fleet affichait alors son défaut — juste par hasard quand le node déclare
+  // 55, faux dès qu'il déclare autre chose
+  assert.strictEqual(power.ledmaOf(LED_014, 0), 55);
+  assert.strictEqual(power.ledmaOf({ ...LED_014, ledma: 120 }, 0), 120);
+  assert.strictEqual(power.ledmaOf(LED_16, 0), 55);
+  assert.strictEqual(power.ledmaOf({ ins: [{ len: 10 }] }, 0), 55, 'défaut WLED quand personne ne le dit');
+});
+
+test('un ledma global de 120 ne se lit pas 55 — le cas qui fait déconner les LED', () => {
+  const vieux = { ...LED_014, ledma: 120 };
+  assert.notStrictEqual(power.ledmaOf(vieux, 0), 55);
+  // et le budget calculé s'appuie bien dessus une fois la config traduite
+  const b = power.nodeBudget({ maxpwr: vieux.maxpwr, ins: power.migrateLed(vieux).ins });
+  assert.strictEqual(b.outputs[0].ledma, 120);
+});
+
+test('migrer 0.14 vers 16 fait DESCENDRE le ledma dans chaque sortie', () => {
+  // réinjecter la sauvegarde telle quelle après la mise à jour rendrait au node
+  // une config dont le firmware neuf ne lit plus le ledma : il repartirait sur
+  // 55, et un ruban déclaré à 120 tirerait plus du double du prévu.
+  const m = power.migrateLed({ ...LED_014, ledma: 120, ins: [{ len: 32, pin: [10] }, { len: 8, pin: [3] }] });
+  assert.strictEqual(m.ledma, undefined, 'le champ global n\'a plus de sens en 16.x');
+  assert.deepStrictEqual(m.ins.map(b => b.ledma), [120, 120]);
+  assert.strictEqual(m.maxpwr, 1500, 'le maxpwr global existe dans les DEUX générations : il ne bouge pas');
+});
+
+test('migrer une config déjà en 16.x ne la touche pas', () => {
+  assert.deepStrictEqual(power.migrateLed(LED_16), { ...LED_16 });
+});
+
+test('migrer ne modifie pas la config d\'origine', () => {
+  const src = { ...LED_014 };
+  const avant = JSON.stringify(src);
+  power.migrateLed(src);
+  assert.strictEqual(JSON.stringify(src), avant);
+});
+
+// ── Réinjecter une sauvegarde après une mise à jour ────────────────────────
+test('une config 0.14 rendue à un node passé en 16.x est TRADUITE', () => {
+  // le scénario complet : sauvegarde, mise à jour du firmware, restauration.
+  // Sans traduction la restauration « réussit » et le node repart à 55 mA/pixel
+  // au lieu de 120 — plus du double du courant prévu, sans un mot.
+  const sauvegarde = { total: 36, maxpwr: 850, ledma: 120, ins: [{ len: 36, pin: [10] }, { len: 12, pin: [3] }] };
+  const apresMaj = { total: 48, maxpwr: 850, ins: [{ len: 36, pin: [10], ledma: 55 }, { len: 12, pin: [3], ledma: 55 }] };
+  const r = power.restoreLed(sauvegarde, apresMaj);
+  assert.strictEqual(r.traduit, true);
+  assert.deepStrictEqual(r.led.ins.map(b => b.ledma), [120, 120]);
+  assert.strictEqual(r.led.ledma, undefined);
+  assert.match(r.note, /120/, 'la note dit d\'où vient le chiffre');
+});
+
+test('rien n\'est traduit quand les deux générations concordent', () => {
+  const v = { maxpwr: 850, ledma: 55, ins: [{ len: 36, pin: [10] }] };
+  const n = { maxpwr: 850, ins: [{ len: 36, pin: [10], ledma: 55 }] };
+  assert.strictEqual(power.restoreLed(n, n).traduit, false, '16.x vers 16.x');
+  assert.strictEqual(power.restoreLed(v, v).traduit, false, '0.14 vers 0.14');
+});
+
+test('on ne « traduit » jamais dans l\'autre sens', () => {
+  // rendre une config 16.x à un node resté en 0.14 ne se répare pas ici : le
+  // firmware n'a pas de champ par sortie. Inventer une conversion masquerait le
+  // vrai problème, qui est qu'on redescend une version.
+  const n = { maxpwr: 850, ins: [{ len: 36, pin: [10], ledma: 120 }] };
+  const v = { maxpwr: 850, ledma: 55, ins: [{ len: 36, pin: [10] }] };
+  const r = power.restoreLed(n, v);
+  assert.strictEqual(r.traduit, false);
+  assert.strictEqual(r.led, n, 'la config est rendue telle quelle');
+});
+
+test('un ledma global de 0 se propage tel quel — il ne s\'invente pas un défaut', () => {
+  // six boules de la flotte déclarent 0, ce qui désactive l'ABL. La mise à jour
+  // ne doit pas maquiller ça en 55 : le rapport doit continuer de le signaler.
+  const r = power.restoreLed({ maxpwr: 850, ledma: 0, ins: [{ len: 36 }] },
+    { maxpwr: 850, ins: [{ len: 36, ledma: 55 }] });
+  assert.strictEqual(r.led.ins[0].ledma, 0);
+});
+
+// ── Les groupes d'alimentation, sans exemplaires ───────────────────────────
+test('audit rend les nodes AU COMPLET, avec leurs budgets et leurs sorties', () => {
+  // Ils étaient jetés ici alors que le schéma les lisait : résultat, il ne
+  // dessinait que des boîtes nues et aucune sortie tant qu'un node n'était pas
+  // rattaché à une alimentation.
+  const nodes = [nodeFrom('a', 'un', boule()), nodeFrom('b', 'deux', boule())];
+  const r = power.audit({ psus: [], nodes });
+  assert.strictEqual(r.nodes.length, 2);
+  assert.ok(r.nodes[0].budget.outputs.length, 'les sorties voyagent avec');
+});
+
+test('deux nodes LIÉS additionnent leurs budgets, deux nodes séparés non', () => {
+  // C'est toute la raison d'être du groupe : sur la même alimentation physique
+  // les consommations s'ajoutent, sur deux alimentations identiques elles ne
+  // s'ajoutent pas. Rien dans le modèle ne permet de trancher — seul le lien.
+  const gros = ip => nodeFrom(ip, ip, { maxpwr: 9000, ins: [{ len: 100, ledma: 55 }] });
+  const nodes = [gros('a'), gros('b')];
+  const lies = power.audit({ psus: [{ uid: 'g1', model: alim(), nodes: ['a', 'b'] }], nodes });
+  assert.strictEqual(lies.psus[0].usedA, 18);
+  assert.ok(lies.psus[0].checks.some(c => c.code.startsWith('psu-')), '18 A sur 20 A : ça se signale');
+
+  const separes = power.audit({
+    psus: [{ uid: 'seul:a', model: alim(), nodes: ['a'] }, { uid: 'seul:b', model: alim(), nodes: ['b'] }],
+    nodes,
+  });
+  assert.deepStrictEqual(separes.psus.map(p => p.usedA), [9, 9]);
+  assert.ok(!separes.psus.some(p => p.checks.some(c => c.code.startsWith('psu-'))), 'chacune tient largement');
+});
+
+test('des nodes liés qui ne désignent pas le même modèle sont signalés', () => {
+  const r = power.audit({
+    psus: [{ uid: 'g1', model: alim(), nodes: ['a', 'b'], mixedModel: true }],
+    nodes: [nodeFrom('a', 'un', boule()), nodeFrom('b', 'deux', boule())],
+  });
+  const c = r.psus[0].checks.find(x => x.code === 'psu-incoherent');
+  assert.ok(c, 'sinon la capacité retenue est une supposition silencieuse');
+  assert.strictEqual(c.level, 'warn');
+});
+
+test('un node sans alimentation reste orphelin, et ne fausse aucun total', () => {
+  const nodes = [nodeFrom('a', 'rattaché', boule()), nodeFrom('b', 'seul', boule())];
+  const r = power.audit({ psus: [{ uid: 'g1', model: alim(), nodes: ['a'] }], nodes });
+  assert.deepStrictEqual(r.orphelins.map(o => o.ip), ['b']);
+  assert.strictEqual(r.totals.rattaches, 1);
+  assert.strictEqual(r.totals.nodes, 2);
+});

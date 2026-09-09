@@ -72,9 +72,10 @@ multipart), servi ensuite par un simple `GET /fleet.json`.
 
 ```jsonc
 { "format": "wled-fleet-node",
-  "formatVersion": 2,
+  "formatVersion": 3,
   "group": "Boule",
   "power": { "psu": "8f97e081-6f2f-4133-bd38-ec7a91f2439b",
+             "psuGroup": "3c1d5a90-77bb-4e02-9a44-1f6e0b2c8d55",
              "rail": "A",
              "driver": "76966b0d-1b2c-4a55-9e10-3f8d2a4b6c71" },
   "updatedAt": 1757337600000,
@@ -118,21 +119,34 @@ une erreur : le node n'a simplement rien à dire là-dessus.
 
 | clé | sens |
 |---|---|
-| `psu` | l'**exemplaire** d'alimentation qui nourrit ce node — pas un modèle |
+| `psu` | le **modèle** d'alimentation qui nourrit ce node |
+| `psuGroup` | quels nodes partagent la même alimentation **physique** |
 | `rail` | sa sortie, quand l'alimentation en a plusieurs |
 | `driver` | le **modèle** de carte que ce node est |
 
-La distinction entre exemplaire et modèle est celle qui structure tout : le
-catalogue décrit « Meanwell LRS-350-24 », l'exemplaire décrit « l'alim jardin,
-sous le praticable ». Le second ne veut rien dire ailleurs, mais c'est lui que
-le node désigne.
+> **Changement en formatVersion 3.** Jusqu'à la v2, `psu` désignait un
+> *exemplaire* — « l'alim jardin, sous le praticable » — décrit dans un fichier
+> propre au poste. Ces exemplaires n'existent plus : personne ne les nommait, et
+> ce qu'ils apportaient vraiment tient dans `psuGroup`. **`psu` se résout
+> désormais dans le catalogue des alimentations**, au même titre que `driver`
+> dans celui des cartes. Un lecteur qui l'ignorerait chercherait un uid dans le
+> mauvais catalogue : c'est pour ça que la version change.
+
+`psuGroup` est un identifiant **opaque et local** : deux nodes qui le partagent
+sont branchés sur la même alimentation physique. Sans lui, deux nodes désignant
+le même modèle seraient indiscernables de deux nodes sur deux alimentations
+identiques — et c'est exactement la question que pose un budget de courant :
+faut-il additionner leurs consommations, ou non. Il n'a aucun sens hors de ce
+plateau, et ne va donc jamais dans le dépôt partagé. Un node sans `psuGroup`
+décrit une alimentation à lui seul.
 
 Un `psu` ou un `rail` peut aussi apparaître **sur une sortie** : elle l'emporte
 alors sur celui du node. C'est le cas d'une structure dont deux rubans partent
 sur un autre circuit. Même hiérarchie que le groupe, qui est du node, contre la
-fixture, qui est de la sortie.
+fixture, qui est de la sortie. *(Prévu par le format ; le rapport de cohérence
+de Fleet ne le prend pas encore en compte.)*
 
-Ces trois identifiants renvoient à des choses qui vivent ailleurs. La fiche
+Ces identifiants renvoient à des choses qui vivent ailleurs. La fiche
 correspondante est déposée dans `/fleet-lib.json` (voir plus haut), pour qu'un
 node lu sur un poste qui n'a jamais vu ce spectacle ne dise pas seulement
 « alimenté par 8f97e081… ».
@@ -197,22 +211,21 @@ citent — le node se décrit alors tout seul.
       "presets": [ { "label": "2 m", "px": 120, "default": true } ] }
   ],
   "drivers": [ /* la fiche de la carte, même forme : uid, rev, ref, board */ ],
-  "psus":    [ /* le MODÈLE d'alimentation : uid, rev, ref, psu */ ],
-  "powerNodes": [
-    { "uid": "8f97e081-6f2f-4133-bd38-ec7a91f2439b",
-      "label": "Alim jardin", "model": "…", "location": "sous le praticable" }
-  ] }
+  "psus":    [ /* le MODÈLE d'alimentation : uid, rev, ref, psu */ ] }
 ```
 
 `led` reprend le vocabulaire de `hw.led.ins[]` : appliquer un produit à une
 sortie est une copie de champs, sans traduction. `order` est le quartet **bas**
 et `wswap` le quartet **haut** du même octet WLED.
 
-`drivers`, `psus` et `powerNodes` accompagnent le bloc `power` de
-`/fleet.json` : les deux premiers sont des fiches de catalogue, le troisième
-décrit l'**exemplaire** posé sur ce plateau — qui n'est dans aucun catalogue,
-puisqu'il n'a de sens que pour ce montage. Les trois peuvent manquer ; les clés
-inconnues d'une version plus récente sont conservées.
+`drivers` et `psus` accompagnent le bloc `power` de `/fleet.json` : ce sont
+les fiches de catalogue que ce node désigne, déposées ici pour qu'il se raconte
+tout seul. Elles peuvent manquer ; les clés inconnues d'une version plus récente
+sont conservées.
+
+> Une clé `powerNodes` a existé jusqu'en formatVersion 2 : elle portait
+> l'*exemplaire* d'alimentation posé sur le plateau. Les exemplaires ont
+> disparu, et un lecteur qui rencontre encore cette clé peut l'ignorer.
 
 Ce que le produit ne contient **pas**, délibérément : le sens de parcours
 (`rev`), l'index de départ, l'univers et l'adresse. Ce sont des propriétés de

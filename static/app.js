@@ -13,6 +13,120 @@
   document.querySelectorAll('#themeSw button').forEach(b => b.onclick = () => applyTheme(b.dataset.theme));
   let COLS = [], GROUPS = [], fleet = { nodes: [] }, LED_TYPES = {}, COLOR_ORDERS = {}, WHITE_SWAPS = {}, WHITE_SWAP_TYPES = [];
   let dmxLib = null;   // les fiches produits, pour la colonne Px de Sorties/DMX
+
+  // ── La colonne Px ────────────────────────────────────────────────────────
+  // Les longueurs types de la fiche, à côté du profil.
+  //
+  // Ce n'est PAS le nombre de pixels déclaré — celui-là reste la colonne
+  // Pixels, et c'est lui qui fait foi : une longueur saisie à la main est
+  // légitime et l'emporte toujours. Cette colonne ne fait que proposer ce que
+  // la fiche prévoit, pour éviter de retaper un nombre et de s'en écarter sans
+  // le vouloir.
+  //
+  // Elle suit le PRODUIT CHOISI, et non une reconnaissance. La version
+  // précédente dépendait de profileIdFor : une sortie dont la longueur n'était
+  // dans aucune fiche — une boule à 30 px quand la fiche n'en déclare que 36 —
+  // n'affichait rien, et choisir un produit à la main ne la remplissait pas
+  // davantage, faute de re-rendu. Choisir un produit repeuple donc la colonne
+  // immédiatement, quel que soit l'état du node.
+  const produitDe = uid => dmxLib && (dmxLib.products || []).find(x => x.uid === uid || (x.legacyId && x.legacyId === uid));
+  const labelProd = p => [p.ref.brand, p.ref.model].filter(Boolean).join(' ') || p.slug;
+  const pxHtml = (uid, len) => {
+    const prod = produitDe(uid);
+    const lens = prod ? prod.presets : [];
+    if (!lens.length) return `<span class="muted" title="${esc(prod ? 'cette fiche ne porte aucune longueur type' : 'aucun produit choisi sur cette sortie : le sélecteur Profil en propose un, et ses longueurs apparaîtront ici')}">—</span>`;
+    const cur = lens.find(x => Number(x.px) === Number(len));
+    return `<select data-preset title="longueurs types de « ${esc(labelProd(prod))} ». Choisir remplit la colonne Pixels ; la valeur saisie reste la vérité finale.">`
+      + `<option value=""${cur ? '' : ' selected'}>${cur ? '—' : esc(String(len)) + ' px (hors fiche)'}</option>`
+      + lens.map(x => `<option value="${x.px}"${cur && cur.px === x.px ? ' selected' : ''}>${esc(x.name ? x.name + ' — ' + x.px : String(x.px))} px${x.default ? ' ★' : ''}</option>`).join('')
+      + '</select>';
+  };
+  const pxCell = (o, pid) => pxHtml(pid || o.profile, o.len);
+
+  // ── La carte du node, et son alimentation ────────────────────────────────
+  // Elles se choisissent dans la grille, avec le mode et le budget de courant :
+  // c'est le même genre de réglage, et c'est là qu'on se pose la question.
+  //
+  // Choisir une carte ou une alimentation ne modifie RIEN sur le node : ces
+  // fiches décrivent le matériel, elles ne le règlent pas. Ce que Fleet en
+  // tire, ce sont les vérifications — tensions admises, courant du bornier,
+  // brochage attendu, capacité de l'alimentation.
+  //
+  // L'écriture est immédiate, dans le /fleet.json du node : contrairement aux
+  // champs de la grille, elle ne passe pas par « Enregistrer les
+  // modifications », parce qu'elle ne touche à aucun réglage WLED. Elle exige
+  // en revanche que le node soit EN LIGNE — le serveur répond 409 sinon.
+  const catalogueCartes = () => ((dmxLib && dmxLib.drivers) || []).filter(x => !x.retired);
+  const catalogueAlims = () => ((dmxLib && dmxLib.psus) || []).filter(x => !x.retired);
+  const nomFiche = x => [x.ref.brand, x.ref.model].filter(Boolean).join(' ') || x.slug;
+  const r1a = v => Math.round(v * 10) / 10;
+  // le budget déclaré d'un node, en mA, lu sur sa config : le plan DMX ne le
+  // porte pas, et c'est la grille elle-même qui l'édite juste à côté
+  const budgetDe = ip => {
+    const n = fleet.nodes.find(x => x.meta.ip === ip);
+    const v = n && n.cfg && n.cfg.hw && n.cfg.hw.led ? Number(n.cfg.hw.led.maxpwr) : NaN;
+    return Number.isFinite(v) ? v : NaN;
+  };
+
+  // ── La cellule Alim, et le lien entre nodes ──────────────────────────────
+  // La grille se lit comme un tableur, de gauche à droite, dans le sens où le
+  // courant circule : l'alimentation, puis les réglages du node, puis les
+  // sorties.
+  //
+  // Il n'y a pas d'exemplaire d'alimentation à créer : on choisit un MODÈLE au
+  // catalogue, et le bouton lier dit quels nodes sont branchés sur la même
+  // alimentation physique. C'est cette distinction, et elle seule, qui décide
+  // si deux consommations s'additionnent.
+  const cellAlim = (n, membres, span) => {
+    const list = catalogueAlims();
+    const cur = ((n.power || {}).psu) || '';
+    const fiche = list.find(x => x.uid === cur) || null;
+    if (!list.length) {
+      return `<td class="alimcell" rowspan="${span}"><span class="muted" title="aucune alimentation au catalogue : Matériel → Bibliothèques → Alimentations">—</span></td>`;
+    }
+    // La charge du groupe : ce que les nodes liés ont le droit de tirer, face à
+    // ce que l'alimentation fournit une fois son taux d'usage et la marge
+    // retirés. On somme les budgets, jamais les pires cas — voir power.js.
+    const budgets = membres.map(m => budgetDe(m.ip)).filter(Number.isFinite);
+    const sommeA = budgets.reduce((a, v) => a + v, 0) / 1000;
+    const capA = fiche && fiche.psu.amps ? fiche.psu.amps * (fiche.psu.derate || 0.8) * 0.8 : null;
+    const pct = capA ? Math.round((sommeA / capA) * 100) : null;
+    const bornes = fiche ? fiche.psu.outputs : 0;
+    const trop = bornes > 0 && membres.length > bornes;
+    const charge = capA === null ? ''
+      : `<div class="${pct > 100 ? 'st-bad' : pct > 90 ? 'st-warn' : 'muted'}" title="somme des budgets des ${membres.length} node(s) liés, face à ${fiche.psu.amps} A moins le taux d'usage et la marge">${r1a(sommeA)} A / ${r1a(capA)} A · ${pct} %</div>`;
+    const compte = bornes > 0
+      ? `<div class="${trop ? 'st-bad' : 'muted'}" title="${trop ? 'plus de nodes liés que cette alimentation n a de sorties' : 'nodes liés sur les sorties déclarées par la fiche'}">${membres.length} / ${bornes} sortie${bornes > 1 ? 's' : ''}</div>`
+      : '';
+    return `<td class="alimcell" rowspan="${span}">`
+      + `<select data-alim="${esc(n.ip)}" title="le MODÈLE d'alimentation qui nourrit ce node. Choisir écrit dans son /fleet.json ; le bouton ⛓ de la colonne suivante dit quels nodes partagent la même alimentation physique."><option value="">—</option>`
+      + list.map(x => `<option value="${esc(x.uid)}"${x.uid === cur ? ' selected' : ''}>${esc(nomFiche(x))} · ${x.psu.volt} V${x.psu.amps ? ` ${x.psu.amps} A` : ''}</option>`).join('')
+      + '</select>' + charge + compte + '</td>';
+  };
+
+  // Le lien vers le node du dessus, sur le patron exact du chaînage des
+  // sorties. Une différence à connaître : le chaînage des sorties se DÉDUIT des
+  // départs et n'écrit rien, alors que le lien d'alimentation est un fait
+  // stocké — il part donc tout de suite sur le node, et exige qu'il soit en
+  // ligne.
+  const cellLien = (n, precedent) => {
+    if (!precedent) return '<td class="liencell"></td>';
+    const g = (n.power || {}).psuGroup || null;
+    const gp = (precedent.power || {}).psuGroup || null;
+    const lie = !!g && g === gp;
+    const titre = lie
+      ? `lié à ${precedent.name || precedent.ip} : même alimentation physique. Cliquer pour détacher.`
+      : `alimentation propre. Cliquer pour le brancher sur la même que ${precedent.name || precedent.ip} — leurs consommations s'additionneront alors.`;
+    return `<td class="liencell${lie ? ' linked' : ''}" data-lien="${esc(n.ip)}" data-lien-prev="${esc(precedent.ip)}" title="${esc(titre)}"><span class="chainmark">${lie ? '⛓' : '⊘'}</span></td>`;
+  };
+  const selCarte = (ip, cur) => {
+    const list = catalogueCartes();
+    if (!list.length) return '<span class="muted" title="aucune carte au catalogue : Matériel → Bibliothèques → Cartes, ou « Déduire de la flotte… »">carte —</span>';
+    return `<label title="quelle carte est ce node. Ce qu'elle admet en tension et en courant décide si son budget est réaliste — le node, lui, n'en sait rien."><span class="lbl">carte</span>`
+      + `<select data-carte="${esc(ip)}"><option value="">—</option>`
+      + list.map(x => `<option value="${esc(x.uid)}"${x.uid === cur ? ' selected' : ''}>${esc(nomFiche(x))}</option>`).join('')
+      + '</select></label>';
+  };
   let ledProfilesCache = []; // local library (led-profiles.json), kept in sync for the Sorties/DMX badge and table
   let sortKey = 'name', sortDir = 1, editing = null;
   // manual row order (drag the ⋮⋮ handle): a list of node identities (MAC, else IP), persisted
@@ -1149,7 +1263,10 @@
   }
   async function renderDmx() {
     const p = $('#dmxpanel');
-    let d; try { const r = await Promise.all([api('/api/dmx-plan'), api('/api/library'), loadLedProfiles()]); d = r[0]; dmxLib = r[1]; } catch (e) { p.innerHTML = `<div class="st-bad">${esc(e.message)}</div>`; return; }
+    // Les trois catalogues d'un coup : la grille y choisit un produit, une
+    // carte et une alimentation. Ils sont petits, et les demander séparément
+    // ferait clignoter la grille au fur et à mesure des réponses.
+    let d; try { const r = await Promise.all([api('/api/dmx-plan'), api('/api/library'), api('/api/drivers'), api('/api/psus'), loadLedProfiles()]); d = r[0]; dmxLib = { ...r[1], drivers: r[2].drivers || [], psus: r[3].psus || [] }; } catch (e) { p.innerHTML = `<div class="st-bad">${esc(e.message)}</div>`; return; }
     const CPX = { 4: 3, 5: 3, 6: 4 }; // channels per pixel by DMX mode (Multi RGB, Multi DRGB, Multi RGBW)
     const modeName = m => ({ 4: 'Multi RGB', 5: 'Multi DRGB', 6: 'Multi RGBW' })[m] || (COLS.find(c => c.id === 'dmxmode') || { enum: {} }).enum[m] || m;
     // conflit = recouvrement AU CANAL PRÈS (voir dmx.js) : deux nodes peuvent partager un
@@ -1203,6 +1320,7 @@
           <label title="limite de courant du node (mA) : l'ABL de WLED baisse la luminosité pour ne jamais dépasser ce budget. Il en retire d'abord 120 mA pour l'ESP lui-même."><span class="lbl">mA</span><input type="number" data-nb="maxpwr" data-orig="${esc(String(mA))}" min="0" step="50" value="${esc(String(mA))}"${ppl ? ' disabled' : ''}></label>
           <label class="chip" title="Un budget par sortie au lieu d'un seul pour tout le node. WLED le recommande dès qu'il y a plusieurs sorties : sans ça, une sortie chargée mange la marge des autres. Les deux régimes s'EXCLUENT — cocher met la limite globale à 0, c'est ce qui bascule le firmware. Indispensable quand les sorties sont sur des circuits ou des alimentations différents."><input type="checkbox" data-ppl data-orig="${ppl ? 1 : 0}" ${ppl ? 'checked' : ''}> par sortie</label>
           <span class="ablnote" data-abl></span>
+          ${selCarte(n.ip, (n.power || {}).driver || "")}
         </div></td>`;
     };
     const profileOptions = cur => `<option value="">profil…</option>${ledProfilesCache.map(pr => `<option value="${esc(pr.id)}" ${pr.id === cur || (pr.legacyId && pr.legacyId === cur) ? 'selected' : ''}>${esc(pr.name)}</option>`).join('')}<option value="__new">＋ enregistrer cette ligne comme profil…</option>${ledProfilesCache.length ? '<option value="__manage">gérer les profils…</option>' : ''}`;
@@ -1223,35 +1341,19 @@
     // proche du nombre d'or ramené au cercle, donc deux numéros voisins ne se
     // ressemblent jamais.
     const fixColor = f => `hsl(${(Number(f) * 137) % 360} 62% 52%)`;
-    const outRow = (n, o, r, i, first, span) => {
+    // Deux générations de firmware, deux endroits pour le mA/pixel. En 0.14 il
+    // est GLOBAL (hw.led.ledma) et les sorties n'en portent pas ; lire
+    // ins[i].ledma sur ces nodes ne rend rien, et la grille affichait alors son
+    // défaut — juste par hasard quand le node déclare 55.
+    const outRow = (n, o, r, i, first, span, led, tete = '') => {
+      const vieuxFw = led && led.ledma !== undefined && !(led.ins || []).some(x => x && x.ledma !== undefined);
+      const ledmaEff = r.ledma !== undefined ? r.ledma : (vieuxFw ? led.ledma : 55);
       const pl = n.plan;
       const pid = profileIdFor(o, r), unknown = !pid && !o.ignored && o.len;
       const linked = chainedTo(pl.outputs, i);
       const offBoundary = i > 0 && !linked && o.aligned === false; // seule ET au milieu d'un univers
       const uniTxt = !o.len ? '' : o.universes > 1 ? `<span class="${offBoundary ? 'st-warn' : 'muted'}" title="${offBoundary ? 'sortie seule qui commence au milieu d\'un univers : à la console elle reste à cheval' : 'cette sortie occupe plusieurs univers'}">${o.universes} univers</span>` : '<span class="st-ok">1 univers</span>';
       const wsw = (r.order || 0) >> 4, hasW = WHITE_SWAP_TYPES.includes(Number(r.type));
-  // Les longueurs types de la fiche, à côté du profil.
-  //
-  // Ce n'est PAS le nombre de pixels déclaré — celui-là reste la colonne
-  // Pixels, et c'est lui qui fait foi : une longueur saisie à la main est
-  // légitime et l emporte toujours. Cette colonne ne fait que proposer ce que
-  // la fiche prévoit, pour éviter de retaper un nombre et de s en écarter sans
-  // le vouloir. Vide quand la sortie ne revendique aucun produit.
-  // `pid` est le produit RECONNU par profileIdFor — marqueur ou ressemblance.
-  // S'en tenir au seul marqueur laissait la colonne vide sur toutes les sorties
-  // jamais patchées par Fleet, alors que la colonne Profil, elle, les nommait :
-  // deux colonnes voisines qui n'auraient pas dit la même chose.
-  const pxCell = (o, pid) => {
-    const prod = dmxLib && (dmxLib.products || []).find(x => x.uid === pid || x.uid === o.profile || (x.legacyId && x.legacyId === o.profile));
-    const lens = prod ? prod.presets : [];
-    if (!lens.length) return '<span class="muted" title="aucune longueur type : la sortie ne revendique pas de produit, ou sa fiche n en porte aucune">—</span>';
-    const cur = lens.find(x => x.px === o.len);
-    return `<select data-preset title="longueurs types de « ${esc(labelProd(prod))} ». Choisir remplit la colonne Pixels ; la valeur saisie reste la vérité finale.">` +
-      `<option value=""${cur ? '' : ' selected'}>${cur ? '—' : esc(String(o.len)) + ' px (hors fiche)'}</option>` +
-      lens.map(x => `<option value="${x.px}"${cur && cur.px === x.px ? ' selected' : ''}>${esc(x.name ? x.name + ' — ' + x.px : String(x.px))} px${x.default ? ' ★' : ''}</option>`).join('') +
-      '</select>';
-  };
-  const labelProd = p => [p.ref.brand, p.ref.model].filter(Boolean).join(' ') || p.slug;
 
   // Ce que le produit dit, et ce que la sortie fait réellement.
   //
@@ -1277,7 +1379,7 @@
       // l'ordre doit suivre celui des <th>, sinon tout le tableau glisse d'une colonne
       const pk = `${n.ip}|${i}`, picked = picks.has(pk);
       return `<tr data-outrow="${i}" data-node="${esc(n.ip)}" class="${o.ignored ? 'offline' : ''}${first ? ' first' : ''}${linked ? ' chained' : ''}${picked ? ' selected' : ''}">
-        ${first ? nodeCell(n, span) : ''}
+        ${tete}${first ? nodeCell(n, span) : ''}
         <td class="pickcell"><input type="checkbox" data-pick="${esc(pk)}" ${picked ? 'checked' : ''} title="cocher plusieurs lignes, puis modifier un champ sur l'une d'elles : la valeur part sur toutes les lignes cochées"></td>
         <td><label class="chip" title="utilisée = câblée. Décocher une sortie qui existe dans WLED mais n'est pas branchée : grisée, et les canaux qu'elle occuperait ne sont plus réservés (hors conflits). Mémorisé sur le node (marqueur dans son MQTT device topic), rien d'autre n'est écrit."><input type="checkbox" data-ignore="${i}" ${o.ignored ? '' : 'checked'}> Sortie ${o.i + 1}</label></td>
         <td class="chaincell${linked ? ' linked' : ''}" data-chain="${i}" title="${i === 0 ? 'première sortie du node : rien au-dessus à quoi la chaîner' : linked ? 'chaînée : ses pixels reprennent juste après ceux de la sortie du dessus, les deux forment une seule fixture continue à la console. Cliquer pour la détacher (elle repartira sur un début d\'univers).' : 'sortie seule. Cliquer pour la chaîner à celle du dessus : ses pixels reprendront juste après, sans trou — le cas de deux sorties d\'un même assemblage (tournette int + ext).'}">${i === 0 ? '' : `<span class="chainmark">${linked ? '⛓' : '⊘'}</span>`}</td>
@@ -1285,8 +1387,8 @@
         <td class="pxcell">${pxCell(o, pid)}</td>
         <td class="muted adv" title="GPIO de la sortie">${esc(o.pin)}</td>
         <td>${sel('type', LED_TYPES, r.type)}</td>
-        <td class="adv"><input type="number" data-out="omax" data-orig="${r.maxpwr ?? 0}" value="${r.maxpwr ?? 0}" min="0" max="65000" step="50" title="Budget de courant de CETTE sortie (mA). N'agit que si « par sortie » est coché sur le node : sinon le firmware l'ignore entièrement, et WLED le réécrit tout seul au prorata des pixels à chaque enregistrement — c'est de là que viennent les valeurs bizarres qu'on trouve dans les configs."></td>
-        <td class="adv"><input type="number" data-out="ledma" data-orig="${r.ledma ?? 55}" value="${r.ledma ?? 55}" min="0" max="255" title="mA par pixel à pleine luminosité, blanc plein. C'est le chiffre sur lequel WLED calcule son freinage : SOUS-DÉCLARÉ, il freine trop peu, la tension s'effondre et les LEDs se mettent à déconner sans qu'aucune erreur ne s'affiche. Déclarer 55 là où la réalité est 120 laisse passer 2,2 fois le courant prévu. 55 = défaut WLED (WS2812 générique) ; compter par PIXEL et non par LED quand un pixel en contient plusieurs. Plage utile 1 à 254 — 255 n'est pas 255 mA mais bascule sur le modèle WS2815 (12 mA), donc freine MOINS."></td>
+        <td class="adv">${vieuxFw ? `<span class="muted" title="firmware ancien : ce node n a pas de limite de courant par sortie, seulement la limite globale. Fleet ne l affiche pas plutôt que de laisser régler un champ qui partirait dans le vide.">—</span><input type="hidden" data-out="omax" data-orig="0" value="0">` : `<input type="number" data-out="omax" data-orig="${r.maxpwr ?? 0}" value="${r.maxpwr ?? 0}" min="0" max="65000" step="50" title="Budget de courant de CETTE sortie (mA). N'agit que si « par sortie » est coché sur le node : sinon le firmware l'ignore entièrement, et WLED le réécrit tout seul au prorata des pixels à chaque enregistrement — c'est de là que viennent les valeurs bizarres qu'on trouve dans les configs.">`}</td>
+        <td class="adv"><input type="number" data-out="ledma" data-orig="${ledmaEff}" value="${ledmaEff}" min="0" max="255" title="mA par pixel à pleine luminosité, blanc plein. C'est le chiffre sur lequel WLED calcule son freinage : SOUS-DÉCLARÉ, il freine trop peu, la tension s'effondre et les LEDs se mettent à déconner sans qu'aucune erreur ne s'affiche. Déclarer 55 là où la réalité est 120 laisse passer 2,2 fois le courant prévu. 55 = défaut WLED (WS2812 générique) ; compter par PIXEL et non par LED quand un pixel en contient plusieurs. Plage utile 1 à 254 — 255 n'est pas 255 mA mais bascule sur le modèle WS2815 (12 mA), donc freine MOINS."></td>
         <td>${sel('order', COLOR_ORDERS, (r.order || 0) & 0x0f)}</td>
         <td>${hasW ? sel('wswap', WHITE_SWAPS, wsw) : `<input type="hidden" data-out="wswap" data-orig="${wsw}" value="${wsw}"><span class="muted" title="ce type de LED n'a pas de canal blanc : WLED ne propose l'échange que sur les types numériques RGBW">—</span>`}</td>
         <td><input type="number" data-out="start" data-orig="${o.start}" value="${o.start}" min="0" title="index du premier pixel de cette sortie dans le node (0 = premier)"></td>
@@ -1298,14 +1400,41 @@
         <td class="oc-addr"><span class="addr"><b>${esc(o.from || '')}</b> → <b>${esc(o.to || '')}</b></span> <span class="straddle">${uniTxt}</span></td></tr>`;
     };
     const groupTable = gc => {
-      const head = `<thead><tr><th>Node</th><th title="sélection pour l'édition en lot : elle porte sur des SORTIES, pas sur des nodes"></th><th>Sortie</th><th title="chaînage : ⛓ pixels collés à la sortie du dessus (une seule fixture), ⊘ sortie seule"></th><th title="profil de LED : type + ordre + pixels mémorisés sous un nom">Profil</th><th title="longueur type du produit choisi. La longueur réellement déclarée reste la colonne Pixels : celle-ci ne fait que proposer ce que la fiche prévoit.">Px</th><th class="adv">Pin</th><th>Type</th><th class="adv" title="budget de courant de cette sortie — n_agit que si « par sortie » est coché sur le node">Limite mA</th><th class="adv" title="Auto Brightness Limiter : mA par pixel à pleine luminosité, pour estimer/limiter la consommation">mA/pixel</th><th>Ordre</th><th title="échange du canal blanc (WLED : Swap) — proposé seulement sur les types numériques à canal blanc">Swap W</th><th title="index du premier pixel dans le node (0 = premier)">Départ</th><th title="pixels sur ce câble ; 📏 = calculateur, 📍 = repérer le dernier pixel">Pixels</th><th title="sens de parcours du ruban">Inv.</th><th class="adv">Skip</th><th class="adv">Off Refresh</th><th title="numéro de fixture à la console. Plusieurs sorties, même sur des nodes différents, peuvent partager un numéro : elles forment alors une seule fixture. La pastille de couleur est dérivée du numéro, pour les repérer d'un coup d'œil.">Fixture</th><th title="univers.canal du premier et du dernier pixel : ce qu'il faut patcher à la console (recalculé en direct)">Adresse console (de → à)</th></tr></thead>`;
+      const head = `<thead><tr><th title="l'alimentation qui nourrit ce node. Elle s'étend sur tous les nodes liés — c'est-à-dire branchés sur la MÊME alimentation physique.">Alim</th><th title="lier ce node à l'alimentation du node du dessus : ⛓ même alimentation physique, ⊘ la sienne"></th><th>Node</th><th title="sélection pour l'édition en lot : elle porte sur des SORTIES, pas sur des nodes"></th><th>Sortie</th><th title="chaînage : ⛓ pixels collés à la sortie du dessus (une seule fixture), ⊘ sortie seule"></th><th title="profil de LED : type + ordre + pixels mémorisés sous un nom">Profil</th><th title="longueur type du produit choisi. La longueur réellement déclarée reste la colonne Pixels : celle-ci ne fait que proposer ce que la fiche prévoit.">Px</th><th class="adv">Pin</th><th>Type</th><th class="adv" title="budget de courant de cette sortie — n_agit que si « par sortie » est coché sur le node">Limite mA</th><th class="adv" title="Auto Brightness Limiter : mA par pixel à pleine luminosité, pour estimer/limiter la consommation">mA/pixel</th><th>Ordre</th><th title="échange du canal blanc (WLED : Swap) — proposé seulement sur les types numériques à canal blanc">Swap W</th><th title="index du premier pixel dans le node (0 = premier)">Départ</th><th title="pixels sur ce câble ; 📏 = calculateur, 📍 = repérer le dernier pixel">Pixels</th><th title="sens de parcours du ruban">Inv.</th><th class="adv">Skip</th><th class="adv">Off Refresh</th><th title="numéro de fixture à la console. Plusieurs sorties, même sur des nodes différents, peuvent partager un numéro : elles forment alors une seule fixture. La pastille de couleur est dérivée du numéro, pour les repérer d'un coup d'œil.">Fixture</th><th title="univers.canal du premier et du dernier pixel : ce qu'il faut patcher à la console (recalculé en direct)">Adresse console (de → à)</th></tr></thead>`;
       const NCOL = 17; // colonnes après la cellule Node
-      const body = gc.nodes.map(n => {
+      // ── Les suites de nodes liés à la même alimentation ──────────────────
+      // La cellule Alim s'étend sur PLUSIEURS nodes quand ils partagent une
+      // alimentation physique. Il faut donc, avant de rendre quoi que ce soit,
+      // savoir où chaque suite commence, quels nodes elle rassemble et combien
+      // de lignes de tableau elle couvre.
+      //
+      // Une suite ne se forme qu'entre nodes ADJACENTS de ce tableau : deux
+      // nodes de groupes d'affichage différents n'ont pas de cellule commune à
+      // étendre, et ne peuvent donc pas être liés ici. Le schéma, lui, ne
+      // connaît pas cette limite.
+      const lignesDe = n => (!n.plan.multi || !n.plan.outputs.length ? 1 : n.plan.outputs.length);
+      const grpDe = n => ((n.power || {}).psuGroup) || null;
+      const tetes = [];                        // index de node -> index de la tête de sa suite
+      for (let i = 0; i < gc.nodes.length; i++) {
+        const g = grpDe(gc.nodes[i]);
+        tetes[i] = (i > 0 && g && g === grpDe(gc.nodes[i - 1])) ? tetes[i - 1] : i;
+      }
+      const suites = new Map();                // index de tête -> { span, membres }
+      gc.nodes.forEach((n, i) => {
+        const t = tetes[i];
+        const s = suites.get(t) || { span: 0, membres: [] };
+        s.span += lignesDe(n); s.membres.push(n);
+        suites.set(t, s);
+      });
+
+      const body = gc.nodes.map((n, idx) => {
         const pl = n.plan; const rec = nodeRec(n.ip); const rawIns = (rec && rec.cfg && rec.cfg.hw && rec.cfg.hw.led && rec.cfg.hw.led.ins) || [];
-        if (!pl.multi) return `<tr data-node="${esc(n.ip)}">${nodeCell(n, 1)}<td class="pickcell"></td><td colspan="${NCOL}" class="muted">mode ${esc(modeName(pl.mode))} : ${esc(pl.note)}</td></tr>`;
+        const s = suites.get(idx);
+        const tete = (s ? cellAlim(n, s.membres, s.span) : '') + cellLien(n, idx > 0 ? gc.nodes[idx - 1] : null);
+        if (!pl.multi) return `<tr data-node="${esc(n.ip)}">${tete}${nodeCell(n, 1)}<td class="pickcell"></td><td colspan="${NCOL}" class="muted">mode ${esc(modeName(pl.mode))} : ${esc(pl.note)}</td></tr>`;
         const outs = pl.outputs; const span = Math.max(1, outs.length);
-        if (!outs.length) return `<tr data-node="${esc(n.ip)}">${nodeCell(n, 1)}<td class="pickcell"></td><td colspan="${NCOL}" class="muted">aucune sortie déclarée</td></tr>`;
-        return outs.map((o, i) => outRow(n, o, rawIns[i] || {}, i, i === 0, span)).join('');
+        if (!outs.length) return `<tr data-node="${esc(n.ip)}">${tete}${nodeCell(n, 1)}<td class="pickcell"></td><td colspan="${NCOL}" class="muted">aucune sortie déclarée</td></tr>`;
+        return outs.map((o, i) => outRow(n, o, rawIns[i] || {}, i, i === 0, span, (rec && rec.cfg && rec.cfg.hw && rec.cfg.hw.led) || null, i === 0 ? tete : '')).join('');
       }).join('');
       const ns = gc.nodes.filter(n => n.plan.multi);
       const minU = ns.length ? Math.min(...ns.map(n => n.plan.firstUni)) : null, maxU = ns.length ? Math.max(...ns.map(n => n.plan.lastUni)) : null;
@@ -1641,10 +1770,83 @@
     // 📏 pixels = LEDs per metre × length ; universes = ceil(px / pxPerUni) for the row's LED type
     // Choisir une longueur type remplit la colonne Pixels — qui reste seule
     // maîtresse : on peut la retoucher juste après, et l'écart s'affichera.
-    p.querySelectorAll('select[data-preset]').forEach(sl => sl.onchange = () => {
-      const v = Number(sl.value); if (!v) return;
-      const el = sl.closest('tr').querySelector('[data-out=len]');
-      el.value = String(v); el.dispatchEvent(new Event('input'));
+    p.querySelectorAll('select[data-preset]').forEach(sl => sl.onchange = () => wirePreset(sl));
+    // La carte s'écrit tout de suite dans le /fleet.json du node. Elle ne
+    // touche à aucun réglage WLED, donc elle n'a rien à faire dans la file
+    // d'attente de « Enregistrer les modifications » — mais elle exige un node
+    // en ligne, et ça, il faut le DIRE : un sélecteur qui revient tout seul à
+    // sa valeur d'avant sans un mot est le pire des deux mondes.
+    // le node tel que le plan DMX le décrit — c'est lui qui porte le bloc power
+    const nodePlan = ip => (d.nodes || []).find(x => x.ip === ip) || null;
+    // Le modèle d'alimentation s'écrit sur le node, comme la carte. Quand
+    // plusieurs nodes sont liés, la cellule les couvre tous : changer le modèle
+    // le change pour toute la suite, sinon on obtiendrait des nodes liés qui ne
+    // désignent pas la même alimentation — ce que le rapport signalerait à
+    // juste titre comme incohérent.
+    p.querySelectorAll('select[data-alim]').forEach(sl => {
+      const avant = sl.value;
+      sl.onchange = async () => {
+        const tete = sl.dataset.alim;
+        const grp = ((nodePlan(tete) || {}).power || {}).psuGroup || null;
+        const cibles = grp ? (d.nodes || []).filter(n => ((n.power || {}).psuGroup) === grp).map(n => n.ip) : [tete];
+        const rates = [];
+        for (const ip of cibles) {
+          try { await post(`/api/node/${encodeURIComponent(ip)}/power`, { psu: sl.value || null }); }
+          catch (e) { rates.push(`${ip} : ${e.message}`); }
+        }
+        if (rates.length) { sl.value = avant; toast(`alimentation non enregistrée — ${rates.join(' · ')}`, true, 7000); }
+        else toast(sl.value ? `alimentation enregistrée sur ${cibles.length} node(s)` : 'alimentation retirée');
+        renderDmx();
+      };
+    });
+
+    // Lier un node à l'alimentation de celui du dessus. Le chaînage des sorties
+    // se déduit des départs et n'écrit rien ; celui-ci est un fait stocké, donc
+    // il part tout de suite sur les nodes concernés — et le node doit être en
+    // ligne.
+    p.querySelectorAll('td[data-lien]').forEach(td => td.onclick = async () => {
+      const ip = td.dataset.lien, ipPrev = td.dataset.lienPrev;
+      const moi = nodePlan(ip), lui = nodePlan(ipPrev);
+      if (!moi || !lui) return;
+      const gMoi = (moi.power || {}).psuGroup || null, gLui = (lui.power || {}).psuGroup || null;
+      const psuLui = (lui.power || {}).psu || null;
+      if (gMoi && gMoi === gLui) {                       // détacher
+        try { await post(`/api/node/${encodeURIComponent(ip)}/power`, { psuGroup: null }); toast('node détaché'); }
+        catch (e) { return toast(`détachement impossible : ${e.message}`, true); }
+        return renderDmx();
+      }
+      if (!psuLui) return toast(`${lui.name || ipPrev} n'a pas d'alimentation : en choisir une d'abord`, true, 6000);
+      // La fiche dit combien de nodes peuvent y être branchés : au-delà, c'est
+      // un refus explicite plutôt qu'un dépassement silencieux.
+      const fiche = catalogueAlims().find(x => x.uid === psuLui);
+      // Un identifiant OPAQUE, et pas un dérivé de l adresse : metadata.js ne
+      // retient qu un uuid ou un ancien identifiant court, et une chaîne
+      // fabriquée serait rejetée en silence — le lien semblerait pris sans
+      // l être. Le groupe n a de sens que sur ce plateau, jamais ailleurs.
+      const grp = gLui || crypto.randomUUID();
+      const dejaLies = (d.nodes || []).filter(n => ((n.power || {}).psuGroup) === grp).length || 1;
+      if (fiche && fiche.psu.outputs > 0 && dejaLies + 1 > fiche.psu.outputs) {
+        return toast(`« ${nomFiche(fiche)} » ne déclare que ${fiche.psu.outputs} sortie(s) : ${dejaLies} node(s) y sont déjà branchés`, true, 7000);
+      }
+      try {
+        // le node du dessus prend le groupe s'il n'en avait pas, puis celui-ci
+        // le rejoint avec le même modèle : deux nodes liés qui désigneraient des
+        // modèles différents seraient signalés comme incohérents
+        if (!gLui) await post(`/api/node/${encodeURIComponent(ipPrev)}/power`, { psuGroup: grp });
+        await post(`/api/node/${encodeURIComponent(ip)}/power`, { psu: psuLui, psuGroup: grp });
+        toast('nodes liés à la même alimentation');
+      } catch (e) { return toast(`lien impossible : ${e.message}`, true, 6000); }
+      renderDmx();
+    });
+    p.querySelectorAll('select[data-carte]').forEach(sl => {
+      const avant = sl.value;
+      sl.onchange = async () => {
+        const ip = sl.dataset.carte;
+        try {
+          await post(`/api/node/${encodeURIComponent(ip)}/power`, { driver: sl.value || null });
+          toast(sl.value ? 'carte enregistrée sur le node' : 'carte retirée');
+        } catch (e) { sl.value = avant; toast(`carte non enregistrée : ${e.message}`, true); }
+      };
     });
     p.querySelectorAll('button[data-calc]').forEach(b => b.onclick = async () => {
       const tr = b.closest('tr');
@@ -1872,6 +2074,47 @@
         sl.closest('td').classList.toggle('newprof', !!(o && r && !pid && !o.ignored && o.len));
       });
     };
+    // Choisir un produit ALIGNE la ligne sur sa fiche : tous les réglages que
+    // le produit décrit, pas seulement le type et l'ordre. Ce qui dépend de
+    // l'installation — sens de parcours, index de départ, univers, adresse —
+    // n'y est pas, et n'est donc jamais touché : appliquer un produit ne peut
+    // pas casser un patch.
+    function appliquerProduit(tr, uid) {
+      const prod = produitDe(uid);
+      const set = (k, val) => {
+        const el = tr.querySelector(`[data-out=${k}]`);
+        if (!el || val === null || val === undefined) return;
+        if (el.type === 'checkbox') el.checked = !!val; else el.value = String(val);
+        el.dispatchEvent(new Event('input'));
+      };
+      if (!prod) return;
+      const l = prod.led;
+      set('type', l.type); set('order', l.order); set('wswap', l.wswap);
+      set('ledma', l.ledma); set('skip', l.skip); set('ref', l.offRefresh);
+      // la longueur par défaut de la fiche, quand elle en a une : c'est le point
+      // de départ, et la colonne Px permet d'en choisir une autre juste après
+      const def = (prod.presets || []).find(x => x.default) || (prod.presets || [])[0];
+      if (def) set('len', def.px);
+    }
+
+    // Repeupler la colonne Px sans re-rendre la grille : un re-rendu perdrait
+    // les autres modifications en attente et le focus.
+    function majPx(tr, uid) {
+      const td = tr.querySelector('td.pxcell'); if (!td) return;
+      const len = (tr.querySelector('[data-out=len]') || {}).value;
+      td.innerHTML = pxHtml(uid, len);
+      const sl = td.querySelector('select[data-preset]');
+      if (sl) sl.onchange = () => wirePreset(sl);
+    }
+    // Choisir une longueur type remplit la colonne Pixels — qui reste seule
+    // maîtresse : on peut la retoucher juste après, et l'écart à la fiche
+    // s'affichera sous le profil.
+    function wirePreset(sl) {
+      const v = Number(sl.value); if (!v) return;
+      const el = sl.closest('tr').querySelector('[data-out=len]');
+      el.value = String(v); el.dispatchEvent(new Event('input'));
+    }
+
     p.querySelectorAll('select[data-prof]').forEach(sl => sl.onchange = async () => {
       const tr = sl.closest('tr'); const v = sl.value; sl.value = '';
       if (v === '__new') {
@@ -1881,10 +2124,9 @@
         await refreshProfileSelects(); if (created) { sl.value = created.id; remember(tr, created.id); } return;
       }
       if (v === '__manage') { const r = sl.getBoundingClientRect(); menuBox(r.left, r.bottom + 2, ledProfilesCache.map(pr => ({ label: `Supprimer « ${pr.name} » (${LED_TYPES[pr.type] || pr.type}, ${COLOR_ORDERS[pr.order] || pr.order}, ${pr.len} px)`, danger: true, act: async () => { try { await api(`/api/led-profiles/${encodeURIComponent(pr.name)}`, { method: 'DELETE' }); } catch (e) { toast(e.message, true); } refreshProfileSelects(); } }))); return; }
-      if (v === '') { remember(tr, null); return; }
-      const pr = ledProfilesCache.find(x => x.id === v); if (!pr) return;
-      const set = (k, val) => { const el = tr.querySelector(`[data-out=${k}]`); el.value = String(val); el.dispatchEvent(new Event('input')); };
-      set('type', pr.type); set('order', pr.order); if (pr.len) set('len', pr.len);
+      if (v === '') { remember(tr, null); majPx(tr, null); return; }
+      appliquerProduit(tr, v);
+      majPx(tr, v);
       sl.value = v; remember(tr, v);
     });
     // the node remembers the profile of each output (MQTT client id suffix) ; in place, no re-render
@@ -2046,22 +2288,40 @@
   // lui donne les données et deux fonctions de rappel. Tirer un câble depuis
   // une alimentation vers un node écrit sur le NODE, comme partout ailleurs.
   let graphApi = null, graphSig = '';
+  // L'antenne, en plus du reste. Elle vient d'une autre route et peut très bien
+  // ne pas répondre — aucune antenne configurée, ou hors du réseau : c'est un
+  // cas normal, pas une panne, et le schéma se dessine sans elle.
+  async function antenneDuGraphe() {
+    try {
+      const a = await api('/api/ap');
+      const parMac = new Map((fleet.nodes || []).map(n => [String((n.info && n.info.mac) || '').toLowerCase(), n.meta.ip]));
+      const nodes = (a.clients || []).filter(c => c.isNode)
+        .map(c => parMac.get(String(c.mac || '').toLowerCase())).filter(Boolean);
+      if (!nodes.length) return null;
+      const r0 = (a.radios || [])[0];
+      return { label: (r0 && r0.ssid) || 'Antenne', nodes };
+    } catch { return null; }
+  }
+
   async function renderGraph() {
     const pane = $('#graphpanel');
     let d; try { d = await api('/api/power'); } catch (e) { pane.innerHTML = `<div class="st-bad">${esc(e.message)}</div>`; return; }
+    d.antenne = await antenneDuGraphe();
     if (!pane.querySelector('.gwrap')) {
       pane.innerHTML = `<h2>Schéma
-          <span class="muted" style="text-transform:none;letter-spacing:0" title="Alimentations à gauche, nodes au milieu, sorties à droite. La couleur d'un câble est celle du pire constat qui le concerne : le schéma est le rapport de cohérence, en plus lisible qu'un tableau. Molette pour zoomer, glisser le fond pour déplacer la vue, double-clic pour tout revoir.">ⓘ</span>
+          <span class="muted" style="text-transform:none;letter-spacing:0" title="La chaîne se lit de gauche à droite, dans l'ordre où le courant et les pixels circulent : alimentation, node, fixture, sortie. L'antenne partage la première colonne avec les alimentations — elle aussi alimente les nodes, en réseau. La couleur d'un câble est celle du pire constat qui le concerne : le schéma est le rapport de cohérence, en plus lisible qu'un tableau. Molette pour zoomer, glisser le fond pour déplacer la vue, double-clic pour tout revoir.">ⓘ</span>
           <span class="spacer"></span>
           <button id="gFit" class="rowbtn">Tout voir</button>
           <button id="gReset" class="rowbtn" title="oublier les positions déplacées à la main et revenir à la disposition calculée">Replacer</button></h2>
-        <div class="gwrap"></div>`;
+        <div class="gwrap"></div>
+        <div id="gChecks"></div>`;
       graphApi = WF_GRAPH.mount(pane.querySelector('.gwrap'), { onWire: wireNode });
       $('#gFit').onclick = () => graphApi.fit();
       $('#gReset').onclick = () => graphApi.resetPos();
       graphApi.update(d);
       // après la frame : le panneau vient d'être affiché, il n'a pas encore sa taille
       requestAnimationFrame(() => graphApi.fit());
+      renderChecks(d);
       graphSig = sigOf(d);
       return;
     }
@@ -2069,18 +2329,38 @@
     // reconstruit le schéma sous les doigts pendant qu'on déplace une boîte est
     // insupportable
     const sig = sigOf(d);
-    if (sig !== graphSig) { graphSig = sig; graphApi.update(d); }
+    if (sig !== graphSig) { graphSig = sig; graphApi.update(d); renderChecks(d); }
+  }
+
+  // Le rapport de cohérence, sous le schéma. Il vivait dans un onglet dédié qui
+  // n'existait que pour éditer des exemplaires d'alimentation ; les couleurs du
+  // graphe donnent la lecture rapide, cette liste donne les phrases.
+  function renderChecks(d) {
+    const box = $('#gChecks'); if (!box) return;
+    const cs = d.checks || [];
+    const par = { bad: [], warn: [], info: [] };
+    for (const c of cs) (par[c.level] || par.info).push(c);
+    const t = d.totals || {};
+    const ligne = c => `<div class="${LVL[c.level] || 'muted'}">${c.level === 'bad' ? '✗' : c.level === 'warn' ? '▲' : 'ⓘ'} ${esc(c.msg)}${c.node ? ` <span class="muted">— ${esc(c.node)}</span>` : ''}</div>`;
+    box.innerHTML = `<div class="subbox" style="margin-top:10px">
+      <h2 style="margin-top:0">Cohérence
+        <span class="muted" style="text-transform:none;letter-spacing:0">${par.bad.length} erreur(s) · ${par.warn.length} avertissement(s) · ${par.info.length} information(s)</span></h2>
+      <div class="muted" style="font-size:12px;margin-bottom:8px">${t.nodes || 0} node(s), ${t.rattaches || 0} rattaché(s) à une alimentation · budget total ${t.budgetA ?? '—'} A sur ${t.capaciteA ?? '—'} A de capacité déclarée</div>
+      ${cs.length ? `<div class="pwchecks">${[...par.bad, ...par.warn, ...par.info].map(ligne).join('')}</div>`
+    : '<div class="st-ok">rien à signaler</div>'}</div>`;
   }
   const sigOf = d => JSON.stringify([
     (d.psus || []).map(p => [p.uid, p.usedA, p.capA, (p.nodes || []).map(n => n.ip), (p.checks || []).length]),
     (d.orphelins || []).map(o => o.ip),
     (d.nodes || []).map(n => [n.ip, n.budget.maxA, n.budget.ratio, (n.budget.outputs || []).length]),
+    d.antenne ? d.antenne.nodes.length : 0,
+    (d.checks || []).length,
   ]);
 
   async function wireNode(psuUid, target) {
     // on ne câble que vers un node, et jamais vers une sortie ou une autre alim
-    const n = (powerData && powerData.nodes || []).find(x => x.ip === target)
-      || (powerData && powerData.orphelins || []).find(x => x.ip === target);
+    // une boîte de sortie porte un « # », une alimentation n'a pas de point :
+    // seul un node ressemble à une adresse IP
     if (!target.includes('.') || target.includes('#')) return;
     try {
       await post(`/api/node/${encodeURIComponent(target)}/power`, { psu: psuUid });
@@ -2089,157 +2369,13 @@
     } catch (e) { toast(e.message, true); }
   }
 
-  // ── Onglet Puissance ──────────────────────────────────────────────────────
-  // La règle de partage, à tenir : Sorties / DMX répond à « où sont les
-  // pixels », Puissance répond à « d'où vient le courant ». Cet onglet ne
-  // montre donc AUCUN univers, aucune adresse, aucune fixture — dès qu'on veut
-  // savoir « quel univers », on change d'onglet. C'est ce qui empêche les deux
-  // pages de devenir deux fois la même.
-  let powerData = null, powerSel = null;
+  // ── Ce qui a remplacé l'onglet Puissance ─────────────────────────────────
+  // Il y avait ici un onglet dédié : une carte par EXEMPLAIRE d'alimentation,
+  // avec la création et l'édition de ces exemplaires. Les exemplaires n'existent
+  // plus — un node porte le modèle qui l'alimente et l'identifiant du groupe
+  // qui le partage — et le rattachement se fait donc là où on règle le node.
+  // Le rapport de cohérence, lui, vit dans le Schéma.
   const LVL = { bad: 'st-bad', warn: 'st-warn', info: 'muted' };
-  const aFmt = a => (a === null || a === undefined ? '—' : `${a} A`);
-
-  async function renderPower() {
-    const pane = $('#powerpanel');
-    try { powerData = await api('/api/power'); } catch (e) { pane.innerHTML = `<div class="st-bad">${esc(e.message)}</div>`; return; }
-    const d = powerData;
-    const graves = d.checks.filter(c => c.level !== 'info');
-
-    const carte = p => {
-      const pct = p.chargePct;
-      const teinte = pct === null ? '' : pct > 100 ? 'st-bad' : pct > 80 ? 'st-warn' : 'st-ok';
-      const cs = p.checks || [];
-      return `<div class="gtable"><details data-key="pw:${esc(p.uid || p.label)}" open><summary>
-          <span class="caret">▸</span> <b>${esc(p.label || '(sans nom)')}</b>
-          <span class="muted">${p.model ? esc([p.model.ref.brand, p.model.ref.model].filter(Boolean).join(' ')) : 'modèle non renseigné'}${p.location ? ` · ${esc(p.location)}` : ''}</span>
-          ${p.capA !== null ? `<span class="${teinte}">${p.usedA} A budgétés sur ${p.capA} A${pct !== null ? ` · ${pct} %` : ''}</span>` : '<span class="muted">capacité inconnue</span>'}
-          ${cs.some(c => c.level === 'bad') ? '<span class="st-bad">✗</span>' : cs.some(c => c.level === 'warn') ? '<span class="st-warn">▲</span>' : ''}
-          <span class="spacer"></span>
-          <button class="rowbtn" data-pwedit="${esc(p.uid)}">Modifier</button>
-        </summary>
-        ${p.capA !== null ? `<div class="pwbar" title="budget utilisable : ${p.budgetA} A (${p.capA} A moins le taux d'usage et la marge)">
-          <i style="width:${Math.min(100, pct || 0)}%" class="${teinte}"></i>
-          <b style="left:${Math.min(100, Math.round((p.budgetA / p.capA) * 100))}%" title="limite conseillée"></b></div>` : ''}
-        ${cs.length ? `<div class="pwchecks">${cs.map(c => `<div class="${LVL[c.level]}">${c.level === 'bad' ? '✗' : c.level === 'warn' ? '▲' : 'ⓘ'} ${esc(c.msg)}</div>`).join('')}</div>` : ''}
-        <table class="outs" style="width:auto">
-          <thead><tr><th>Node</th><th>Carte</th><th title="ce que l'ABL autorise réellement — c'est ce chiffre qu'on somme, pas le pire cas">Budget</th><th title="blanc plein, toutes sorties : jamais atteint en pratique">Pire cas</th><th title="part du blanc plein réellement atteignable avec ce budget">Blanc</th><th>Tension</th><th></th></tr></thead>
-          <tbody>${p.nodes.length ? p.nodes.map(n => ligneNode(n)).join('') : '<tr><td colspan="7" class="muted">aucun node rattaché</td></tr>'}</tbody>
-        </table></details></div>`;
-    };
-
-    // La carte se choisit ICI et nulle part ailleurs : c'est un fait de
-    // matériel, au même titre que l'alimentation qui nourrit le boîtier, et
-    // Sorties/DMX ne parle que de pixels. Le rattachement part dans le
-    // /fleet.json du node, donc il survit à un changement de poste.
-    const selCarte = (ip, uid) => {
-      const list = (d.drivers || []);
-      if (!list.length) return '<span class="muted" title="aucune carte au catalogue : onglet Matériel > Bibliothèques > Cartes">—</span>';
-      return `<select data-setdriver="${esc(ip)}" title="quelle carte est ce node : ce qu'elle admet en tension et en courant décide si son budget est réaliste"><option value="">—</option>${list.map(x => `<option value="${esc(x.uid)}"${x.uid === uid ? ' selected' : ''}>${esc([x.ref.brand, x.ref.model].filter(Boolean).join(' '))}</option>`).join('')}</select>`;
-    };
-
-    const ligneNode = n => {
-      const full = (d.nodes || []).find(x => x.ip === n.ip) || {};
-      const b = full.budget || {};
-      const r = n.ratio === null || n.ratio === undefined ? null : Math.round(n.ratio * 100);
-      return `<tr><td><b>${esc(n.name)}</b></td>
-        <td>${selCarte(n.ip, full.driver ? full.driver.uid : '')}</td>
-        <td>${aFmt(n.maxA)}${b.ablGoverns ? ' <span class="muted" title="le facteur d\'usage dépasse ce budget : c\'est l\'ABL qui décide ici">◂</span>' : ''}</td>
-        <td class="muted">${aFmt(n.worstA)}</td>
-        <td class="${r === null ? 'muted' : r < 50 ? 'st-warn' : 'muted'}">${r === null ? '—' : `${r} %`}</td>
-        <td class="muted">${(b.volts && b.volts.length) ? b.volts.join('/') + ' V' : '—'}</td>
-        <td><button class="rowbtn" data-detach="${esc(n.ip)}" title="détacher ce node de cette alimentation">✕</button></td></tr>`;
-    };
-
-    pane.innerHTML = `<h2>Puissance
-        <span class="muted" style="text-transform:none;letter-spacing:0" title="Cette page répond à « d'où vient le courant ». Sorties / DMX répond à « où sont les pixels » — on n'y trouve donc ici ni univers, ni adresse, ni fixture. Les budgets sommés sont les limites déclarées à WLED (son limiteur automatique), et non les pires cas théoriques : sur une flotte réelle le pire cas dépasse partout le budget, et le sommer produirait une alerte permanente.">ⓘ</span>
-        <span class="spacer"></span>
-        <button id="pwNew" class="rowbtn">＋ Alimentation</button></h2>
-      ${graves.length
-    ? `<div class="subbox" style="margin-bottom:10px">${graves.map(c => `<div class="${LVL[c.level]}">${c.level === 'bad' ? '✗' : '▲'} ${c.node ? `<b>${esc(c.node)}</b> — ` : ''}${esc(c.msg)}</div>`).join('')}</div>`
-    : '<div class="st-ok" style="margin-bottom:10px">✓ rien à signaler sur la chaîne électrique</div>'}
-      <div class="pwtotals subbox">
-        <span><span class="k">Capacité installée</span> <b>${d.totals.capaciteA} A</b></span>
-        <span><span class="k">Budgets déclarés</span> <b>${d.totals.budgetA} A</b></span>
-        <span><span class="k">Pire cas théorique</span> <b class="muted">${d.totals.pireCasA} A</b></span>
-        <span><span class="k">Nodes rattachés</span> <b>${d.totals.rattaches} / ${d.totals.nodes}</b></span>
-      </div>
-      ${d.psus.map(carte).join('') || '<div class="muted">aucune alimentation saisie — « ＋ Alimentation » pour commencer</div>'}
-      ${d.orphelins.length ? `<h2 style="margin-top:16px">Non rattachés <span class="muted">${d.orphelins.length}</span></h2>
-        <div class="muted" style="font-size:12px;margin-bottom:6px">Ces nodes ne sont reliés à aucune alimentation : impossible de dire si ce qu'ils ont le droit de tirer est couvert.</div>
-        <table class="outs" style="width:auto"><tbody>${d.orphelins.map(o => `<tr><td><b>${esc(o.name)}</b></td><td>${aFmt(o.maxA)}</td>
-          <td>${d.plan.psus.length ? `<select data-attach="${esc(o.ip)}"><option value="">rattacher à…</option>${d.plan.psus.map(x => `<option value="${esc(x.uid)}">${esc(x.label)}</option>`).join('')}</select>` : '<span class="muted">saisir d\'abord une alimentation</span>'}</td></tr>`).join('')}</tbody></table>` : ''}
-      <div id="pwEdit"></div>`;
-
-    keepDetails(pane);
-    $('#pwNew').onclick = () => editPsu(null);
-    pane.querySelectorAll('[data-pwedit]').forEach(b => b.onclick = () => editPsu(b.dataset.pwedit));
-    pane.querySelectorAll('[data-attach]').forEach(sel => sel.onchange = () => attach(sel.dataset.attach, sel.value));
-    pane.querySelectorAll('[data-detach]').forEach(b => b.onclick = () => attach(b.dataset.detach, null));
-    pane.querySelectorAll('[data-setdriver]').forEach(sl => sl.onchange = async () => {
-      const ip = sl.dataset.setdriver, uid = sl.value || null;
-      try {
-        // rail: undefined = on ne touche PAS au rattachement d'alimentation en
-        // changeant la carte ; ce sont deux faits indépendants
-        await post(`/api/node/${encodeURIComponent(ip)}/power`, { driver: uid });
-        toast(uid ? 'carte rattachée' : 'carte détachée');
-        renderPower();
-      } catch (e) { toast(e.message, true); renderPower(); }
-    });
-    updatePowerBadge(d);
-  }
-
-  function updatePowerBadge(d) {
-    const n = (d.checks || []).filter(c => c.level !== 'info').length;
-    setBadge('power', n ? ` <span class="n">${n}</span>` : '');
-  }
-
-  // Rattacher écrit sur le NODE : c'est lui qui doit se raconter, y compris sur
-  // un poste qui n'a jamais vu ce showfile.
-  async function attach(ip, psu) {
-    try {
-      await post(`/api/node/${encodeURIComponent(ip)}/power`, { psu, rail: psu ? undefined : null });
-      toast(psu ? 'node rattaché' : 'node détaché');
-      renderPower();
-    } catch (e) { toast(e.message, true); }
-  }
-
-  function editPsu(uid) {
-    const cur = uid ? powerData.plan.psus.find(x => x.uid === uid) : null;
-    const box = $('#pwEdit');
-    box.innerHTML = `<h2 style="margin-top:16px">${cur ? 'Modifier' : 'Nouvelle alimentation'}</h2>
-      <div class="setrow" style="max-width:700px">
-        <label for="pwLabel">Libellé</label><div><input id="pwLabel" value="${esc(cur ? cur.label : '')}" placeholder="Alim jardin" style="width:220px"></div>
-        <div class="hint">le nom qu'on emploie sur le plateau, pas la référence du fabricant</div>
-        <label for="pwModel">Modèle</label><div><select id="pwModel"><option value="">— non renseigné —</option>${
-  (powerData.catalogue || []).filter(x => !x.retired).map(x => `<option value="${esc(x.uid)}"${cur && cur.model === x.uid ? ' selected' : ''}>${esc([x.ref.brand, x.ref.model].filter(Boolean).join(' '))} · ${x.psu.volt} V${x.psu.amps ? ` ${x.psu.amps} A` : ''}</option>`).join('')}</select></div>
-        <div class="hint">pris dans la Bibliothèque → Alimentations. Sans modèle, aucune capacité n'est connue et rien ne peut être vérifié.</div>
-        <label for="pwLoc">Emplacement</label><div><input id="pwLoc" value="${esc(cur ? cur.location : '')}" placeholder="sous le praticable jardin" style="width:100%;max-width:330px"></div>
-        <div class="hint">ce qu'on cherche quand quelque chose ne s'allume pas, et que personne ne note jamais</div>
-      </div>
-      <div style="margin-top:8px;display:flex;gap:8px">
-        <button id="pwSave" class="rowbtn primary">Enregistrer</button>
-        ${cur ? '<button id="pwDel" class="rowbtn">Retirer</button>' : ''}
-        <button id="pwCancel" class="rowbtn">Annuler</button>
-      </div>`;
-    box.scrollIntoView({ block: 'nearest' });
-    $('#pwCancel').onclick = () => { box.innerHTML = ''; };
-    $('#pwSave').onclick = async () => {
-      try {
-        await post('/api/power/psu', { uid: cur ? cur.uid : undefined, label: $('#pwLabel').value, model: $('#pwModel').value || null, location: $('#pwLoc').value });
-        box.innerHTML = ''; toast('alimentation enregistrée'); renderPower();
-      } catch (e) { toast(e.message, true); }
-    };
-    if ($('#pwDel')) $('#pwDel').onclick = async () => {
-      if (!await confirmBox(`Retirer « ${cur.label} » ?\nLes nodes qu'elle nourrit ne seront PAS détachés d'autorité : ils apparaîtront comme non rattachés, à vous de les replacer.`)) return;
-      try {
-        const r = await api(`/api/power/psu/${encodeURIComponent(cur.uid)}`, { method: 'DELETE' });
-        box.innerHTML = '';
-        toast(r.orphelins.length ? `retirée — ${r.orphelins.length} node(s) désormais sans alimentation` : 'retirée');
-        renderPower();
-      } catch (e) { toast(e.message, true); }
-    };
-  }
-
 
   // ── Cartes et alimentations ───────────────────────────────────────────────
   // Même patron que les produits : liste à gauche, éditeur à droite. Ce qui
@@ -3582,7 +3718,7 @@
         }[o.status] || esc(o.status);
       }
       const why = !n.online ? 'hors ligne' : n.otaLock ? 'OTA verrouillé' : !asset ? 'pas de firmware pour cette plateforme dans la cible' : !asset.local ? 'firmware pas encore téléchargé' : '';
-      return `<tr title="${esc(why)}"><td><input type="checkbox" class="fwsel" data-ip="${esc(n.ip)}" ${can ? '' : 'disabled'} ${fwSel.has(n.ip) && can ? 'checked' : ''}></td><td>${esc(n.name || n.ip)} <span class="muted">${esc(n.ip)}</span></td><td>${esc(fw.env || '')}${fw.fork ? ` <span class="tag pre" title="firmware d'un fork : ${esc(fw.fork)}">fork</span>` : ''}</td><td>${esc(fw.ver || '')}</td><td>${esc(fw.latest || '?')}${fw.latestLocal ? ' <span class="st-ok" title="dans le dépôt">●</span>' : ''}</td><td class="${stCls}">${esc(fw.status || '')}${n.otaLock ? ' · <span class="st-bad">OTA verrouillé</span>' : ''}</td><td>${flash}</td></tr>`;
+      return `<tr title="${esc(why)}"><td><input type="checkbox" class="fwsel" data-ip="${esc(n.ip)}" ${can ? '' : 'disabled'} ${fwSel.has(n.ip) && can ? 'checked' : ''}></td><td>${esc(n.name || n.ip)} <span class="muted">${esc(n.ip)}</span></td><td>${esc(fw.env || '')}${fw.envDeduit ? ` <span class="tag" title="${esc('ce firmware est trop ancien pour annoncer sa plateforme (le champ info.release apparaît seulement en 0.15) : elle est déduite de son matériel — ' + (fw.envPourquoi || '') + '. Vérifier avant de flasher.')}">déduit</span>` : ''}${!fw.env && fw.envPourquoi ? ` <span class="muted" title="${esc(fw.envPourquoi)}">à choisir</span>` : ''}${fw.fork ? ` <span class="tag pre" title="firmware d'un fork : ${esc(fw.fork)}">fork</span>` : ''}</td><td>${esc(fw.ver || '')}</td><td>${esc(fw.latest || '?')}${fw.latestLocal ? ' <span class="st-ok" title="dans le dépôt">●</span>' : ''}</td><td class="${stCls}">${esc(fw.status || '')}${n.otaLock ? ' · <span class="st-bad">OTA verrouillé</span>' : ''}</td><td>${flash}</td></tr>`;
     }).join('') || '<tr><td colspan="7" class="muted">aucun node</td></tr>';
     $('#fwNodes').querySelectorAll('input.fwsel').forEach(cb => cb.onchange = () => { cb.checked ? fwSel.add(cb.dataset.ip) : fwSel.delete(cb.dataset.ip); updateFlashBtn(); });
     updateFlashBtn();
@@ -3782,9 +3918,6 @@
     graph: { pane: '#graphpanel', label: 'Schéma',
       title: "le plateau vu en schéma : quelle alimentation nourrit quel node, et quelle sortie part de quel node. Les câbles prennent la couleur du pire constat qui les concerne — le schéma EST le rapport de cohérence. Tirer un câble depuis le port d'une alimentation rattache un node ; glisser une boîte la déplace, double-clic sur le fond pour tout revoir.",
       show: () => { renderGraph(); } },
-    power: { pane: '#powerpanel', label: "Puissance",
-      title: "la chaîne électrique : quelle alimentation nourrit quel node, ce que chacun a le droit de tirer, et si ça tient. Répond à « d'où vient le courant » — Sorties / DMX répond à « où sont les pixels ». Le badge = nombre d'anomalies.",
-      show: () => { renderPower(); } },
     lib: { pane: '#libpanel', label: "Bibliothèque",
       title: "catalogue des produits LED de la gamme : pour chaque produit, tous ses réglages de sortie (type, ordre des couleurs, échange du blanc, mA/LED, skip, off refresh, LEDs par mètre) et ses longueurs types. Choisir un produit sur une sortie remplit tous ces champs d'un coup. Le badge = produits jamais publiés dans la bibliothèque partagée.",
       show: () => { renderLib(); } },
@@ -3803,7 +3936,7 @@
   };
   const FAMILIES = [
     { id: 'fleet', label: 'Flotte', tabs: ['grid', 'journal', 'snap'] },
-    { id: 'show', label: 'Show', tabs: ['dmx', 'power', 'graph'] },
+    { id: 'show', label: 'Show', tabs: ['dmx', 'graph'] },
     { id: 'hw', label: 'Matériel', tabs: ['lib', 'fw', 'pair'] },
     { id: 'net', label: 'Réseau', tabs: ['ap', 'opt'] },
     { id: 'cfg', label: '⚙', tabs: ['settings'] },

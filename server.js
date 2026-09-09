@@ -380,7 +380,15 @@ function enqueueOta(ip, tag, asset, parallel) {
   if (!rec) throw new Error('node inconnu');
   if (!firmware.isLocal(tag, asset)) throw new Error(`${asset} n'est pas dans le dépôt local : le télécharger d'abord`);
   const m = firmware.ASSET_RE.exec(asset);
-  if (rec.info && m && m[2] !== rec.info.release) throw new Error(`plateforme ${m[2]} ≠ ${rec.info.release} du node`);
+  // La plateforme du node : celle qu'il déclare, ou celle qu'on déduit quand il
+  // est trop ancien pour la dire (avant 0.15, info.release n'existe pas). Sans
+  // ça, ce garde-fou comparait l'asset à un champ absent et refusait TOUTE mise
+  // à jour sur les nodes qui en avaient le plus besoin.
+  if (rec.info && m) {
+    const g = firmware.guessEnv(rec.info);
+    if (!g.env) throw new Error(`plateforme du node indéterminable (${g.pourquoi}) : choisir le fichier à la main`);
+    if (m[2] !== g.env) throw new Error(`plateforme ${m[2]} ≠ ${g.env}${g.deduit ? ' (déduite)' : ''} du node`);
+  }
   if (rec.cfg && rec.cfg.ota && rec.cfg.ota.lock) throw new Error('OTA verrouillé sur ce node (Sécurité > OTA lock)');
   if (rec.meta.ota && ['queued', 'flash', 'reboot'].includes(rec.meta.ota.status)) throw new Error('mise à jour déjà en cours');
   rec.meta.ota = { status: 'queued', tag, asset, from: rec.info && rec.info.ver, at: Date.now(), msg: '' };
@@ -503,11 +511,7 @@ async function writeNodeLibrary(rec, meta) {
   // poste neuf dirait « alimenté par 7e3f… » sans que personne ne sache ce que
   // c'est. C'est le même problème que les produits, et la même réponse.
   Object.assign(slice, drivers.nodeSlice(driverStore, [pw.driver].filter(Boolean)));
-  const inst = powerPlan.psus.find(x => x.uid === pw.psu);
-  Object.assign(slice, psus_.nodeSlice(psuStore, [inst && inst.model].filter(Boolean)));
-  // et l'exemplaire lui-même, qui n'est dans aucun catalogue puisqu'il est
-  // propre à ce montage
-  if (inst) slice.powerNodes = [{ uid: inst.uid, label: inst.label, model: inst.model, location: inst.location }];
+  Object.assign(slice, psus_.nodeSlice(psuStore, [pw.psu].filter(Boolean)));
   if (!slice.products.length && !slice.drivers.length && !slice.psus.length) return;   // rien à décrire
   slice.format = library.NODE_FORMAT;
   try {
@@ -526,6 +530,7 @@ async function writeNodePower(rec, b) {
   const cur = metadata.parse(rec.meta.nodeMeta || metadata.empty());
   const next = metadata.parse({ ...cur, power: {
     psu: b.psu === undefined ? cur.power.psu : b.psu,
+    psuGroup: b.psuGroup === undefined ? cur.power.psuGroup : b.psuGroup,
     rail: b.rail === undefined ? cur.power.rail : b.rail,
     driver: b.driver === undefined ? cur.power.driver : b.driver,
   } });
@@ -1080,15 +1085,36 @@ function catUsage(kind) {
   return by;
 }
 
-// ── Le plan d'alimentation ──────────────────────────────────────────────────
-// Les EXEMPLAIRES posés sur le plateau, par opposition aux modèles du
-// catalogue. Propre au spectacle, donc jamais dans le dépôt partagé — mais
-// dans le showfile, puisqu'il décrit ce montage-là.
-const POWER_FILE = dataFile('power-plan.json');
-let powerPlan = (() => {
-  try { return power.normPlan(JSON.parse(fs.readFileSync(POWER_FILE, 'utf8'))); } catch { return power.normPlan(null); }
-})();
-const savePlan = () => saveCat(POWER_FILE, powerPlan);
+// ── Les groupes d'alimentation ──────────────────────────────────────────────
+// Il n'y a plus de fichier de plan ni d'exemplaires à créer : un node porte le
+// MODÈLE qui l'alimente (`power.psu`) et, quand plusieurs nodes partagent la
+// même alimentation physique, un identifiant de groupe commun
+// (`power.psuGroup`). Tout se lit donc sur les nodes, et voyage avec eux.
+//
+// Un node qui déclare un modèle sans groupe forme un groupe d'un seul : c'est
+// le cas courant, une alimentation par boîtier, et il ne demande aucun geste.
+function powerGroups(nodes) {
+  const par = new Map();
+  for (const n of nodes) {
+    if (!n.power.psu) continue;                       // pas d'alimentation déclarée : orphelin
+    const cle = n.power.psuGroup || `seul:${n.ip}`;
+    if (!par.has(cle)) par.set(cle, { uid: cle, rail: n.power.rail || null, nodes: [], modeles: new Set() });
+    const g = par.get(cle);
+    g.nodes.push(n.ip);
+    g.modeles.add(n.power.psu);
+  }
+  return [...par.values()].map(g => {
+    const premier = [...g.modeles][0];
+    const model = psus_.resolve(psuStore, premier);
+    return {
+      uid: g.uid, rail: g.rail, nodes: g.nodes, model,
+      // deux nodes liés qui ne désignent pas le même modèle : l'un des deux se
+      // trompe, et la capacité retenue n'est alors qu'une supposition
+      mixedModel: g.modeles.size > 1,
+      label: model ? psus_.label(model) : 'alimentation non renseignée',
+    };
+  });
+}
 
 // Ce que le module de cohérence attend : un budget par node, et les
 // exemplaires avec la liste des nodes qui les désignent.
@@ -1104,21 +1130,33 @@ function powerAudit() {
       ip: rec.meta.ip, name: (rec.info && rec.info.name) || rec.meta.ip, driver,
       online: !!rec.meta.online,
       power: meta.power || { psu: null, rail: null, driver: null },
+      // Le mA/pixel des firmwares 0.14 est GLOBAL : sans traduction, le module
+      // de cohérence lit ins[i].ledma, ne trouve rien, et suppose 55 — donc il
+      // ne verrait pas les nodes qui déclarent 0 et dont l'ABL est en réalité
+      // entièrement désactivé.
       budget: power.nodeBudget({
-        maxpwr: led.maxpwr, ins: led.ins, ignored: rec.meta.ignoredOutputs || [], driver,
-        product: i => library.resolve(libraryStore, (byPos[i] || {}).product),
+        maxpwr: led.maxpwr, ins: power.migrateLed(led).ins, ignored: rec.meta.ignoredOutputs || [], driver,
+        // Le produit d'une sortie se marque à DEUX endroits, pour des raisons
+        // historiques : dans /fleet.json (outputs[].product) et dans le
+        // marqueur que Fleet range depuis toujours dans le client id MQTT du
+        // node. La grille lisait le second, ce rapport ne lisait que le
+        // premier — d'où un écart mA/pixel bien visible dans Sorties/DMX et
+        // parfaitement muet dans le rapport de cohérence, sur les mêmes
+        // sorties. On accepte les deux, le fichier faisant foi quand les deux
+        // répondent.
+        // la fixture ne sert à aucun calcul : elle place la sortie sous sa
+        // fixture dans le schéma plutôt que directement sous son node
+        fixture: i => { const v = (byPos[i] || {}).fixture; return v === undefined ? null : v; },
+        product: i => library.resolve(libraryStore,
+          (byPos[i] || {}).product || (rec.meta.outputProfiles || [])[i] || null),
       }),
     });
   }
-  // un exemplaire rassemble les nodes qui le désignent — au niveau node, ou par
-  // une sortie qui déclare autre chose que son node
-  const psus = powerPlan.psus.map(inst => ({
-    ...inst,
-    model: psus_.resolve(psuStore, inst.model),
-    rail: null,
-    nodes: nodes.filter(n => n.power.psu === inst.uid).map(n => n.ip),
-  }));
-  return power.audit({ psus, nodes });
+  // Le regroupement se lit sur les nodes eux-mêmes. Le `psu` par SORTIE, prévu
+  // par metadata.js pour les grandes structures dont deux rubans partent sur un
+  // autre circuit, n'est pas encore pris en compte ici — le dire plutôt que de
+  // laisser croire le contraire.
+  return power.audit({ psus: powerGroups(nodes), nodes });
 }
 
 // Le corps commun des routes de catalogue. Les trois types se comportent
@@ -1592,6 +1630,13 @@ const server = http.createServer(async (req, res) => {
       const b = await readBody(req);
       if (!Array.isArray(b.ins) || !b.ins.length) return send(res, 400, { error: 'liste de sorties vide' });
       const prevIns = rec.cfg.hw.led.ins || [];
+      // Quelle génération de firmware ? En 0.14 le mA/pixel est GLOBAL et les
+      // sorties n'ont ni ledma ni maxpwr ; WLED y ignore les clés qu'il ne
+      // connaît pas, donc écrire ins[i].ledma sur un de ces nodes ne lève
+      // aucune erreur et ne change rien — Fleet affichait ensuite la valeur
+      // demandée comme si elle était appliquée.
+      const scheme = power.ablScheme(rec.cfg.hw.led);
+      const vieux = scheme === power.SCHEME_GLOBAL;
       const ins = [];
       for (let i = 0; i < b.ins.length; i++) {
         const u = b.ins[i];
@@ -1619,11 +1664,27 @@ const server = http.createServer(async (req, res) => {
         // l'expose par la case « Use per-output limiter », qui n'est pas stockée :
         // cocher revient à soumettre maxpwr global = 0 (settings_leds.htm:164).
         const omax = Number(u.omax);
-        ins.push({ ...base, pin: pins, type: Number.isFinite(type) ? type : (base.type ?? 22), order: (highNib << 4) | lowNib, start, len, rev: !!u.rev, skip: Math.max(0, Number(u.skip) || 0), ledma: Number.isFinite(ledma) && ledma >= 0 ? ledma : (base.ledma ?? 55), ref: !!u.ref,
-          ...(Number.isFinite(omax) && omax >= 0 ? { maxpwr: Math.min(65000, Math.round(omax)) } : {}) });
+        ins.push({ ...base, pin: pins, type: Number.isFinite(type) ? type : (base.type ?? 22), order: (highNib << 4) | lowNib, start, len, rev: !!u.rev, skip: Math.max(0, Number(u.skip) || 0), ref: !!u.ref,
+          // sur un firmware 0.14 ces deux champs n'existent pas dans la sortie :
+          // les y mettre reviendrait à les jeter
+          ...(vieux ? {} : { ledma: Number.isFinite(ledma) && ledma >= 0 ? ledma : (base.ledma ?? 55) }),
+          ...(!vieux && Number.isFinite(omax) && omax >= 0 ? { maxpwr: Math.min(65000, Math.round(omax)) } : {}) });
+      }
+      // Sur un node 0.14, le mA/pixel n'a qu'UN emplacement pour tout le node.
+      // Demander deux valeurs différentes n'y est pas réalisable : mieux vaut
+      // le dire que d'en appliquer une au hasard.
+      let ledPatch = {};
+      if (vieux) {
+        const demandes = [...new Set(b.ins.map(u => Number(u.ledma)).filter(v => Number.isFinite(v) && v >= 0))];
+        if (demandes.length > 1) {
+          return send(res, 400, { error: `ce node est en firmware ${(rec.info && rec.info.ver) || 'ancien'} : le mA/pixel y est unique pour tout le node, il ne peut pas valoir ${demandes.join(' et ')} selon la sortie` });
+        }
+        if (demandes.length === 1) ledPatch.ledma = Math.min(255, demandes[0]);
+        const parSortie = b.ins.some(u => Number.isFinite(Number(u.omax)) && Number(u.omax) > 0);
+        if (parSortie) return send(res, 400, { error: `ce node est en firmware ${(rec.info && rec.info.ver) || 'ancien'} : il n'a pas de limite de courant par sortie, seulement la limite globale du node` });
       }
       try {
-        await postJson(ip, '/json/cfg', { hw: { led: { ins } } }, 8000);
+        await postJson(ip, '/json/cfg', { hw: { led: { ...ledPatch, ins } } }, 8000);
         recordChange(rec, 'outputs', rec.derived.outputs, ins.map(x => `${x.pin.join('/')}:${x.start}+${x.len}`).join(' | '), 'grille');
         // Les métadonnées Fleet APRÈS les réglages, jamais avant : si l'écriture
         // du fichier échoue, le node porte des réglages sans marqueur — gênant
@@ -1769,10 +1830,12 @@ const server = http.createServer(async (req, res) => {
       const b = await readBody(req);
       const inc = b.include || {};
       const doc = {
-        // v2 : ajout de `drivers`, `psus` et `powerPlan`. Purement additif — un
-        // Fleet antérieur ignore ces clés et lit le reste comme avant, un Fleet
-        // récent trouve simplement un plan vide dans un showfile v1.
-        format: 'wledfleet-showfile', formatVersion: 2, app: APP_VERSION, exportedAt: new Date().toISOString(),
+        // v3 : le plan d'alimentation disparaît. Il portait des EXEMPLAIRES —
+        // « Alim jardin » — que plus rien ne décrit : un node porte désormais
+        // le modèle qui l'alimente et l'identifiant du groupe qui le partage,
+        // donc tout voyage déjà avec les nodes. Un showfile v2 s'importe sans
+        // erreur, sa clé powerPlan étant simplement ignorée.
+        format: 'wledfleet-showfile', formatVersion: 3, app: APP_VERSION, exportedAt: new Date().toISOString(),
         // `library` porte le catalogue complet (avec ses identifiants) ;
         // `ledProfiles` reste pour qu'une version antérieure sache encore lire
         // ce showfile.
@@ -1782,9 +1845,6 @@ const server = http.createServer(async (req, res) => {
         // sur un autre poste désigne des drivers et des alims que ce poste ne
         // connaît pas, et le rapport de cohérence ne conclut plus rien.
         drivers: driverStore, psus: psuStore,
-        // Le plan, lui, n'existe QUE là : « Alim jardin » ne veut rien dire dans
-        // le dépôt partagé, donc le showfile est son seul véhicule.
-        powerPlan,
         snapshots: snapshots.list().map(s => { try { return snapshots.load(s.id); } catch { return null; } }).filter(Boolean),
         firmwareIndex: (() => { try { return JSON.parse(fs.readFileSync(dataFile('firmware', 'index.json'), 'utf8')); } catch { return null; } })(),
         journal: inc.journal ? changes.slice(-2000) : undefined,
@@ -1849,16 +1909,9 @@ const server = http.createServer(async (req, res) => {
           }
           if (n) { saveKind(kind); done.push(`${n} ${kind === 'drivers' ? 'driver(s)' : 'alimentation(s)'}`); }
         }
-        // Le plan d'alimentation est fusionné exemplaire par exemplaire, pas
-        // remplacé : importer le showfile d'un autre plateau ne doit pas faire
-        // disparaître les alims déjà décrites ici.
-        if (doc.powerPlan) {
-          let n = 0;
-          for (const inst of power.normPlan(doc.powerPlan).psus) {
-            try { powerPlan = power.planUpsert(powerPlan, inst, require('crypto').randomUUID()).plan; n++; } catch { /* ignorée */ }
-          }
-          if (n) { savePlan(); done.push(`${n} alimentation(s) du plateau`); }
-        }
+        // Un showfile v2 porte encore un plan d'alimentation : on l'ignore
+        // sciemment. Ses exemplaires ne désignent plus rien, et le rattachement
+        // qui compte voyage avec les nodes, dans leur /fleet.json.
         for (const e of doc.knownNodes) { const ip = typeof e === 'string' ? e : e.ip; if (!ip) continue; const r = addNode(ip); if (e.info && !r.info) { r.info = e.info; r.state = e.state || null; r.cfg = e.cfg || null; r.meta.lastSeen = e.lastSeen || null; r.meta.fails = 2; } if (typeof e.group === 'string' && e.group) r.meta.group = e.group; if (Array.isArray(e.ignoredOutputs)) r.meta.ignoredOutputs = e.ignoredOutputs; derive(r); }
         saveKnown(); pollAll(); done.push(`${doc.knownNodes.length} node(s)`);
       }
@@ -1888,31 +1941,7 @@ const server = http.createServer(async (req, res) => {
     // liste que personne ne peut produire autrement. Les seuils et
     // l'arithmétique de l'ABL sont dans power.js, vérifiés dans le firmware.
     if (p === '/api/power' && req.method === 'GET') {
-      return send(res, 200, { ...powerAudit(), plan: powerPlan, catalogue: psuStore.psus, drivers: driverStore.drivers });
-    }
-    // @api Crée ou met à jour un EXEMPLAIRE d'alimentation : son libellé, le
-    // modèle du catalogue qu'il suit, et où il se trouve. Propre au spectacle —
-    // « Alim jardin » ne veut rien dire sur un autre poste — donc jamais publié
-    // dans le dépôt partagé, mais présent dans le showfile.
-    if (p === '/api/power/psu' && req.method === 'POST') {
-      if (READONLY) return send(res, 403, { error: 'lecture seule' });
-      const b = await readBody(req);
-      try {
-        const r = power.planUpsert(powerPlan, b, require('crypto').randomUUID());
-        powerPlan = r.plan; savePlan();
-        return send(res, 200, { ok: true, psu: r.psu, plan: powerPlan });
-      } catch (e) { return send(res, 400, { error: e.message }); }
-    }
-    // @api Retire un exemplaire d'alimentation. Les nodes qui le désignent sont
-    // renvoyés : c'est à l'utilisateur de les rattacher ailleurs, on ne les
-    // détache pas d'autorité.
-    if ((m = /^\/api\/power\/psu\/([0-9a-z][0-9a-z-]{1,39})$/.exec(p)) && req.method === 'DELETE') {
-      if (READONLY) return send(res, 403, { error: 'lecture seule' });
-      const orphelins = [...fleet.values()]
-        .filter(r => r.meta.nodeMeta && r.meta.nodeMeta.power && r.meta.nodeMeta.power.psu === m[1])
-        .map(r => ({ ip: r.meta.ip, name: (r.info && r.info.name) || r.meta.ip }));
-      try { powerPlan = power.planRemove(powerPlan, m[1]); savePlan(); return send(res, 200, { ok: true, plan: powerPlan, orphelins }); }
-      catch (e) { return send(res, 400, { error: e.message }); }
+      return send(res, 200, { ...powerAudit(), catalogue: psuStore.psus, drivers: driverStore.drivers });
     }
     // @api Rattache un node : quelle alimentation le nourrit, sur quel rail, et
     // quelle carte il est. Écrit dans son /fleet.json, donc le node se raconte
@@ -2300,7 +2329,11 @@ const server = http.createServer(async (req, res) => {
     // nodes, détectés au canal près.
     if (p === '/api/dmx-plan' && req.method === 'GET') {
       // plan de toute la flotte + conflits entre nodes, au canal près (voir dmx.js)
-      const nodes = [...fleet.values()].filter(r => r.derived && r.derived.dmx).map(r => ({ ip: r.meta.ip, name: r.info && r.info.name, group: r.meta.group || '', online: r.meta.online, live: r.info && r.info.live, lm: r.info && r.info.lm, lip: r.info && r.info.lip, plan: r.derived.dmx }));
+      const nodes = [...fleet.values()].filter(r => r.derived && r.derived.dmx).map(r => ({ ip: r.meta.ip, name: r.info && r.info.name, group: r.meta.group || '', online: r.meta.online, live: r.info && r.info.live, lm: r.info && r.info.lm, lip: r.info && r.info.lip, plan: r.derived.dmx,
+        // le rattachement électrique voyage avec le plan : la grille y choisit la
+        // carte et l'alimentation, et un troisième aller-retour pour deux champs
+        // ne se justifie pas
+        power: (r.meta.nodeMeta && r.meta.nodeMeta.power) || null }));
       const conflicts = dmx.conflicts(nodes.map(n => ({ name: n.name || n.ip, plan: n.plan })));
       const inUse = [...new Set(nodes.flatMap(n => (n.plan.occupancy || []).map(iv => iv.u)))].sort((a, b) => a - b);
       return send(res, 200, { nodes: nodes.sort((a, b) => (a.plan.uni || 0) - (b.plan.uni || 0)), conflicts, universesInUse: inUse });

@@ -188,21 +188,66 @@ function latestFor(env) {
   return { stable, pre };
 }
 
+// ── La plateforme d'un node qui ne la dit pas ──────────────────────────────
+// WLED n'expose `info.release` que depuis la 0.15. Avant, le champ n'existe
+// pas : la colonne Plateforme restait vide, « Dernière stable » affichait « ? »,
+// et AUCUNE mise à jour n'était proposée — précisément sur les nodes qui en
+// auraient le plus besoin. Le garde-fou du flash comparait lui aussi l'asset à
+// un `release` absent et refusait tout.
+//
+// On la déduit donc de ce que ces firmwares annoncent quand même :
+//
+//   arch          "ESP32-C3", "ESP32-S3", "esp32"
+//   getflash      taille du flash en octets
+//   e32flashtext  mode du flash ("DIO", "QIO"…)
+//
+// ── Ce qu'on refuse de faire ──────────────────────────────────────────────
+// Deviner quand c'est ambigu. Un esp32 nu peut être une build ESP32, ESP32_8M,
+// ESP32_16M ou ESP32_Ethernet, et rien dans /json/info ne les départage — la
+// preuve, un des QUADRI de la flotte tourne une build Ethernet en déclarant
+// « aucun » comme type de carte. Envoyer la mauvaise build à un node PoE lui
+// ferait perdre son réseau, et il faudrait aller le rechercher à la main.
+// Quand ça ne se tranche pas, on rend null et on le dit.
+const MB = 1024 * 1024;
+
+function guessEnv(info) {
+  const i = info || {};
+  if (i.release) return { env: i.release, deduit: false, pourquoi: '' };
+  const arch = String(i.arch || '');
+  const flash = Number(i.getflash) || (Number(i.flash) ? Number(i.flash) * MB : 0);
+  const mode = String(i.e32flashtext || '').toUpperCase();
+  const mo = flash ? Math.round(flash / MB) : 0;
+
+  // ESP32-C3 : une seule build 4 Mo côté WLED en dio, et c'est justement celle
+  // que le platformio.ini d'amont désigne comme « requise pour les mises à jour
+  // OTA depuis une version antérieure, qui utilisait dio ».
+  if (/^ESP32-C3$/i.test(arch) && mo === 4 && (mode === 'DIO' || mode === '')) {
+    return { env: 'ESP32-C3', deduit: true, pourquoi: `ESP32-C3, ${mo} Mo, mode ${mode || 'inconnu'}` };
+  }
+  // ESP32-S3 : les variantes se distinguent par la taille ET le mode. On ne
+  // tranche que la 4 Mo qspi, la seule qui soit sans ambiguïté.
+  if (/^ESP32-S3$/i.test(arch) && mo === 4 && mode !== 'OPI') {
+    return { env: 'ESP32-S3_4M_qspi', deduit: true, pourquoi: `ESP32-S3, ${mo} Mo, qspi` };
+  }
+  return { env: null, deduit: false, pourquoi: arch ? `${arch}${mo ? ', ' + mo + ' Mo' : ''} : plusieurs builds possibles, à choisir à la main` : 'plateforme inconnue' };
+}
+
 // What the grid shows for one node.
 function assess(info) {
   if (!info) return null;
   loadIndex();
-  const env = info.release, ver = info.ver;
+  const g = guessEnv(info);
+  const env = g.env, ver = info.ver;
   const { stable, pre } = latestFor(env);
   const fork = info.repo && info.repo !== REPO ? info.repo : null;
   return {
-    env, ver, fork,
+    env, ver, fork, envDeduit: g.deduit, envPourquoi: g.pourquoi,
     latest: stable ? stable.version : null,
     latestTag: stable ? stable.tag : null,
     latestLocal: stable ? stable.local : false,
     available: stable ? cmpVer(stable.version, ver) > 0 : null,
     pre: pre ? { version: pre.version, tag: pre.tag, local: pre.local } : null,
-    status: !stable ? (env ? 'plateforme inconnue' : '?') : cmpVer(stable.version, ver) > 0 ? (stable.local ? 'MAJ prête' : 'MAJ à télécharger') : cmpVer(stable.version, ver) < 0 ? 'plus récent que le dépôt' : 'à jour',
+    status: !stable ? (env ? 'plateforme inconnue' : (g.pourquoi ? 'plateforme à choisir' : '?')) : cmpVer(stable.version, ver) > 0 ? (stable.local ? 'MAJ prête' : 'MAJ à télécharger') : cmpVer(stable.version, ver) < 0 ? 'plus récent que le dépôt' : 'à jour',
   };
 }
 
@@ -268,4 +313,4 @@ function flashFile(ip, filePath, onProgress = () => {}, timeoutMs = 180000) {
   });
 }
 
-module.exports = { loadIndex, refresh, download, remove, addLocal, assess, latestFor, view, localPath, isLocal, flashFile, cmpVer, ASSET_RE, catalogue: () => catalogue };
+module.exports = { loadIndex, refresh, download, remove, addLocal, assess, latestFor, view, localPath, isLocal, flashFile, cmpVer, guessEnv, ASSET_RE, catalogue: () => catalogue };

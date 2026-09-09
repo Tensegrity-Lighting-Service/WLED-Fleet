@@ -256,8 +256,12 @@
   /* ── Le schéma du plateau ─────────────────────────────────────────────────
      Tout suit les variables de thème : le SVG bascule clair/sombre comme le
      reste, sans une ligne de plus. */
-  .gwrap{position:absolute;inset:0;top:44px;overflow:hidden}
-  #graphpanel{position:relative}
+  /* le panneau tient en colonne : le schéma d abord, le rapport dessous. Le
+     schéma était en position absolue et couvrait tout le panneau — la liste des
+     constats se retrouvait donc DERRIÈRE lui. */
+  #graphpanel.open{display:flex;flex-direction:column}
+  .gwrap{position:relative;flex:0 0 auto;height:60vh;min-height:260px;overflow:hidden}
+  #gChecks{flex:0 0 auto}
   #graphpanel h2{position:relative;z-index:2}
   .gsvg{width:100%;height:100%;display:block;cursor:grab;touch-action:none}
   .gsvg.dragging{cursor:grabbing}
@@ -283,3 +287,22 @@
    visible quand ça diverge. */
 .devline { font-size: 10px; line-height: 1.3; margin-top: 2px; white-space: nowrap; }
 .devline .rowbtn { padding: 0 3px; margin-left: 3px; font-size: 10px; line-height: 1.2; }
+
+/* schéma : la fixture s'intercale entre le node et ses sorties, l'antenne
+   partage la colonne des alimentations */
+.gbox.fix rect { fill: var(--chip); stroke-dasharray: none }
+.gbox.ap rect { fill: var(--panel2); stroke: var(--info) }
+.gedge.wifi { stroke-dasharray: 5 4; opacity: .55 }
+
+/* la carte et l'alimentation dans la cellule du node : mêmes petits champs que
+   le mode et l'ampérage, sur la même ligne */
+.ncell-set select[data-carte], .ncell-set select[data-alim] { max-width: 130px }
+
+/* la colonne Alim couvre tous les nodes liés à la même alimentation ; la
+   colonne de lien reprend l'aspect du chaînage des sorties */
+table.outs td.alimcell { min-width: 150px; vertical-align: top; padding: 4px 6px; border-right: 1px solid var(--line2) }
+table.outs td.alimcell select { max-width: 150px }
+table.outs td.alimcell div { font-size: 10px; line-height: 1.35; margin-top: 2px }
+table.outs td.liencell { width: 26px; text-align: center; padding: 0 2px; cursor: pointer; color: var(--muted); user-select: none }
+table.outs td.liencell:hover { background: var(--chip) }
+table.outs td.liencell.linked { color: var(--info) }

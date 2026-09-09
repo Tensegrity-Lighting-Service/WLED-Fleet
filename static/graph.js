@@ -30,7 +30,7 @@ window.WF_GRAPH = (() => {
   const NS = 'http://www.w3.org/2000/svg';
   const el = (n, attrs = {}) => { const e = document.createElementNS(NS, n); for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, v); return e; };
 
-  const W_PSU = 190, W_NODE = 200, W_OUT = 150, H = 46, GAP_Y = 14, GAP_X = 130, H_OUT = 30;
+  const W_PSU = 190, W_NODE = 200, W_FIX = 120, W_OUT = 150, H = 46, GAP_Y = 14, GAP_X = 110, H_OUT = 30;
 
   // Les positions déplacées à la main vivent dans le navigateur, pas sur les
   // nodes : une coordonnée d'écran n'est pas une information de terrain.
@@ -146,7 +146,9 @@ window.WF_GRAPH = (() => {
     function drawEdge(e2) {
       const a = boxOf(e2.from), b = boxOf(e2.to);
       if (!a || !b) return null;
-      const p = el('path', { class: `gedge ${e2.level || ''}`, d: bezier(a.x + a.w, a.y + H / 2, b.x, b.y + H / 2) });
+      // le milieu de CHAQUE boîte, pas une hauteur supposée : une sortie et une
+      // fixture sont plus basses qu un node, et le câble visait à côté
+      const p = el('path', { class: `gedge ${e2.kind || ''} ${e2.level || ''}`, d: bezier(a.x + a.w, a.y + (a.h || H) / 2, b.x, b.y + (b.h || H) / 2) });
       if (e2.title) { const t = el('title'); t.textContent = e2.title; p.append(t); }
       gEdges.append(p);
       return p;
@@ -155,7 +157,7 @@ window.WF_GRAPH = (() => {
       for (const e2 of model.edges) {
         if (e2.from !== id && e2.to !== id) continue;
         const a = boxOf(e2.from), b = boxOf(e2.to);
-        if (e2.path && a && b) e2.path.setAttribute('d', bezier(a.x + a.w, a.y + H / 2, b.x, b.y + H / 2));
+        if (e2.path && a && b) e2.path.setAttribute('d', bezier(a.x + a.w, a.y + (a.h || H) / 2, b.x, b.y + (b.h || H) / 2));
       }
     }
 
@@ -212,63 +214,134 @@ window.WF_GRAPH = (() => {
   // doit toujours donner la même image, sinon deux postes ne voient pas la même
   // chose et un simple rafraîchissement fait tout bouger sous les yeux.
   //
-  // Les sorties sont repliées par défaut : 4 467 pixels répartis sur 30 sorties
-  // donneraient trente boîtes de plus, et le schéma ne tiendrait plus.
+  // La chaîne se lit de gauche à droite, dans l'ordre où le courant et les
+  // pixels circulent :
+  //
+  //     alimentation  →  node  →  fixture  →  sortie
+  //
+  // L'antenne partage la première colonne avec les alimentations : elle aussi
+  // alimente les nodes, en réseau plutôt qu'en courant.
+  //
+  // ── Le défaut que cette version corrige ────────────────────────────────
+  // Les sorties n'étaient dessinées QUE pour les nodes rattachés à une
+  // alimentation, parce que la boucle qui les produisait était imbriquée dans
+  // celle des alimentations. Sur un plateau où personne n'a encore renseigné
+  // les alims — c'est-à-dire au début, toujours — le schéma ne montrait donc
+  // que des boîtes de nodes nues, et paraissait cassé. Un node se dessine
+  // désormais entier, rattaché ou non.
   function build(data, pos, collapsed) {
     const boxes = [], edges = [];
     const at = (id, x, y) => (pos[id] ? { x: pos[id].x, y: pos[id].y } : { x, y });
-    let y = 0;
-
     const worst = cs => (cs || []).reduce((a, c) => (c.level === 'bad' ? 'bad' : c.level === 'warn' && a !== 'bad' ? 'warn' : a), '');
 
+    const X_NODE = W_PSU + GAP_X;
+    const X_FIX = X_NODE + W_NODE + GAP_X;
+    const X_OUT = X_FIX + W_FIX + GAP_X;
+
+    const parIp = new Map((data.nodes || []).map(n => [n.ip, n]));
+    // Une fixture peut couvrir plusieurs nodes : elle n'appartient donc à
+    // aucun, et sa boîte n'est créée qu'une fois, là où on la rencontre.
+    const fixtures = new Map();
+    let y = 0;
+
+    // Un node et tout ce qui en descend. Rend le bas atteint, pour que
+    // l'appelant empile sans se recouvrir.
+    function drawNode(ip, nom, ny, source) {
+      const full = parIp.get(ip) || {};
+      const b = full.budget || {};
+      const lvl = worst(b.checks);
+      const sorties = (b.outputs || []).filter(o => !o.ignored && o.len > 0);
+      const p = at(ip, X_NODE, ny);
+      boxes.push({ id: ip, kind: source ? 'node' : 'node orphan', ...p, w: W_NODE, h: H,
+        level: lvl || (source ? '' : 'warn'),
+        label: nom,
+        sub: `${b.maxA === undefined ? '—' : b.maxA} A · ${b.ratio === null || b.ratio === undefined ? '—' : `${Math.round(b.ratio * 100)} % blanc`}`,
+        collapsible: sorties.length > 0,
+        title: [
+          full.driver ? [full.driver.ref.brand, full.driver.ref.model].filter(Boolean).join(' ') : 'carte non renseignée',
+          source ? '' : 'aucune alimentation déclarée : impossible de vérifier ce que ce node a le droit de tirer',
+          b.worstA === undefined ? '' : `pire cas ${b.worstA} A`,
+          ...(b.checks || []).map(c => `• ${c.msg}`),
+        ].filter(Boolean).join('\n') });
+      if (source) edges.push({ from: source.id, to: ip, level: lvl || source.level, title: `${source.label} → ${nom}` });
+
+      let oy = ny;
+      if (!collapsed[ip]) {
+        for (const o of sorties) {
+          const oid = `${ip}#${o.i}`;
+          // La fixture s'intercale quand la sortie en déclare une. Sinon la
+          // sortie pend directement du node : dire « sans fixture » avec une
+          // boîte de plus n'apprendrait rien.
+          let amont = ip, amontNom = nom;
+          if (o.fixture !== null && o.fixture !== undefined) {
+            const fid = `fx:${o.fixture}`;
+            if (!fixtures.has(fid)) {
+              const fp = at(fid, X_FIX, oy);
+              fixtures.set(fid, fp);
+              boxes.push({ id: fid, kind: 'fix', ...fp, w: W_FIX, h: H_OUT,
+                label: `Fixture ${o.fixture}`, sub: '',
+                title: 'numéro de fixture à la console — plusieurs sorties, même sur des nodes différents, peuvent le partager' });
+            }
+            edges.push({ from: ip, to: fid, title: `${nom} → fixture ${o.fixture}` });
+            amont = fid; amontNom = `fixture ${o.fixture}`;
+          }
+          const op = at(oid, X_OUT, oy);
+          boxes.push({ id: oid, kind: 'out', ...op, w: W_OUT, h: H_OUT,
+            label: `Sortie ${o.i + 1}`, sub: `${o.len} px · ${o.ledma} mA`,
+            title: o.product ? [o.product.ref.brand, o.product.ref.model].filter(Boolean).join(' ') : 'produit non renseigné' });
+          edges.push({ from: amont, to: oid, title: `${amontNom} → sortie ${o.i + 1}` });
+          oy += H_OUT + 8;
+        }
+      }
+      return Math.max(ny + H + GAP_Y, oy);
+    }
+
+    // ── Les alimentations, et ce qui pend dessous ────────────────────────
     for (const p of data.psus || []) {
       const py = y;
       const lvl = worst(p.checks);
-      const p1 = at(p.uid, 0, py);
-      boxes.push({ id: p.uid, kind: 'psu', ...p1, w: W_PSU, h: H, level: lvl,
-        label: p.label || '(sans nom)',
-        sub: p.capA !== null ? `${p.usedA} A / ${p.capA} A` : 'capacité inconnue',
-        badge: p.chargePct !== null ? `${p.chargePct} %` : '',
+      const pp = at(p.uid, 0, py);
+      boxes.push({ id: p.uid, kind: 'psu', ...pp, w: W_PSU, h: H, level: lvl,
+        label: p.label || '(alimentation)',
+        sub: p.capA === null || p.capA === undefined ? 'capacité inconnue' : `${p.usedA} A / ${p.capA} A`,
+        badge: p.chargePct === null || p.chargePct === undefined ? '' : `${p.chargePct} %`,
         title: [p.model ? [p.model.ref.brand, p.model.ref.model].filter(Boolean).join(' ') : 'modèle non renseigné',
-          p.location, ...(p.checks || []).map(c => `• ${c.msg}`)].filter(Boolean).join('\n') });
+          `${(p.nodes || []).length} node(s)`,
+          ...(p.checks || []).map(c => `• ${c.msg}`)].filter(Boolean).join('\n') });
 
       let ny = py;
       for (const n of p.nodes || []) {
-        const full = (data.nodes || []).find(x => x.ip === n.ip) || {};
-        const b = full.budget || {};
-        const nlvl = worst(b.checks);
-        const n1 = at(n.ip, W_PSU + GAP_X, ny);
-        boxes.push({ id: n.ip, kind: 'node', ...n1, w: W_NODE, h: H, level: nlvl,
-          label: n.name, sub: `${n.maxA} A · ${n.ratio === null ? '—' : `${Math.round(n.ratio * 100)} % blanc`}`,
-          collapsible: (b.outputs || []).some(o => !o.ignored && o.len > 0),
-          title: [(full.driver ? [full.driver.ref.brand, full.driver.ref.model].filter(Boolean).join(' ') : 'carte non renseignée'),
-            `pire cas ${n.worstA} A`, ...(b.checks || []).map(c => `• ${c.msg}`)].filter(Boolean).join('\n') });
-        edges.push({ from: p.uid, to: n.ip, level: nlvl || lvl, title: `${p.label} → ${n.name}` });
-
-        let oy = ny;
-        if (!collapsed[n.ip]) {
-          for (const o of (b.outputs || []).filter(x => !x.ignored && x.len > 0)) {
-            const oid = `${n.ip}#${o.i}`;
-            const o1 = at(oid, W_PSU + GAP_X + W_NODE + GAP_X, oy);
-            boxes.push({ id: oid, kind: 'out', ...o1, w: W_OUT, h: H_OUT,
-              label: `Sortie ${o.i + 1}`, sub: `${o.len} px · ${o.ledma} mA`,
-              title: o.product ? [o.product.ref.brand, o.product.ref.model].filter(Boolean).join(' ') : 'produit non renseigné' });
-            edges.push({ from: n.ip, to: oid, title: `${n.name} → sortie ${o.i + 1}` });
-            oy += H_OUT + 8;
-          }
-        }
-        ny = Math.max(ny + H + GAP_Y, oy);
+        const nom = (parIp.get(n.ip) || {}).name || n.name || n.ip;
+        ny = drawNode(n.ip, nom, ny, { id: p.uid, label: p.label || 'alimentation', level: lvl });
       }
       y = Math.max(py + H + GAP_Y, ny) + 10;
     }
 
-    // les non rattachés en bas, dans leur propre couche : c'est justement ce
-    // qu'on veut voir en premier sur un plateau qu'on découvre
+    // ── Ceux qui ne sont rattachés à rien ────────────────────────────────
+    // La première chose à regarder sur un plateau qu'on découvre — et, tant
+    // qu'aucune alimentation n'est renseignée, la totalité de la flotte.
     for (const o of data.orphelins || []) {
-      const p1 = at(o.ip, W_PSU + GAP_X, y);
-      boxes.push({ id: o.ip, kind: 'node orphan', ...p1, w: W_NODE, h: H, level: 'warn',
-        label: o.name, sub: `${o.maxA} A · sans alimentation`,
-        title: 'Aucune alimentation déclarée : impossible de vérifier ce que ce node a le droit de tirer.' });
+      const nom = (parIp.get(o.ip) || {}).name || o.name || o.ip;
+      y = drawNode(o.ip, nom, y, null);
+    }
+
+    // ── L'antenne ────────────────────────────────────────────────────────
+    // Dans la même colonne que les alimentations : elle aussi alimente les
+    // nodes, en réseau. Repliée par défaut — vingt-sept liens Wi-Fi tracés
+    // d'un coup ne montreraient rien d'autre qu'une pelote.
+    const ant = data.antenne;
+    if (ant && ant.nodes && ant.nodes.length) {
+      const ap = at('ap', 0, y);
+      boxes.push({ id: 'ap', kind: 'ap', ...ap, w: W_PSU, h: H,
+        label: ant.label || 'Antenne', sub: `${ant.nodes.length} node(s) en Wi-Fi`,
+        collapsible: true,
+        title: 'les nodes associés à l\'antenne — déplier pour voir les liens' });
+      if (!collapsed.ap) {
+        for (const ip of ant.nodes) {
+          if (!boxes.some(b => b.id === ip)) continue;      // node absent du schéma
+          edges.push({ from: 'ap', to: ip, kind: 'wifi', title: `${ant.label || 'Antenne'} → ${ip}` });
+        }
+      }
       y += H + GAP_Y;
     }
     return { boxes, edges };

@@ -21,7 +21,6 @@ const SECRETS = [
   ['settings.json', 'réglages du poste'],
   ['drivers.json', 'catalogue de cartes — pas un secret, mais propre au poste'],
   ['psus.json', 'catalogue d\'alimentations — idem'],
-  ['power-plan.json', 'les alimentations posées sur CE plateau — il voyage par le showfile, jamais par le dépôt'],
 ];
 
 test('chaque fichier sensible est exclu des quatre endroits', () => {

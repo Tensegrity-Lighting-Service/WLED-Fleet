@@ -152,7 +152,7 @@ test('le nom de fichier évite ceux auxquels WLED donne un sens', () => {
   }
 });
 
-// ── v2 : le rattachement électrique ────────────────────────────────────────
+// ── v2/v3 : le rattachement électrique ─────────────────────────────────────
 test('le bloc power vit au premier rang, pas dans extra', () => {
   // `extra` est la boîte de ce que Fleet ne connaît PAS, et build() l'étale en
   // tête SANS validation. Y ranger ce que Fleet écrit lui-même mentirait sur sa
@@ -160,7 +160,7 @@ test('le bloc power vit au premier rang, pas dans extra', () => {
   const uid = '8f97e081-6f2f-4133-bd38-ec7a91f2439b';
   const b = md.build({ power: { psu: uid, rail: 'A', driver: 'ab' } });
   assert.deepStrictEqual(b.power, { psu: uid, rail: 'A', driver: 'ab' });
-  assert.strictEqual(b.formatVersion, 2);
+  assert.strictEqual(b.formatVersion, 3);
   assert.strictEqual(md.parse(b).extra.power, undefined, 'jamais recopié dans extra');
 });
 
@@ -180,7 +180,7 @@ test('une sortie peut avoir son alimentation à elle, et elle l\'emporte', () =>
 test('une v1 donne un power vide, pas une erreur', () => {
   const v1 = { format: 'wled-fleet-node', formatVersion: 1, group: 'Boule', outputs: [{ i: 0, product: 'ab' }] };
   const m = md.parse(v1);
-  assert.deepStrictEqual(m.power, { psu: null, rail: null, driver: null });
+  assert.deepStrictEqual(m.power, { psu: null, psuGroup: null, rail: null, driver: null });
   assert.strictEqual(md.build(m).power, undefined, 'et rien n\'est ajouté au fichier');
   assert.strictEqual(md.build(m).outputs[0].product, 'ab', 'le reste survit');
 });
@@ -189,4 +189,41 @@ test('un node qui n\'a QUE du power n\'est pas considéré comme vide', () => {
   // sinon la restauration après reformatage le laisserait tomber
   assert.strictEqual(md.isEmpty(md.parse({ power: { psu: 'ab' } })), false);
   assert.strictEqual(md.isEmpty(md.empty()), true);
+});
+
+// ── v3 : le modèle d'alimentation, et qui la partage ───────────────────────
+test('psu désigne un MODÈLE, et psuGroup dit qui le partage physiquement', () => {
+  // Sans le groupe, deux nodes sur le même modèle seraient indiscernables de
+  // deux nodes sur deux alimentations identiques — et c'est exactement la
+  // question que pose un budget de courant : faut-il additionner, ou non.
+  const modele = '8f97e081-6f2f-4133-bd38-ec7a91f2439b';
+  const grp = '3c1d5a90-77bb-4e02-9a44-1f6e0b2c8d55';
+  const b = md.build({ power: { psu: modele, psuGroup: grp, rail: 'A', driver: 'ab' } });
+  assert.deepStrictEqual(b.power, { psu: modele, psuGroup: grp, rail: 'A', driver: 'ab' });
+  assert.strictEqual(md.parse(b).power.psuGroup, grp, 'et il survit à un aller-retour');
+});
+
+test('un groupe sans alimentation ne désigne rien, et n\'est pas écrit', () => {
+  // même règle que le rail : ce qui n'a de sens qu'en face d'une alimentation
+  // ne s'écrit pas tout seul
+  assert.strictEqual(md.build({ power: { psuGroup: 'aa' } }).power, undefined);
+  assert.strictEqual(md.build({ power: { driver: 'ab', psuGroup: 'aa' } }).power.psuGroup, undefined,
+    'une carte sans alimentation ne justifie pas un groupe d\'alimentation');
+  assert.strictEqual(md.build({ power: { psu: 'aa', psuGroup: 'bb' } }).power.psuGroup, 'bb');
+});
+
+test('une v2 se lit sans erreur, le groupe valant simplement null', () => {
+  // les nodes déjà patchés en v2 portent un psu sans groupe : ils décrivent
+  // alors une alimentation à eux seuls, ce qui est le cas le plus courant
+  const v2 = { format: 'wled-fleet-node', formatVersion: 2, power: { psu: 'aa', driver: 'ab' } };
+  const m = md.parse(v2);
+  assert.strictEqual(m.power.psuGroup, null);
+  assert.strictEqual(m.power.psu, 'aa');
+  assert.strictEqual(md.build(m).formatVersion, 3, 'et il est réécrit en v3');
+});
+
+test('un groupe illisible est ignoré sans emporter le reste', () => {
+  const b = md.build({ power: { psu: 'aa', psuGroup: 'PAS UN ID', driver: 'ab' } });
+  assert.strictEqual(b.power.psuGroup, undefined);
+  assert.strictEqual(b.power.psu, 'aa', 'le reste du bloc survit');
 });

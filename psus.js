@@ -72,6 +72,21 @@ function normPsu(input) {
     psu: {
       volt, amps, watts, basis,
       rails: normRails(x.rails, volt),
+      // Combien de nodes on peut brancher dessus — le nombre de bornes, pas le
+      // nombre d'ampères. C'est ce qui plafonne le nombre de nodes liés à une
+      // même alimentation dans la grille.
+      //
+      // À ne pas confondre avec `rails`, qui décrit des sorties NOMMÉES et
+      // TYPÉES (tension, ampérage) et sert aux vérifications de tension. Une
+      // alimentation à deux rails peut très bien offrir six bornes. Quand des
+      // rails sont déclarés et que rien n'est saisi, on prend leur nombre :
+      // c'est le cas le plus fréquent, et ça évite un champ à remplir pour rien.
+      // 0 = non renseigné, et alors rien n'est plafonné.
+      outputs: (() => {
+        const n = Number(x.outputs);
+        if (Number.isFinite(n) && n >= 0) return Math.min(64, Math.round(n));
+        return Array.isArray(x.rails) ? normRails(x.rails, volt).length : 0;
+      })(),
       // Taux d'usage conseillé par le fabricant. 80 % est la valeur du métier
       // pour une alimentation à convection : au-delà elle chauffe, vieillit vite
       // et sa tension s'affaisse — ce qui, sur du LED adressable, se traduit par

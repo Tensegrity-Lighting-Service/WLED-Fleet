@@ -40,7 +40,15 @@ const FORMAT = 'wled-fleet-node';
 // Compatibilité gratuite dans les deux sens : une v1 donne un `power` vide, et
 // un Fleet plus ancien conserve `power` par `extra` — c'est exactement ce pour
 // quoi `extra` existe.
-const FORMAT_VERSION = 2;
+//
+// v3 : `power.psu` désigne désormais le MODÈLE d'alimentation au catalogue, et
+// non plus un exemplaire propre au plateau. Le changement de sens vaut un
+// changement de version : un lecteur qui l'ignorerait résoudrait l'uid dans le
+// mauvais catalogue, et trouverait « Meanwell LRS-350-12 » là où il attendait
+// « Alim jardin ». `psuGroup` le complète en disant QUELS nodes partagent la
+// même alimentation physique — la seule chose que l'exemplaire apportait
+// vraiment, et qui ne se déduit d'aucun modèle.
+const FORMAT_VERSION = 3;
 
 // Le marqueur de produit est OPAQUE : un uuid depuis la v3 du catalogue, un
 // identifiant court à 2 caractères pour ce que Fleet a écrit avant. On accepte
@@ -113,11 +121,19 @@ const empty = () => ({ format: FORMAT, formatVersion: FORMAT_VERSION, group: '',
 function normPower(p) {
   const x = p && typeof p === 'object' ? p : {};
   return {
-    psu: isProductId(x.psu) ? x.psu : null,        // exemplaire d'alimentation
+    psu: isProductId(x.psu) ? x.psu : null,           // MODÈLE d'alimentation (v3)
+    // Quels nodes partagent la même alimentation PHYSIQUE. Deux nodes qui
+    // désignent le même modèle sans partager ce groupe sont sur deux
+    // alimentations distinctes — et c'est toute la différence pour un budget
+    // de courant. Identifiant opaque, frappé au premier lien, sans aucun sens
+    // hors de ce plateau : il ne va donc jamais dans le dépôt partagé.
+    psuGroup: isProductId(x.psuGroup) ? x.psuGroup : null,
     rail: typeof x.rail === 'string' && x.rail ? x.rail.slice(0, 8) : null,
     driver: isProductId(x.driver) ? x.driver : null,  // modèle de carte
   };
 }
+// `rail` et `psuGroup` seuls ne désignent rien : un rail sans alimentation, un
+// groupe sans modèle. C'est `psu` ou `driver` qui rendent le bloc porteur.
 const powerEmpty = p => !p || (!p.psu && !p.driver);
 
 // Ce qu'on écrit sur le node. Les sorties sans rien à dire sont omises : un node
@@ -142,7 +158,9 @@ function build(meta) {
     .filter(o => Object.keys(o).length > 1); // « i » seul ne dit rien
   const doc = { ...m.extra, format: FORMAT, formatVersion: FORMAT_VERSION, group: m.group, updatedAt: Date.now(), updatedBy: m.updatedBy, outputs };
   // omis quand il ne dit rien : un node sans rattachement n'a pas besoin du bloc
-  if (!powerEmpty(m.power)) doc.power = { ...(m.power.psu ? { psu: m.power.psu } : {}), ...(m.power.psu && m.power.rail ? { rail: m.power.rail } : {}), ...(m.power.driver ? { driver: m.power.driver } : {}) };
+  // même règle pour `rail` et `psuGroup` que pour le reste : ce qui ne désigne
+  // rien sans alimentation n'est pas écrit
+  if (!powerEmpty(m.power)) doc.power = { ...(m.power.psu ? { psu: m.power.psu } : {}), ...(m.power.psu && m.power.psuGroup ? { psuGroup: m.power.psuGroup } : {}), ...(m.power.psu && m.power.rail ? { rail: m.power.rail } : {}), ...(m.power.driver ? { driver: m.power.driver } : {}) };
   return doc;
 }
 const isEmpty = meta => { const b = build(meta); return !b.outputs.length && !b.group && !b.power; };

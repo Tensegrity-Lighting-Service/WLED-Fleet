@@ -56,6 +56,9 @@ const { MA_FOR_ESP, LED_MA_MAX } = require('./columns');
 // Valeur par défaut du firmware pour une limite par sortie (const.h:596). Une
 // valeur égale à celle-ci n'est pas un réglage, c'est un défaut.
 const ABL_DEFAULT = 850;
+// mA par pixel supposé quand rien ne le déclare : le défaut de WLED pour un
+// WS2812 générique (const.h)
+const ABL_DEFAULT_LEDMA = 55;
 
 const DEF = {
   usage: 0.60,      // part du pire cas qu'un contenu réel atteint
@@ -77,8 +80,11 @@ const chk = (level, code, msg, extra = {}) => ({ level, code, msg, ...extra });
 //   maxpwr   hw.led.maxpwr, la limite globale (0 = régime par sortie)
 //   ignored  positions déclarées non câblées : elles ne consomment rien
 //   product  (i) -> la fiche du produit de la sortie i, ou null
+//   fixture  (i) -> le numéro de fixture console de la sortie i, ou null. Il ne
+//            sert à aucun calcul : il permet au schéma de placer une sortie
+//            sous sa fixture plutôt que directement sous son node.
 //   driver   la fiche de la carte, ou null
-function nodeBudget({ maxpwr = 0, ins = [], ignored = [], product = () => null, driver = null, opts = {} } = {}) {
+function nodeBudget({ maxpwr = 0, ins = [], ignored = [], product = () => null, fixture = () => null, driver = null, opts = {} } = {}) {
   const o = { ...DEF, ...opts };
   const ig = new Set(ignored);
   const cap = Number(maxpwr) || 0;
@@ -95,6 +101,7 @@ function nodeBudget({ maxpwr = 0, ins = [], ignored = [], product = () => null, 
       worstMa: ig.has(i) ? 0 : len * (effective + 1),
       ownLimit: Number(b.maxpwr) || 0,
       product: product(i) || null,
+      fixture: fixture(i),
     };
   });
 
@@ -246,9 +253,17 @@ function nodeBudget({ maxpwr = 0, ins = [], ignored = [], product = () => null, 
 
 // ── La chaîne complète ─────────────────────────────────────────────────────
 //
-//   psus   [{ uid, label, model, rail, nodes: [ip…] }] — les EXEMPLAIRES posés
-//          sur le plateau, avec le modèle du catalogue qu'ils suivent
+//   psus   [{ uid, label, model, rail, nodes: [ip…], mixedModel }] — un GROUPE
+//          d'alimentation : les nodes branchés sur une même alimentation
+//          physique, et le modèle du catalogue qu'elle suit. Un node seul forme
+//          un groupe d'un seul ; `uid` est l'identifiant du groupe.
 //   nodes  [{ ip, name, budget }] où budget est le retour de nodeBudget()
+//
+// Il n'y a plus d'« exemplaire » : le modèle vit au catalogue, et l'appartenance
+// à une même alimentation physique se lit dans `power.psuGroup` sur les nodes.
+// Ce qu'un exemplaire apportait — un libellé, un emplacement — n'était rempli
+// par personne ; ce qu'il apportait vraiment, savoir QUI partage QUOI, est
+// désormais porté par les nodes eux-mêmes.
 function audit({ psus = [], nodes = [], opts = {} } = {}) {
   const o = { ...DEF, ...opts };
   const byIp = new Map(nodes.map(n => [n.ip, n]));
@@ -270,6 +285,14 @@ function audit({ psus = [], nodes = [], opts = {} } = {}) {
     // On somme les BUDGETS, jamais les pires cas — voir l'en-tête du module.
     const usedA = r2(mine.reduce((a, n) => a + (n.budget.maxA || 0), 0));
 
+    // Des nodes liés qui ne désignent pas le même modèle : ils sont pourtant
+    // sur la même alimentation physique. L'un des deux se trompe, et tant qu'on
+    // ne sait pas lequel, la capacité retenue est une supposition.
+    if (psu.mixedModel) {
+      checks.push(chk('warn', 'psu-incoherent',
+        'les nodes liés ne désignent pas le même modèle d\'alimentation : ils sont pourtant censés partager la même',
+        { num: { nodes: (psu.nodes || []).length } }));
+    }
     if (!model) checks.push(chk('info', 'psu-unknown', 'modèle d\'alimentation non renseigné : rien à vérifier'));
     else if (capA === null) checks.push(chk('info', 'psu-unknown', 'ampérage de l\'alimentation non renseigné'));
     else if (!mine.length) checks.push(chk('info', 'psu-unused', 'aucun node rattaché'));
@@ -351,6 +374,12 @@ function audit({ psus = [], nodes = [], opts = {} } = {}) {
 
   return {
     psus: out, orphelins, checks,
+    // Les nodes AU COMPLET, budgets, sorties et produits compris. Ils étaient
+    // jetés ici alors que le schéma et l'onglet les lisaient (`data.nodes`) :
+    // résultat, le schéma ne dessinait que des boîtes nues et ne montrait
+    // aucune sortie tant qu'un node n'était pas rattaché à une alimentation.
+    // C'est la donnée qui manquait, pas le dessin.
+    nodes,
     totals: {
       capaciteA: r2(out.reduce((a, p) => a + (p.capA || 0), 0)),
       budgetA: r2(nodes.reduce((a, n) => a + (n.budget.maxA || 0), 0)),
@@ -361,60 +390,94 @@ function audit({ psus = [], nodes = [], opts = {} } = {}) {
   };
 }
 
-module.exports = { nodeBudget, audit, DEF, ABL_DEFAULT, MA_FOR_ESP };
-
-// ── Les EXEMPLAIRES d'alimentation ─────────────────────────────────────────
-// Le catalogue décrit « Meanwell LRS-350-24 ». Ici on décrit « l'alim jardin,
-// une LRS-350-24, dont le rail A part vers les boules ». Cette information est
-// propre au spectacle : elle ne veut rien dire sur un autre poste, elle n'a
-// donc rien à faire dans le dépôt partagé.
+// ── Les deux générations de firmware ───────────────────────────────────────
+// Relevé sur la vraie flotte, et vérifié en direct sur les nodes :
 //
-// Elle vit dans power-plan.json et voyage dans le showfile. Les nodes, eux,
-// portent l'uid de l'exemplaire — et la fiche du modèle leur est déposée dans
-// /fleet-lib.json, pour qu'un node lu seul ne dise pas juste « alimenté par
-// 7e3f… ».
-const PLAN_FORMAT = 'wled-fleet-power';
-const PLAN_VERSION = 1;
+//   0.14.4 (vid 2405180)   hw.led.ledma = 55        <- GLOBAL, un seul chiffre
+//                          hw.led.ins[i]            <- ni ledma, ni maxpwr
+//   16.x   (vid 2605030+)  hw.led                   <- plus de ledma du tout
+//                          hw.led.ins[i].ledma      <- un par sortie
+//                          hw.led.ins[i].maxpwr     <- un par sortie
+//
+// Fleet lisait ins[i].ledma sans se poser la question. Sur un node 0.14 il ne
+// trouve rien et retombe sur 55 — ce qui est juste par hasard tant que le node
+// déclare 55, et faux dès qu'il déclare autre chose.
+//
+// Le vrai danger est à l'ÉCRITURE : WLED 0.14 ignore les clés qu'il ne connaît
+// pas. Écrire ins[i].ledma sur un de ces nodes ne lève aucune erreur, ne change
+// rien, et Fleet affiche ensuite la valeur demandée comme si elle était
+// appliquée. Un réglage de courant qui n'existe que dans l'interface est
+// exactement le genre de mensonge qu'on ne découvre qu'en voyant les LED
+// déconner sur le plateau.
+const SCHEME_GLOBAL = 'ledma-global';   // 0.14 et avant
+const SCHEME_PER_OUT = 'ledma-par-sortie'; // 16.x et après
 
-function normPlan(raw) {
-  const s = raw && typeof raw === 'object' ? raw : {};
-  const psus = (Array.isArray(s.psus) ? s.psus : []).map(p => {
-    const x = p || {};
+// On tranche sur ce que le node porte, jamais sur son numéro de version : un
+// build maison peut être numéroté n'importe comment, la forme de sa config ne
+// ment pas.
+function ablScheme(led) {
+  const L = led || {};
+  const ins = Array.isArray(L.ins) ? L.ins.filter(Boolean) : [];
+  if (ins.some(b => b.ledma !== undefined)) return SCHEME_PER_OUT;
+  if (L.ledma !== undefined) return SCHEME_GLOBAL;
+  return SCHEME_PER_OUT;   // rien pour trancher : on suppose le firmware courant
+}
+
+// Le mA/pixel réellement en vigueur sur une sortie, quelle que soit la
+// génération. C'est ce chiffre-là qu'il faut afficher et calculer.
+function ledmaOf(led, i) {
+  const L = led || {};
+  const b = (Array.isArray(L.ins) ? L.ins : [])[i] || {};
+  const v = b.ledma !== undefined ? Number(b.ledma)
+    : (L.ledma !== undefined ? Number(L.ledma) : NaN);
+  return Number.isFinite(v) ? v : ABL_DEFAULT_LEDMA;
+}
+
+// Traduire une config 0.14 vers la forme 16.x : le ledma global descend dans
+// CHAQUE sortie, et disparaît du niveau node.
+//
+// Sans cette traduction, réinjecter la sauvegarde d'un node après sa mise à
+// jour lui rendrait une config dont le firmware neuf ne lit plus le ledma : il
+// repartirait sur son défaut (55), et un ruban déclaré à 120 se remettrait
+// silencieusement à tirer plus du double de ce qui est prévu.
+//
+// Le maxpwr GLOBAL, lui, ne bouge pas : il existe dans les deux générations et
+// garde le même sens.
+function migrateLed(led) {
+  const L = led && typeof led === 'object' ? led : {};
+  if (ablScheme(L) === SCHEME_PER_OUT) return { ...L };
+  const ma = Number(L.ledma);
+  const out = { ...L };
+  delete out.ledma;
+  out.ins = (Array.isArray(L.ins) ? L.ins : []).map(b => (b && typeof b === 'object'
+    ? { ...b, ledma: Number.isFinite(ma) ? ma : ABL_DEFAULT_LEDMA }
+    : b));
+  return out;
+}
+
+// Réinjecter une sauvegarde sur un node qui a changé de génération.
+//
+// Le cas : on sauvegarde un node en 0.14, on le met à jour en 16.x, puis on lui
+// rend sa configuration. Rendue telle quelle, elle porte un ledma GLOBAL que le
+// firmware neuf ne lit plus — il repart alors sur son défaut de 55 mA/pixel. Un
+// ruban déclaré à 120 se remettrait donc à tirer plus du double du prévu, sans
+// qu'aucune erreur ne le dise : la restauration aurait "réussi".
+//
+// On ne traduit QUE dans ce sens. Rendre une config 16.x à un node resté en
+// 0.14 ne se répare pas ici : le firmware n'a tout simplement pas de champ par
+// sortie, et c'est à l'appelant de ne pas descendre une version en douce.
+function restoreLed(savedLed, liveLed) {
+  const avant = ablScheme(savedLed);
+  const apres = ablScheme(liveLed);
+  if (avant === SCHEME_GLOBAL && apres === SCHEME_PER_OUT) {
+    const ma = Number((savedLed || {}).ledma);
     return {
-      uid: typeof x.uid === 'string' && x.uid ? x.uid : null,   // frappé à l'insertion
-      label: String(x.label || '').trim().slice(0, 40),
-      model: typeof x.model === 'string' && x.model ? x.model : null,  // uid du catalogue
-      // où elle est physiquement : ce qu'on cherche quand quelque chose ne
-      // s'allume pas, et que personne ne note jamais
-      location: String(x.location || '').trim().slice(0, 60),
-      note: String(x.note || '').trim().slice(0, 200),
+      led: migrateLed(savedLed),
+      traduit: true,
+      note: `mA/pixel repris du réglage global (${Number.isFinite(ma) ? ma : ABL_DEFAULT_LEDMA}) et posé sur chaque sortie`,
     };
-  }).filter(p => p.label || p.model);
-  return { format: PLAN_FORMAT, formatVersion: PLAN_VERSION, psus };
+  }
+  return { led: savedLed, traduit: false, note: '' };
 }
 
-function planUpsert(plan, input, newUid) {
-  const st = normPlan(plan);
-  const p = normPlan({ psus: [input] }).psus[0];
-  if (!p) throw new Error('libellé ou modèle requis');
-  const i = p.uid ? st.psus.findIndex(x => x.uid === p.uid) : -1;
-  if (i >= 0) st.psus[i] = { ...p, uid: st.psus[i].uid };
-  else st.psus.push({ ...p, uid: p.uid || newUid });
-  st.psus.sort((a, b) => a.label.localeCompare(b.label));
-  return { plan: st, psu: st.psus.find(x => x.uid === (p.uid || newUid)) };
-}
-
-// Retirer un exemplaire n'est jamais anodin : des nodes le désignent. On rend
-// la liste de ceux qu'il faudra détacher plutôt que de le faire d'autorité.
-function planRemove(plan, uid) {
-  const st = normPlan(plan);
-  if (!st.psus.some(x => x.uid === uid)) throw new Error('alimentation inconnue');
-  st.psus = st.psus.filter(x => x.uid !== uid);
-  return st;
-}
-
-module.exports.PLAN_FORMAT = PLAN_FORMAT;
-module.exports.PLAN_VERSION = PLAN_VERSION;
-module.exports.normPlan = normPlan;
-module.exports.planUpsert = planUpsert;
-module.exports.planRemove = planRemove;
+module.exports = { nodeBudget, audit, DEF, ABL_DEFAULT, MA_FOR_ESP, ablScheme, ledmaOf, migrateLed, SCHEME_GLOBAL, SCHEME_PER_OUT, restoreLed };

@@ -3,7 +3,6 @@ settings.json
 led-profiles.json
 drivers.json
 psus.json
-power-plan.json
 changes.log
 changes-dev.log
 firmware/

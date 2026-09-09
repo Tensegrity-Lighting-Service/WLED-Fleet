@@ -23,6 +23,7 @@ const path = require('path');
 const http = require('http');
 const { dataFile, codeFile, DATA_DIR, CODE_DIR } = require('./paths');
 const metadata = require('./metadata');
+const power = require('./power');
 
 const DIR = dataFile('snapshots');
 const safeId = s => String(s || '').replace(/[^\w.-]+/g, '_').slice(0, 80);
@@ -149,6 +150,16 @@ async function restore(snap, targets, what, reboot, recs, postJson, onProgress =
         // never push the Wi-Fi/Ethernet block of another machine by accident: keep the node's own network settings
         const cfg = JSON.parse(JSON.stringify(entry.cfg));
         if (what.keepNetwork !== false && rec.cfg) { cfg.nw = rec.cfg.nw; cfg.eth = rec.cfg.eth; cfg.ap = rec.cfg.ap; }
+        // Un node mis à jour entre la sauvegarde et maintenant n'a plus le même
+        // schéma de courant : en 0.14 le mA/pixel est global, en 16.x il vit
+        // dans chaque sortie. Rendre la config d'avant telle quelle laisserait
+        // le firmware neuf repartir sur son défaut de 55, et un ruban déclaré à
+        // 120 tirerait plus du double du prévu — sans rien signaler, puisque la
+        // restauration aurait "réussi".
+        if (cfg.hw && cfg.hw.led && rec.cfg && rec.cfg.hw && rec.cfg.hw.led) {
+          const t = power.restoreLed(cfg.hw.led, rec.cfg.hw.led);
+          if (t.traduit) { cfg.hw.led = t.led; r.done.push(t.note); }
+        }
         await uploadFile(r.ip, '/cfg.json', cfg); r.done.push('cfg.json');
         if (reboot) { await postJson(r.ip, '/json/state', { rb: true }, 5000); r.done.push('reboot'); }
       }

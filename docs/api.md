@@ -8,7 +8,7 @@ Référence des surfaces exposées par WLED Fleet, à l'usage des logiciels
 satellites — plugin MA3, scripts, outils tiers. Générée depuis le code : elle ne
 peut pas diverger de ce que le serveur fait réellement.
 
-Version de l'application au moment de la génération : **0.12.0** · 102 points
+Version de l'application au moment de la génération : **0.12.0** · 100 points
 d'entrée.
 
 ## Ce qui fait autorité, et ce qui n'en fait pas
@@ -121,8 +121,6 @@ d'ensemble lit 3, et accepte alors de dépendre d'une instance de Fleet en march
 | méthode | chemin | rôle |
 |---|---|---|
 | `GET` | `/api/power` | Le rapport de cohérence électrique : pour chaque alimentation posée sur le plateau, sa capacité, la somme des budgets des nodes qu'elle nourrit, et les constats. Plus les nodes rattachés à rien — la seule liste que personne ne peut produire autrement. Les seuils et l'arithmétique de l'ABL sont dans power.js, vérifiés dans le firmware. |
-| `POST` | `/api/power/psu` | Crée ou met à jour un EXEMPLAIRE d'alimentation : son libellé, le modèle du catalogue qu'il suit, et où il se trouve. Propre au spectacle — « Alim jardin » ne veut rien dire sur un autre poste — donc jamais publié dans le dépôt partagé, mais présent dans le showfile. |
-| `DELETE` | `/api/power/psu/:id` | Retire un exemplaire d'alimentation. Les nodes qui le désignent sont renvoyés : c'est à l'utilisateur de les rattacher ailleurs, on ne les détache pas d'autorité. |
 | `POST` | `/api/node/:ip/power` | Rattache un node : quelle alimentation le nourrit, sur quel rail, et quelle carte il est. Écrit dans son /fleet.json, donc le node se raconte ensuite tout seul — y compris sur un autre poste. |
 
 ### Écritures en attente

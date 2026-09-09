@@ -4,6 +4,11 @@ Gestionnaire de flotte WLED (Phase 1 de la roadmap) : découverte des nodes sur
 le réseau, suivi de leur santé, et **grille de réglages type tableur** — une
 ligne par node, une colonne par paramètre, cellules éditables.
 
+> **Ce qui a changé, version par version : [CHANGELOG.md](CHANGELOG.md).**
+> Les règles du dépôt sont dans [CLAUDE.md](CLAUDE.md), le contrat d API dans
+> [docs/api.md](docs/api.md), et ce que Fleet écrit sur les nodes dans
+> [docs/fixture-mapping.md](docs/fixture-mapping.md).
+
 Prototype Node.js **sans aucune dépendance** (stdlib uniquement). Le cœur
 temps-réel (DDP) restera en Go, conformément à la roadmap ; ce module valide
 d'abord l'API WLED et le modèle de données.
