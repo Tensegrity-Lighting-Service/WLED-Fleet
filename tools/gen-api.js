@@ -25,6 +25,7 @@ const SECTIONS = [
   ['Catalogues : produits, cartes, alimentations', ['/api/library', '/api/led-profiles', '/api/drivers', '/api/psus']],
   ['Chaîne électrique', ['/api/power', '/api/node/:ip/power']],
   ['Écritures en attente', ['/api/node/:ip/offline-queue']],
+  ['Référence du show', ['/api/node/:ip/ref', '/api/ref']],
   ['Sauvegardes et showfile', ['/api/snapshots', '/api/showfile']],
   ['Firmwares et mise à jour', ['/api/firmware', '/api/node/:ip/update']],
   ['Antenne', ['/api/ap']],

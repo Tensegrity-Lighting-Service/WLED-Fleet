@@ -8,7 +8,7 @@ Référence des surfaces exposées par WLED Fleet, à l'usage des logiciels
 satellites — plugin MA3, scripts, outils tiers. Générée depuis le code : elle ne
 peut pas diverger de ce que le serveur fait réellement.
 
-Version de l'application au moment de la génération : **0.13.0** · 100 points
+Version de l'application au moment de la génération : **0.14.0** · 102 points
 d'entrée.
 
 ## Ce qui fait autorité, et ce qui n'en fait pas
@@ -121,7 +121,7 @@ d'ensemble lit 3, et accepte alors de dépendre d'une instance de Fleet en march
 | méthode | chemin | rôle |
 |---|---|---|
 | `GET` | `/api/power` | Le rapport de cohérence électrique : pour chaque alimentation posée sur le plateau, sa capacité, la somme des budgets des nodes qu'elle nourrit, et les constats. Plus les nodes rattachés à rien — la seule liste que personne ne peut produire autrement. Les seuils et l'arithmétique de l'ABL sont dans power.js, vérifiés dans le firmware. |
-| `POST` | `/api/node/:ip/power` | Rattache un node : quelle alimentation le nourrit, sur quel rail, et quelle carte il est. Écrit dans son /fleet.json, donc le node se raconte ensuite tout seul — y compris sur un autre poste. |
+| `POST` | `/api/node/:ip/power` | Rattache un node : quelle alimentation le nourrit, sur quel rail, et quelle carte il est. Écrit dans son /fleet.json, donc le node se raconte ensuite tout seul — y compris sur un autre poste. Un node HORS LIGNE ne fait pas échouer le rattachement : Fleet le retient et le déposera au retour du node — la réponse le dit — pour qu on puisse préparer un show avant d avoir branché quoi que ce soit. |
 
 ### Écritures en attente
 
@@ -129,6 +129,13 @@ d'ensemble lit 3, et accepte alors de dépendre d'une instance de Fleet en march
 |---|---|---|
 | `POST` | `/api/node/:ip/offline-queue/apply` | Applique à un node redevenu joignable les écritures mises en attente pendant son absence. |
 | `POST` | `/api/node/:ip/offline-queue/discard` | Abandonne les écritures en attente pour ce node. |
+
+### Référence du show
+
+| méthode | chemin | rôle |
+|---|---|---|
+| `ANY` | `/api/node/:ip/ref` | La référence du show d'un node : ce que Fleet tient pour vrai, colonne par colonne. POST l'aligne sur les valeurs actuelles du node (« garder la valeur du node ») pour les colonnes citées, ou pour toutes si `cols` est absent — rien n'est envoyé au node. DELETE l'oublie : elle sera resemée au prochain sondage, donc sans aucun écart. |
+| `POST` | `/api/ref/reset` | Oublie la référence du show sur TOUTE la flotte. Elle se resème au prochain sondage : plus aucun écart n'est signalé, et l'état des nodes devient celui du spectacle. C'est l'équivalent d'une remise à zéro. |
 
 ### Sauvegardes et showfile
 

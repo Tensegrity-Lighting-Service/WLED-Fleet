@@ -304,5 +304,30 @@ const columns = [
 
 const groups = [...new Set(columns.map(c => c.group))];
 
-module.exports = { columns, groups, LED_TYPES, COLOR_ORDERS, WHITE_SWAPS, WHITE_SWAP_TYPES, DMX_MODES,
+// ── Les colonnes qui portent une référence de show ──────────────────────────
+//
+// Fleet retient, colonne par colonne, la valeur qu'il tient pour celle du
+// SPECTACLE (rec.meta.ref, côté server.js). C'est ce qui permet de dire lequel
+// des deux a bougé quand un node revient avec autre chose : une intention posée
+// ici et pas encore partie, ou un réglage changé ailleurs — interface WLED,
+// préréglage, mise à jour de firmware.
+//
+// Trois exclusions, et elles comptent :
+//
+//   - ce qui n'est pas écrivable n'a pas de référence : la MAC ou l'archi d'un
+//     node ne se décident pas depuis un pupitre.
+//   - `meta.*` non plus : ces colonnes-là (le groupe) n'existent que dans Fleet,
+//     qui en est le seul auteur. Elles ne peuvent pas diverger.
+//   - `state.*` enfin. state.on, state.bri, state.ps, state.transition changent
+//     à chaque conduite : les suivre couvrirait la grille d'écarts que personne
+//     n'a provoqués. Les valeurs persistantes équivalentes existent et sont,
+//     elles, suivies : defon, defbri, defps, trdur.
+//
+// Conséquence assumée : syncsend / syncrecv vivent sous state.udpn et sortent
+// donc du dispositif, alors que ce sont des réglages. Les y remettre demande de
+// traiter state.* au cas par cas — pas de retirer la règle.
+const REF = columns.filter(c => c.watch !== false && c.write
+  && !c.path.startsWith('state.') && !c.path.startsWith('meta.'));
+
+module.exports = { columns, groups, REF, LED_TYPES, COLOR_ORDERS, WHITE_SWAPS, WHITE_SWAP_TYPES, DMX_MODES,
   LED_MA_PRESETS, LED_MA_MAX, PSU_MA_MIN, PSU_MA_MAX, MA_FOR_ESP, VOLTAGES, ETH_TYPES };

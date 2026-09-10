@@ -219,6 +219,7 @@ async function applyOfflineQueue(rec) {
     if (q.group !== undefined) { await writeGroup(rec, q.group, 'grille'); applied.push('groupe'); }
     if (q.ignoredOutputs !== undefined) { await writeIgnored(rec, q.ignoredOutputs, 'grille'); applied.push('sorties non utilisées'); }
     if (q.outputProfiles !== undefined) { await writeProfiles(rec, q.outputProfiles, 'grille'); applied.push('profils de sortie'); }
+    if (q.power !== undefined) { await writeNodePower(rec, q.power); applied.push('alimentation et carte'); }
   } finally { saveKnown(); }
   return { applied };
 }
@@ -316,6 +317,7 @@ function snapshot(rec) {
 }
 function recordChange(rec, colId, oldV, newV, source) {
   const ev = { at: Date.now(), ip: rec.meta.ip, name: (rec.info && rec.info.name) || rec.meta.ip, col: colId, old: oldV, new: newV, source };
+  if (NOTRES.has(source)) setRef(rec, colId, newV); // la référence suit ce que Fleet a décidé, et rien d'autre
   changes.push(ev);
   if (changes.length > 2000) changes = changes.slice(-2000);
   fs.appendFile(CHANGES_FILE, JSON.stringify(ev) + '\n', () => {});
@@ -340,6 +342,31 @@ function loadChanges() {
   } catch { /* no journal yet */ }
 }
 
+// ── La référence du show ─────────────────────────────────────────────────────
+// La règle est dans showref.js, testable sans serveur ni node. Ici on ne garde
+// que le branchement : où la référence vit (rec.meta.ref, donc elle suit le
+// record à travers mergeByMac et part dans known-nodes.json), et QUAND elle a le
+// droit de bouger.
+//
+// `NOTRES` est le point d'accroche unique : toute écriture de Fleet resonde le
+// node avec la source « grille », et une restauration de sauvegarde avec la
+// source « restauration ». Un sondage ordinaire (« externe ») et une mise à jour
+// de firmware (« maj ») ne réalignent rien — c'est tout l'intérêt.
+//
+// Imprécision connue, héritée du journal : le sondage qui suit une écriture
+// attribue « grille » à TOUT ce qui a changé depuis le sondage précédent, pas
+// seulement à la cellule écrite. Une dérive extérieure tombée dans cette fenêtre
+// de quelques secondes passe donc pour la nôtre. La corriger demande de porter
+// la source colonne par colonne dans diffSnapshot ; ça n'a pas paru valoir le
+// coût.
+const showref = require('./showref');
+const NOTRES = new Set(['grille', 'restauration']);
+const refOf = rec => (rec.meta.ref || (rec.meta.ref = {}));
+const setRef = (rec, colId, value) => showref.set(refOf(rec), colId, value);
+const seedRef = rec => showref.seed(refOf(rec), rec);
+const ecarts = rec => showref.ecarts(rec.meta.ref, rec);
+const alignRef = (rec, cols) => showref.align(refOf(rec), rec, cols);
+
 async function pollInfoState(rec, source = 'externe') {
   const ip = rec.meta.ip;
   const before = snapshot(rec);
@@ -360,6 +387,7 @@ async function pollInfoState(rec, source = 'externe') {
     if (rec.meta.fails >= 2) rec.meta.online = false;
   }
   derive(rec);
+  seedRef(rec);
   const ota = rec.meta.ota && ['flash', 'reboot'].includes(rec.meta.ota.status);
   const restoring = rec.meta.restoreUntil && Date.now() < rec.meta.restoreUntil; // changes right after a snapshot restore are ours
   if (!firstPoll && wasOnline !== rec.meta.online && !ota && !restoring) recordChange(rec, 'online', wasOnline, rec.meta.online, 'statut');
@@ -462,6 +490,7 @@ async function pollCfg(rec, source = 'externe') {
     }
   } catch { /* le node ne répond pas sur ce point : on garde la copie précédente */ }
   derive(rec);
+  seedRef(rec);
   if (before) diffSnapshot(rec, before, source);
 }
 
@@ -526,6 +555,22 @@ async function writeNodeLibrary(rec, meta) {
 // grille n'a pas d'avis » ; `null` = « détache ». La distinction compte :
 // enregistrer un formulaire où le champ carte est absent ne doit pas effacer la
 // carte déclarée.
+// Le rattachement électrique d'un node : son alimentation, son rail, sa carte.
+//
+// ── Pourquoi ça doit marcher hors ligne ────────────────────────────────────
+// On prépare un show avant de brancher quoi que ce soit. Refuser de retenir
+// « cette boule est sur l'alim jardin » parce que la boule n'est pas allumée
+// revient à interdire de préparer — et à perdre le travail déjà fait dès qu'un
+// node tombe.
+//
+// Fleet garde donc SA copie tout de suite : c'est elle qui alimente la grille,
+// le rapport de cohérence et le showfile, et elle est persistée dans
+// known-nodes.json. Le node, lui, recevra son /fleet.json quand il reviendra —
+// par la file d'attente, comme le groupe, les sorties non câblées et les
+// profils de sortie, qui posent exactement le même problème depuis toujours.
+//
+// La ligne porte alors ⏳ : l'intention est retenue, mais le node ne la connaît
+// pas encore. C'est une nuance qu'il faut montrer, pas masquer.
 async function writeNodePower(rec, b) {
   const cur = metadata.parse(rec.meta.nodeMeta || metadata.empty());
   const next = metadata.parse({ ...cur, power: {
@@ -534,11 +579,21 @@ async function writeNodePower(rec, b) {
     rail: b.rail === undefined ? cur.power.rail : b.rail,
     driver: b.driver === undefined ? cur.power.driver : b.driver,
   } });
+  if (!rec.meta.online) {
+    rec.meta.nodeMeta = next;
+    if (!metadata.isEmpty(next)) rec.meta.nodeMetaSeen = next;
+    queueOffline(rec, 'power', next.power);
+    saveKnown();
+    return { queued: true };
+  }
   await metadata.write(rec.meta.ip, next, 8000);
   rec.meta.nodeMeta = next;
   if (!metadata.isEmpty(next)) rec.meta.nodeMetaSeen = next;
+  unqueueOffline(rec, 'power');
   await writeNodeLibrary(rec, next);
   derive(rec);
+  saveKnown();
+  return { queued: false };
 }
 
 async function restoreNodeMeta(rec, reason = 'maj') {
@@ -1003,7 +1058,10 @@ async function scan() {
 // known-nodes.json keeps, for every node, the LAST KNOWN info/state/cfg and
 // when it was last seen: a node that is off (or on another site) still shows
 // its whole row, greyed, with "vu il y a", instead of an empty line.
-const knownEntries = () => [...fleet.values()].map(r => ({ ip: r.meta.ip, lastSeen: r.meta.lastSeen, info: r.info, state: r.state, cfg: r.cfg, ignoredOutputs: r.meta.ignoredOutputs || [], group: r.meta.group || '', offlineQueue: r.meta.offlineQueue || null, nodeMeta: r.meta.nodeMetaSeen || null }));
+// `ref` est la référence du show (voir setRef / seedRef) : sans elle sur le
+// disque, un redémarrage de l'application effacerait la mémoire de ce que Fleet
+// avait décidé, et tout redeviendrait « le node a raison ».
+const knownEntries = () => [...fleet.values()].map(r => ({ ip: r.meta.ip, lastSeen: r.meta.lastSeen, info: r.info, state: r.state, cfg: r.cfg, ignoredOutputs: r.meta.ignoredOutputs || [], group: r.meta.group || '', offlineQueue: r.meta.offlineQueue || null, nodeMeta: r.meta.nodeMetaSeen || null, ref: r.meta.ref || null }));
 let declaredGroups = []; // Fleet-only group names, kept even when no node is in them
 // ── Bibliothèque de produits LED ─────────────────────────────────────────────
 // Le fichier reste 'led-profiles.json' : il est migré en place au chargement
@@ -1466,6 +1524,7 @@ function loadKnown() {
     // ligne, et à les remettre si le node revient nu d'une mise à jour
     if (e.nodeMeta) { r.meta.nodeMetaSeen = metadata.parse(e.nodeMeta); r.meta.nodeMeta = r.meta.nodeMetaSeen; }
     if (typeof e.group === 'string' && e.group) r.meta.group = e.group; // Fleet-only: node group (zone, type…)
+    if (e.ref && typeof e.ref === 'object') r.meta.ref = e.ref; // la référence du show, ce que Fleet tient pour vrai
     if (r.meta.offlineQueue) { // offlineQueue overrides the two legacy fallbacks above too
       if (r.meta.offlineQueue.group !== undefined) r.meta.group = r.meta.offlineQueue.group;
       if (r.meta.offlineQueue.ignoredOutputs !== undefined) r.meta.ignoredOutputs = r.meta.offlineQueue.ignoredOutputs;
@@ -1597,9 +1656,14 @@ function fleetPayload() {
   const now = Date.now();
   const nodes = [...fleet.values()].map(r => {
     r.meta.lastSeenAgo = r.meta.lastSeen ? Math.round((now - r.meta.lastSeen) / 1000) : null;
-    return r;
+    r.meta.foreign = isForeign(r.meta.ip);
+    // La référence entière ne part PAS : trente-huit valeurs par node à chaque
+    // sondage pour que le client en compare trente-huit. Il reçoit les seules
+    // colonnes où ça ne colle pas, avec la valeur du show — l'autre moitié, la
+    // valeur du node, il l'a déjà dans le record.
+    const ec = ecarts(r);
+    return { ...r, meta: { ...r.meta, ref: undefined, ecarts: Object.keys(ec).length ? ec : undefined } };
   });
-  nodes.forEach(n => { n.meta.foreign = isForeign(n.meta.ip); });
   return { updated: now, readonly: READONLY, scanning, lastScan, nodes, groups: allGroups(), net: netStatus(), maintenance };
 }
 
@@ -1912,7 +1976,12 @@ const server = http.createServer(async (req, res) => {
         // Un showfile v2 porte encore un plan d'alimentation : on l'ignore
         // sciemment. Ses exemplaires ne désignent plus rien, et le rattachement
         // qui compte voyage avec les nodes, dans leur /fleet.json.
-        for (const e of doc.knownNodes) { const ip = typeof e === 'string' ? e : e.ip; if (!ip) continue; const r = addNode(ip); if (e.info && !r.info) { r.info = e.info; r.state = e.state || null; r.cfg = e.cfg || null; r.meta.lastSeen = e.lastSeen || null; r.meta.fails = 2; } if (typeof e.group === 'string' && e.group) r.meta.group = e.group; if (Array.isArray(e.ignoredOutputs)) r.meta.ignoredOutputs = e.ignoredOutputs; derive(r); }
+        // La référence du show voyage avec les nodes — c'est la part du showfile
+        // qui dit ce qui est VOULU, par opposition à ce qui est branché. Elle ne
+        // remplace pas celle d'ici quand il y en a déjà une : importer le
+        // showfile d'un autre plateau n'efface rien. Pour que celle du fichier
+        // l'emporte, remettre la référence à zéro avant d'importer.
+        for (const e of doc.knownNodes) { const ip = typeof e === 'string' ? e : e.ip; if (!ip) continue; const r = addNode(ip); if (e.info && !r.info) { r.info = e.info; r.state = e.state || null; r.cfg = e.cfg || null; r.meta.lastSeen = e.lastSeen || null; r.meta.fails = 2; } if (typeof e.group === 'string' && e.group) r.meta.group = e.group; if (Array.isArray(e.ignoredOutputs)) r.meta.ignoredOutputs = e.ignoredOutputs; if (e.ref && typeof e.ref === 'object' && !Object.keys(r.meta.ref || {}).length) r.meta.ref = e.ref; derive(r); }
         saveKnown(); pollAll(); done.push(`${doc.knownNodes.length} node(s)`);
       }
       if (what.snapshots && Array.isArray(doc.snapshots)) { let n = 0; for (const s of doc.snapshots) { try { snapshots.importFile(Buffer.from(JSON.stringify(s)), (s.name || s.id || 'snapshot') + '.json'); n++; } catch { /* skip bad one */ } } done.push(`${n} sauvegarde(s)`); }
@@ -1945,13 +2014,18 @@ const server = http.createServer(async (req, res) => {
     }
     // @api Rattache un node : quelle alimentation le nourrit, sur quel rail, et
     // quelle carte il est. Écrit dans son /fleet.json, donc le node se raconte
-    // ensuite tout seul — y compris sur un autre poste.
+    // ensuite tout seul — y compris sur un autre poste. Un node HORS LIGNE ne
+    // fait pas échouer le rattachement : Fleet le retient et le déposera au
+    // retour du node — la réponse le dit — pour qu on puisse préparer un show
+    // avant d avoir branché quoi que ce soit.
     if ((m = /^\/api\/node\/([^/]+)\/power$/.exec(p)) && req.method === 'POST') {
       if (READONLY) return send(res, 403, { error: 'lecture seule' });
       const rec = fleet.get(decodeURIComponent(m[1])); if (!rec) return send(res, 404, { error: 'node inconnu' });
-      if (!rec.meta.online) return send(res, 409, { error: 'node hors ligne' });
       const b = await readBody(req);
-      try { await writeNodePower(rec, b); return send(res, 200, { ok: true, power: rec.meta.nodeMeta.power }); }
+      try {
+        const r = await writeNodePower(rec, b);
+        return send(res, 200, { ok: true, queued: r.queued, power: rec.meta.nodeMeta.power });
+      }
       catch (e) { return send(res, 502, { error: e.message }); }
     }
     // ── Drivers et alimentations ──────────────────────────────────────────
@@ -2760,6 +2834,32 @@ const server = http.createServer(async (req, res) => {
     if ((m = /^\/api\/node\/([^/]+)\/cell$/.exec(p)) && req.method === 'POST') {
       const { col, value } = await readBody(req);
       return send(res, 200, await writeCell(decodeURIComponent(m[1]), col, value));
+    }
+    // @api La référence du show d'un node : ce que Fleet tient pour vrai,
+    // colonne par colonne. POST l'aligne sur les valeurs actuelles du node
+    // (« garder la valeur du node ») pour les colonnes citées, ou pour toutes
+    // si `cols` est absent — rien n'est envoyé au node. DELETE l'oublie : elle
+    // sera resemée au prochain sondage, donc sans aucun écart.
+    if ((m = /^\/api\/node\/([^/]+)\/ref$/.exec(p)) && ['POST', 'DELETE'].includes(req.method)) {
+      if (READONLY) return send(res, 403, { error: 'lecture seule' });
+      const ip = decodeURIComponent(m[1]); const rec = fleet.get(ip);
+      if (!rec) return send(res, 404, { error: 'node inconnu' });
+      if (req.method === 'DELETE') { rec.meta.ref = {}; seedRef(rec); saveKnown(); return send(res, 200, { ok: true, ecarts: ecarts(rec) }); }
+      const b = await readBody(req);
+      const n = alignRef(rec, Array.isArray(b.cols) ? b.cols : null);
+      if (n) { saveKnown(); recordChangeFleet(`${(rec.info && rec.info.name) || ip} : ${n} valeur(s) du node adoptée(s) comme référence du show`); }
+      return send(res, 200, { ok: true, aligned: n, ecarts: ecarts(rec) });
+    }
+    // @api Oublie la référence du show sur TOUTE la flotte. Elle se resème au
+    // prochain sondage : plus aucun écart n'est signalé, et l'état des nodes
+    // devient celui du spectacle. C'est l'équivalent d'une remise à zéro.
+    if (p === '/api/ref/reset' && req.method === 'POST') {
+      if (READONLY) return send(res, 403, { error: 'lecture seule' });
+      let n = 0;
+      for (const rec of fleet.values()) { if (Object.keys(ecarts(rec)).length) n++; rec.meta.ref = {}; seedRef(rec); }
+      saveKnown();
+      recordChangeFleet(`référence du show remise à zéro (${n} node(s) portaient des écarts)`);
+      return send(res, 200, { ok: true, nodes: fleet.size, avaient: n });
     }
     // @api Redémarre le node.
     if ((m = /^\/api\/node\/([^/]+)\/reboot$/.exec(p)) && req.method === 'POST') {

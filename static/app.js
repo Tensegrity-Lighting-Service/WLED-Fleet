@@ -77,6 +77,15 @@
   // catalogue, et le bouton lier dit quels nodes sont branchés sur la même
   // alimentation physique. C'est cette distinction, et elle seule, qui décide
   // si deux consommations s'additionnent.
+  // L'alimentation et la carte ne se règlent pas sur le node : elles s'écrivent
+  // dans son /fleet.json. Quand il est hors ligne, Fleet retient l'intention et
+  // la file d'attente la lui portera au retour — la valeur affichée est donc
+  // celle du show, que le node ignore encore. C'est une nuance à montrer, pas à
+  // masquer : ⏳, le même signe que dans la grille.
+  const attendPower = ip => { const r = fleet.nodes.find(x => x.meta.ip === ip); return !!(r && r.meta.offlineQueue && r.meta.offlineQueue.power !== undefined); };
+  const marqueAttente = ip => attendPower(ip)
+    ? ` <span class="ecwait" title="⏳ retenu par Fleet — le node est hors ligne et ne le sait pas encore. Ce sera écrit dans son /fleet.json dès qu'il répondra.">⏳</span>` : '';
+
   const cellAlim = (n, membres, span) => {
     const list = catalogueAlims();
     const cur = ((n.power || {}).psu) || '';
@@ -101,7 +110,7 @@
     return `<td class="alimcell" rowspan="${span}">`
       + `<select data-alim="${esc(n.ip)}" title="le MODÈLE d'alimentation qui nourrit ce node. Choisir écrit dans son /fleet.json ; le bouton ⛓ de la colonne suivante dit quels nodes partagent la même alimentation physique."><option value="">—</option>`
       + list.map(x => `<option value="${esc(x.uid)}"${x.uid === cur ? ' selected' : ''}>${esc(nomFiche(x))} · ${x.psu.volt} V${x.psu.amps ? ` ${x.psu.amps} A` : ''}</option>`).join('')
-      + '</select>' + charge + compte + '</td>';
+      + '</select>' + marqueAttente(n.ip) + charge + compte + '</td>';
   };
 
   // Le lien vers le node du dessus, sur le patron exact du chaînage des
@@ -109,15 +118,21 @@
   // départs et n'écrit rien, alors que le lien d'alimentation est un fait
   // stocké — il part donc tout de suite sur le node, et exige qu'il soit en
   // ligne.
-  const cellLien = (n, precedent) => {
-    if (!precedent) return '<td class="liencell"></td>';
+  // `lignes` : le nombre de lignes du node, donc le rowspan. Sans lui, la
+  // cellule n'existait que sur la première sortie et les suivantes glissaient
+  // d'une colonne vers la gauche — chaque valeur se retrouvait sous le mauvais
+  // en-tête. Les cellules Alim et Node, elles, portaient déjà leur rowspan :
+  // c'est ce qui rendait le décalage exactement d'une colonne.
+  const cellLien = (n, precedent, lignes) => {
+    const rs = lignes > 1 ? ` rowspan="${lignes}"` : '';
+    if (!precedent) return `<td class="liencell"${rs}></td>`;
     const g = (n.power || {}).psuGroup || null;
     const gp = (precedent.power || {}).psuGroup || null;
     const lie = !!g && g === gp;
     const titre = lie
       ? `lié à ${precedent.name || precedent.ip} : même alimentation physique. Cliquer pour détacher.`
       : `alimentation propre. Cliquer pour le brancher sur la même que ${precedent.name || precedent.ip} — leurs consommations s'additionneront alors.`;
-    return `<td class="liencell${lie ? ' linked' : ''}" data-lien="${esc(n.ip)}" data-lien-prev="${esc(precedent.ip)}" title="${esc(titre)}"><span class="chainmark">${lie ? '⛓' : '⊘'}</span></td>`;
+    return `<td class="liencell${lie ? ' linked' : ''}"${rs} data-lien="${esc(n.ip)}" data-lien-prev="${esc(precedent.ip)}" title="${esc(titre)}"><span class="chainmark">${lie ? '⛓' : '⊘'}</span></td>`;
   };
   const selCarte = (ip, cur) => {
     const list = catalogueCartes();
@@ -125,7 +140,7 @@
     return `<label title="quelle carte est ce node. Ce qu'elle admet en tension et en courant décide si son budget est réaliste — le node, lui, n'en sait rien."><span class="lbl">carte</span>`
       + `<select data-carte="${esc(ip)}"><option value="">—</option>`
       + list.map(x => `<option value="${esc(x.uid)}"${x.uid === cur ? ' selected' : ''}>${esc(nomFiche(x))}</option>`).join('')
-      + '</select></label>';
+      + '</select></label>' + marqueAttente(ip);
   };
   let ledProfilesCache = []; // local library (led-profiles.json), kept in sync for the Sorties/DMX badge and table
   let sortKey = 'name', sortDir = 1, editing = null;
@@ -202,6 +217,58 @@
     if (col.fmt === 'duration') return fmtDur(v);
     return String(v);
   }
+
+  // ── Deux valeurs sur une même donnée ───────────────────────────────────────
+  //
+  // Quand le spectacle et le node ne disent pas la même chose, les deux
+  // s'affichent DANS LA CELLULE : c'est là qu'on corrige, et un tableau
+  // récapitulatif ailleurs serait décorrélé du geste. La valeur du show à
+  // gauche en gras, celle du node à droite en gris, un signe entre les deux qui
+  // dit lequel a bougé.
+  //
+  //   ⏳  modification préplanifiée — Fleet a décidé, le node ne le sait pas
+  //       encore. C'est déjà le marqueur de la file d'attente ailleurs dans
+  //       l'application.
+  //   ⚑  information modifiée en dehors — le node a changé tout seul
+  //       (interface WLED, préréglage, mise à jour de firmware).
+  //
+  // La même fonction sert à la grille et à Sorties/DMX : c'est le même problème,
+  // il ne doit pas avoir deux présentations.
+  const ECART = {
+    plan: { signe: '⏳', dit: 'en attente — le node ne l\'a pas encore' },
+    externe: { signe: '⚑', dit: 'modifié en dehors de Fleet' },
+  };
+  function celluleEcart(col, show, node, genre) {
+    const e = ECART[genre] || ECART.externe;
+    const vide = '<span class="rien">—</span>';
+    return `<span class="ecart ${genre}"><b>${display(col, show) || vide}</b>`
+      + `<i>${e.signe}</i><span class="autre">${display(col, node) || vide}</span></span>`;
+  }
+  // `tranchable` : le serveur signale un écart sur cette donnée, donc le menu
+  // propose de trancher. Une valeur simplement mise en attente sur une cellule
+  // par ailleurs d'accord n'a rien à trancher — elle s'abandonne par Annuler.
+  function titreEcart(col, show, node, genre, quand, tranchable) {
+    const e = ECART[genre] || ECART.externe;
+    return `${e.signe} ${e.dit}${quand ? ` (${new Date(quand).toLocaleString()})` : ''}\n`
+      + `show : ${raw(col, show) || '—'}\nnode : ${raw(col, node) || '—'}\n`
+      + (tranchable ? `clic droit : garder l'une ou l'autre — ici, sur la sélection, ce node ou le groupe\n\n`
+        : `Déployer l'envoie au node, Annuler l'abandonne\n\n`);
+  }
+  // les écarts d'un node, tels que le serveur les a calculés (meta.ecarts) :
+  // uniquement les colonnes où la référence du show et le node divergent
+  const ecartsDe = n => (n.meta && n.meta.ecarts) || null;
+  const ecartDe = (n, colId) => { const e = ecartsDe(n); return e && Object.prototype.hasOwnProperty.call(e, colId) ? e[colId] : undefined; };
+  // Les seuls écarts à COMPTER : ceux que personne n'a encore pris en main. Une
+  // cellule sur laquelle une modification est déjà en attente est comptée par
+  // « Déployer » ; la faire compter deux fois ferait dire au badge ⚑ qu'une
+  // valeur a changé en dehors de Fleet alors que c'est nous qui l'avons décidée.
+  const colsEcartExterne = n => Object.keys(ecartsDe(n) || {}).filter(colId => !pending.has(pkey(key(n), colId)));
+  // Même grammaire, sur un champ de formulaire (Sorties / DMX). Le champ porte
+  // déjà la valeur du node : le badge porte celle du show, et se clique pour
+  // trancher. Un « 900 ⚑ 420 » en texte à côté d'un champ qui affiche 420
+  // répéterait la même valeur deux fois.
+  const badgeEcart = (ip, col, show) =>
+    `<button type="button" class="ecbadge" data-ecart="${esc(ip)}|${esc(col.id)}" title="${esc(`⚑ le show dit ${raw(col, show) || '(vide)'} — le node dit autre chose.\ncliquer : garder l'une ou l'autre`)}">⚑ ${esc(raw(col, show) || '—')}</button>`;
   // panels are rebuilt on every poll: remember which <details data-key> are open (and the
   // scroll position) before innerHTML is replaced, and put them back afterwards
   function keepDetails(p) {
@@ -213,6 +280,29 @@
   // red = destructive (retirer, supprimer, abandonner…), orange = writes / reboots / flashes,
   // green = the rest. Click outside, Escape or « Annuler » cancels. Returns a Promise<boolean>.
   let lastPointer = { x: innerWidth / 2, y: innerHeight / 2 };
+
+  // Placer une fenêtre sans jamais la laisser sortir de l'écran.
+  //
+  // Deux défauts réunis la rendaient invalidable : la hauteur était mesurée
+  // AVANT que le corps ne soit rempli — donc sur une fenêtre vide, bien plus
+  // courte que la vraie — et le repli vers le haut ne garantissait rien quand la
+  // fenêtre était plus haute que la fenêtre du navigateur. Résultat : les
+  // boutons Annuler / Valider passaient sous le bord bas, hors d'atteinte.
+  //
+  // À appeler APRÈS avoir rempli le contenu. Le reste — la fenêtre qui se réduit
+  // au lieu de déborder — est dans la feuille de style.
+  const placerPop = (box, ancre = lastPointer) => {
+    const r = box.getBoundingClientRect();
+    const W = r.width, H = r.height;
+    const x = Math.min(Math.max(8, ancre.x - 20), Math.max(8, innerWidth - W - 8));
+    // sous le pointeur si ça tient, au-dessus sinon, et collée en haut en
+    // dernier recours : une fenêtre plus haute que l'écran doit commencer en
+    // haut, jamais au milieu
+    let y = ancre.y + 12;
+    if (y + H > innerHeight - 8) y = ancre.y - H - 12;
+    y = Math.min(Math.max(8, y), Math.max(8, innerHeight - H - 8));
+    box.style.left = x + 'px'; box.style.top = y + 'px';
+  };
   document.addEventListener('mousedown', e => { lastPointer = { x: e.clientX, y: e.clientY }; }, true);
   function confirmBox(msg, opts = {}) {
     return new Promise(resolve => {
@@ -224,10 +314,7 @@
       const box = document.createElement('div'); box.className = 'pop';
       box.innerHTML = `<div class="pop-head">${esc(head)}</div>${rest.join('\n').trim() ? `<div class="pop-body">${esc(rest.join('\n').trim())}</div>` : ''}<div class="pop-actions"><button class="pop-cancel">Annuler</button><button class="pop-act ${tone}">${esc(label)}</button></div>`;
       document.body.appendChild(box);
-      const W = box.offsetWidth, H = box.offsetHeight;
-      let x = Math.min(Math.max(8, lastPointer.x - 20), innerWidth - W - 8), y = lastPointer.y + 12;
-      if (y + H > innerHeight - 8) y = Math.max(8, lastPointer.y - H - 12);
-      box.style.left = x + 'px'; box.style.top = y + 'px';
+      placerPop(box);
       const done = v => { document.removeEventListener('mousedown', outside, true); document.removeEventListener('keydown', key, true); box.remove(); resolve(v); };
       const outside = e => { if (!box.contains(e.target)) { e.stopPropagation(); e.preventDefault(); done(false); } };
       const key = e => { if (e.key === 'Escape') { e.stopPropagation(); done(false); } else if (e.key === 'Enter') { e.stopPropagation(); done(true); } };
@@ -246,9 +333,7 @@
         <div style="padding:0 10px 8px"><input class="pop-input" value="${esc(value)}" style="width:100%"></div>
         <div class="pop-actions"><button class="pop-cancel">Annuler</button><button class="pop-act green">Appliquer</button></div>`;
       document.body.appendChild(box);
-      const W = box.offsetWidth, H = box.offsetHeight;
-      box.style.left = Math.min(Math.max(8, lastPointer.x - 20), innerWidth - W - 8) + 'px';
-      box.style.top = (lastPointer.y + 12 + H > innerHeight - 8 ? Math.max(8, lastPointer.y - H - 12) : lastPointer.y + 12) + 'px';
+      placerPop(box);
       const input = box.querySelector('.pop-input');
       const done = v => { document.removeEventListener('mousedown', outside, true); document.removeEventListener('keydown', key, true); box.remove(); resolve(v); };
       const outside = e => { if (!box.contains(e.target)) { e.stopPropagation(); e.preventDefault(); done(null); } };
@@ -384,6 +469,7 @@
         else { nb.textContent = `⚠ PC hors du réseau ${net.subnets.join(' / ')}.x`; nb.className = 'badge ro'; nb.title = `le PC n'a aucune adresse dans le sous-réseau de la flotte. Interfaces actuelles : ${net.ifaces.map(i => `${i.iface} ${i.address}`).join(', ') || 'aucune'}. Brancher le câble / rejoindre le réseau du show, ou changer "subnet" dans settings.json. Les nodes reviendront seuls.`; }
       }
       renderBody();
+      updatePendingUI(); // le compteur d'écarts vient du serveur : il change sans qu'on ait rien touché
       updateDmxBadge();
     } catch (e) {
       $('#liveDot').className = 'dot bad'; $('#liveTxt').textContent = 'serveur injoignable';
@@ -762,7 +848,7 @@
   const nameOf = ip => { const n = nodeOf(ip); return (n && n.info && n.info.name) || ip; };
   // Fleet-only fields written straight to the node's MQTT config (group, sorties non
   // utilisées, profils de sortie) : mis en attente (⏳) quand le node est hors ligne.
-  const OFFLINE_FIELD_LABEL = { group: 'groupe', ignoredOutputs: 'sorties non utilisées', outputProfiles: 'profils de sortie' };
+  const OFFLINE_FIELD_LABEL = { group: 'groupe', ignoredOutputs: 'sorties non utilisées', outputProfiles: 'profils de sortie', power: 'alimentation et carte' };
   async function setGroup(ips, g) {
     let queued = 0;
     for (const ip of ips) { try { const r = await post(`/api/node/${encodeURIComponent(ip)}/group`, { group: g }); if (r.queued) queued++; } catch (e) { toast(`${nameOf(ip)} : ${e.message}`, true); } }
@@ -793,22 +879,116 @@
       { label: 'Nouveau groupe…', act: async () => { const g = prompt(`Nom du nouveau groupe pour ${lbl} :`); if (g && g.trim()) await setGroup(ips, g.trim()); } },
     ];
     const items = [{ label: 'Groupe', sub: groupSub, help: `${lbl} : choisir le groupe (Group topic MQTT du node, écrit tout de suite)` }];
+    // ── Trancher un écart : la cellule montre les deux valeurs, le menu dit
+    // laquelle garder, et sur quelle portée. On ne quitte pas la grille : c'est
+    // ici qu'on lit l'écart, ce doit être ici qu'on le résout.
+    //
+    // « Garder le show » passe par stageValue, donc par Déployer : rien ne part
+    // sur un node sans un geste explicite. « Garder le node » ne touche que la
+    // référence, côté serveur, et n'écrit rien nulle part.
+    if (c && !fleet.readonly) {
+      // [{ip, col, show, node}] pour les écarts EXTERNES des cellules retenues.
+      // `garde` filtre sur le COUPLE (node, colonne) : c'est la maille de la
+      // sélection, et une portée « sélection » qui prendrait toute la colonne
+      // toucherait des cellules que l'utilisateur n'a pas choisies.
+      const paires = (ipList, garde) => {
+        const out = [];
+        for (const ip of ipList) {
+          const nd = nodeOf(ip); const e = nd && ecartsDe(nd); if (!e) continue;
+          for (const colId of Object.keys(e)) {
+            if (garde && !garde(ip, colId)) continue;
+            const col = COLS.find(x => x.id === colId); if (!col) continue;
+            out.push({ ip, col, show: e[colId], node: get(nd, col.path) });
+          }
+        }
+        return out;
+      };
+      const gardeNode = async (ps, quoi) => {
+        // garder le node, c'est aussi renoncer à ce qu'on avait mis en attente
+        // sur ces cellules : sans ça la valeur adoptée repartirait au Déployer
+        // suivant, et le geste n'aurait servi à rien.
+        const enAttente = ps.filter(x => pending.has(pkey(x.ip, x.col.id))).length;
+        if (!await confirmBox(`Garder la valeur du NODE pour ${quoi} ?\n\nLa référence du show s'aligne dessus. Rien n'est envoyé, rien n'est modifié sur les nodes — c'est Fleet qui admet que le node a raison.${enAttente ? `\n\n${enAttente} modification(s) en attente sur ces cellules seront abandonnées.` : ''}`)) return;
+        const parIp = new Map(); ps.forEach(x => { parIp.set(x.ip, [...(parIp.get(x.ip) || []), x.col.id]); pending.delete(pkey(x.ip, x.col.id)); });
+        for (const [ip, cols] of parIp) { try { await post(`/api/node/${encodeURIComponent(ip)}/ref`, { cols }); } catch (err) { toast(`${nameOf(ip)} : ${err.message}`, true); } }
+        cellSel.clear(); updatePendingUI(); await refresh(); toast(`${ps.length} valeur(s) du node adoptée(s)`);
+      };
+      const gardeShow = ps => { // remet la valeur du show en attente : elle repartira au Déployer
+        const ecartes = ps.filter(x => x.col.write);
+        const refuses = ps.length - ecartes.length;
+        ecartes.forEach(x => stageValue(x.ip, x.col, x.show));
+        updatePendingUI(); renderBody();
+        toast(`${ecartes.length} valeur(s) du show mise(s) en attente${refuses ? ` — ${refuses} colonne(s) non modifiable(s) ignorée(s)` : ''} · Déployer pour les envoyer`);
+      };
+      const ici = paires([c.ip], (ip, id) => id === c.col);
+      // la sélection, au sens strict : les cellules cochées. Une ligne cochée
+      // sans cellule (clic sur la poignée) vaut toutes ses cellules.
+      const sel = paires(rows().map(key).filter(inSel),
+        (ip, id) => cellSel.has(pkey(ip, id)) || (selected.has(ip) && ![...cellSel].some(k2 => k2.startsWith(ip + '|'))));
+      const ceNode = paires([c.ip]);
+      const g = groupOf(nodeOf(c.ip));
+      const duGroupe = paires(rows().filter(x => groupOf(x) === g).map(key));
+      if (ici.length) {
+        const x = ici[0];
+        const sub = [
+          { label: `Garder le SHOW : ${raw(x.col, x.show) || '(vide)'}`, help: 'met la valeur du show en attente dans cette cellule ; rien ne part avant Déployer', act: () => gardeShow(ici) },
+          { label: `Garder le NODE : ${raw(x.col, x.node) || '(vide)'}`, help: 'la référence du show s\'aligne sur le node ; rien n\'est envoyé', act: () => gardeNode(ici, `« ${x.col.label} » de ${nameOf(c.ip)}`) },
+          { sep: true },
+        ];
+        if (sel.length > ici.length) sub.push(
+          { label: `Garder le SHOW — sélection (${sel.length})`, act: () => gardeShow(sel) },
+          { label: `Garder le NODE — sélection (${sel.length})`, act: () => gardeNode(sel, `${sel.length} cellule(s) sélectionnée(s)`) });
+        if (ceNode.length > ici.length) sub.push(
+          { label: `Garder le SHOW — tout ${nameOf(c.ip)} (${ceNode.length})`, act: () => gardeShow(ceNode) },
+          { label: `Garder le NODE — tout ${nameOf(c.ip)} (${ceNode.length})`, act: () => gardeNode(ceNode, `les ${ceNode.length} écarts de ${nameOf(c.ip)}`) });
+        if (duGroupe.length > ceNode.length) sub.push(
+          { label: `Garder le SHOW — groupe ${g || 'sans groupe'} (${duGroupe.length})`, act: () => gardeShow(duGroupe) },
+          { label: `Garder le NODE — groupe ${g || 'sans groupe'} (${duGroupe.length})`, act: () => gardeNode(duGroupe, `les ${duGroupe.length} écarts du groupe ${g || 'sans groupe'}`) });
+        items.push({ label: `⚑ Écart : show ${raw(x.col, x.show) || '(vide)'} / node ${raw(x.col, x.node) || '(vide)'}`, sub,
+          help: `« ${x.col.label} » a changé sur le node en dehors de Fleet. Choisir laquelle des deux valeurs fait foi, et sur quelle portée.` });
+      } else if (ceNode.length || duGroupe.length) {
+        items.push({ label: `⚑ ${ceNode.length} écart(s) sur ce node`, sub: [
+          { label: `Sélectionner les ${ceNode.length} cellules`, act: () => action('ecarts', c.ip) },
+          { sep: true },
+          { label: `Garder le SHOW — tout ${nameOf(c.ip)}`, act: () => gardeShow(ceNode) },
+          { label: `Garder le NODE — tout ${nameOf(c.ip)}`, act: () => gardeNode(ceNode, `les ${ceNode.length} écarts de ${nameOf(c.ip)}`) },
+          ...(duGroupe.length > ceNode.length ? [{ sep: true },
+            { label: `Garder le SHOW — groupe ${g || 'sans groupe'} (${duGroupe.length})`, act: () => gardeShow(duGroupe) },
+            { label: `Garder le NODE — groupe ${g || 'sans groupe'} (${duGroupe.length})`, act: () => gardeNode(duGroupe, `les ${duGroupe.length} écarts du groupe ${g || 'sans groupe'}`) }] : []),
+        ], help: 'cette cellule est d\'accord, mais d\'autres du même node ne le sont pas' });
+      }
+      if (ceNode.length) items.push({ sep: true });
+    }
     // right-click the name / mDNS / AP-SSID cell of one node: push that cell's value as
     // the reference into the other two (same server endpoint as the ≡ unifier row button —
     // showAdv only, easy to miss — but any of the three fields can now be the source,
     // not just the name)
     if (c && ['name', 'mdns', 'apssid'].includes(c.col) && !fleet.readonly) {
-      const node = nodeOf(c.ip);
-      if (node && node.info) {
-        const col = COLS.find(x => x.id === c.col);
-        const p = pending.get(pkey(c.ip, c.col));
-        const value = p ? p.value : (get(node, col.path) ?? (c.col === 'name' ? node.info.name : undefined));
-        if (value) {
-          items.push({ label: `Renommer « ${nameOf(c.ip)} » d'après cette cellule`, help: `« ${value} » (${col.label}) devient le nom, le mDNS (forme d'hôte) et le SSID de l'AP de ce node — les trois s'alignent dessus. Redémarrage nécessaire, lancé automatiquement.`, act: async () => {
-            if (!await confirmBox(`Aligner nom / mDNS / SSID de l'AP de « ${nameOf(c.ip)} » sur « ${value} » ?\n\nRedémarrage immédiat.`)) return;
-            try { const r = await post(`/api/node/${encodeURIComponent(c.ip)}/unify`, { name: value, reboot: true }); toast(`${nameOf(c.ip)} : nom / mDNS / AP = ${r.name}, redémarrage`); } catch (e) { toast(e.message, true); }
-          } });
-        }
+      const col = COLS.find(x => x.id === c.col);
+      // CHAQUE node s'aligne sur SA valeur de cette colonne, pas sur celle du
+      // node cliqué : aligner vingt-sept nodes sur « Boule 04 » leur donnerait
+      // le même nom, le même mDNS et le même SSID — trois collisions par node.
+      const valeurDe = ip => { const nd = nodeOf(ip); if (!nd || !nd.info) return null;
+        const p = pending.get(pkey(ip, c.col));
+        return p ? p.value : (get(nd, col.path) ?? (c.col === 'name' ? nd.info.name : undefined)) || null; };
+      const cibles = ips.map(ip => ({ ip, value: valeurDe(ip) })).filter(x => x.value);
+      if (cibles.length === 1) {
+        const { ip, value } = cibles[0];
+        items.push({ label: `Renommer « ${nameOf(ip)} » d'après cette cellule`, help: `« ${value} » (${col.label}) devient le nom, le mDNS (forme d'hôte) et le SSID de l'AP de ce node — les trois s'alignent dessus. Redémarrage nécessaire, lancé automatiquement.`, act: async () => {
+          if (!await confirmBox(`Aligner nom / mDNS / SSID de l'AP de « ${nameOf(ip)} » sur « ${value} » ?\n\nRedémarrage immédiat.`)) return;
+          try { const r = await post(`/api/node/${encodeURIComponent(ip)}/unify`, { name: value, reboot: true }); toast(`${nameOf(ip)} : nom / mDNS / AP = ${r.name}, redémarrage`); } catch (e) { toast(e.message, true); }
+          refresh();
+        } });
+      } else if (cibles.length > 1) {
+        const apercu = cibles.slice(0, 8).map(x => `• ${nameOf(x.ip)} → ${x.value}`).join('\n');
+        items.push({ label: `Renommer ${cibles.length} nodes d'après leur « ${col.label} »`, help: `chaque node aligne son nom, son mDNS et le SSID de son AP sur SA propre valeur de « ${col.label} » — pas sur celle du node cliqué. Redémarrage de chacun, lancé automatiquement.`, act: async () => {
+          if (!await confirmBox(`Aligner nom / mDNS / SSID de l'AP de ${cibles.length} nodes sur leur « ${col.label} » ?\n\n${apercu}${cibles.length > 8 ? '\n…' : ''}\n\nRedémarrage immédiat de chacun.`)) return;
+          let ok = 0; for (const { ip, value } of cibles) {
+            try { await post(`/api/node/${encodeURIComponent(ip)}/unify`, { name: value, reboot: true }); ok++; } catch (e) { toast(`${nameOf(ip)} : ${e.message}`, true); }
+          }
+          toast(`${ok}/${cibles.length} node(s) alignés sur leur « ${col.label} », redémarrage`);
+          refresh();
+        } });
       }
     }
     // right-click a cell that's part of a multi-cell selection in one column: offer to
@@ -902,20 +1082,38 @@
         const p = pending.get(pkey(k, c.id));
         const v = p ? p.value : live;
         const isDiff = diffOn && !c.nodiff && m[c.id].distinct > 1 && list.length > 2 && JSON.stringify(live) !== m[c.id].mode;
-        const cls = ['gk-' + GROUPS.indexOf(c.group), c.write && !fleet.readonly ? 'rw' : '', c.type === 'num' ? 'num' : '', isDiff ? 'diff' : '', p ? 'pending' : ''].filter(Boolean).join(' ') + changedCls(k, c.id);
         const ch = recentChanges.get(pkey(k, c.id));
-        const title = (p ? `en attente : ${raw(c, live)} → ${raw(c, v)}\n\n` : ch ? `modifié ${ch.source} à ${new Date(ch.at).toLocaleTimeString()} : ${raw(c, ch.old)} → ${raw(c, ch.new)}\n\n` : '') + helpText(c);
-        return `<td class="${cls}" data-ip="${esc(k)}" data-col="${c.id}" title="${esc(title)}"><span class="cell">${display(c, v)}</span></td>`;
+        // Deux valeurs peuvent vivre sur cette donnée, et pour deux raisons
+        // opposées : une intention posée ici et pas encore partie (`pending`),
+        // ou le node qui a changé sans nous (`meta.ecarts`, calculé contre la
+        // référence du show). Les confondre, c'est ce qui faisait apparaître un
+        // bouton « mettre à jour » sans que personne n'ait rien touché.
+        const refShow = ecartDe(n, c.id);
+        const genre = p ? 'plan' : refShow !== undefined ? 'externe' : '';
+        const show = p ? p.value : refShow;
+        const cls = ['gk-' + GROUPS.indexOf(c.group), c.write && !fleet.readonly ? 'rw' : '', c.type === 'num' ? 'num' : '', isDiff ? 'diff' : '', p ? 'pending' : '', genre ? 'ecarte' : ''].filter(Boolean).join(' ') + changedCls(k, c.id);
+        const title = (genre ? titreEcart(c, show, live, genre, genre === 'externe' && ch ? ch.at : 0, refShow !== undefined)
+          : ch ? `modifié ${ch.source} à ${new Date(ch.at).toLocaleTimeString()} : ${raw(c, ch.old)} → ${raw(c, ch.new)}\n\n` : '') + helpText(c);
+        const dedans = genre ? celluleEcart(c, show, live, genre) : display(c, v);
+        return `<td class="${cls}" data-ip="${esc(k)}" data-col="${c.id}" title="${esc(title)}"><span class="cell">${dedans}</span></td>`;
       }).join('');
       const pn = pending.get(pkey(k, 'name'));
-      const name = pn ? pn.value : (get(n, nameCol.path) ?? (n.info && n.info.name) ?? '');
+      const nameLive = get(n, nameCol.path) ?? (n.info && n.info.name) ?? '';
+      const name = pn ? pn.value : nameLive;
+      const nameRef = ecartDe(n, 'name');
+      const nameGenre = pn ? 'plan' : nameRef !== undefined ? 'externe' : '';
       const pr = presenceHtml(n);
       const oq = n.meta.offlineQueue;
       const oqWhat = oq ? Object.keys(oq).map(f => OFFLINE_FIELD_LABEL[f] || f).join(', ') : '';
-      const nameTitle = [n.meta.err, pr.status, n.derived && n.derived.nameMismatch ? n.derived.nameMismatch + ' — bouton ≡ unifier en bout de ligne' : '', oq ? `⏳ en attente (${oqWhat}) — ${n.meta.online ? 'cliquer pour envoyer ou abandonner' : 'sera proposé au retour du node'}` : ''].filter(Boolean).join('\n');
+      // combien de colonnes de ce node ont bougé SANS Fleet : le compte vit sur
+      // la ligne, le détail dans les cellules. Un badge qui renvoie vers un
+      // tableau ailleurs serait décorrélé de l'endroit où on corrige.
+      const ecCols = colsEcartExterne(n), nEc = ecCols.length;
+      const ecLbl = ecCols.map(id => (COLS.find(c => c.id === id) || { label: id }).label).join(', ');
+      const nameTitle = [n.meta.err, pr.status, n.derived && n.derived.nameMismatch ? n.derived.nameMismatch + ' — bouton ≡ unifier en bout de ligne' : '', oq ? `⏳ en attente (${oqWhat}) — ${n.meta.online ? 'cliquer pour envoyer ou abandonner' : 'sera proposé au retour du node'}` : '', nEc ? `⚑ ${nEc} valeur(s) modifiée(s) en dehors de Fleet : ${ecLbl}` : ''].filter(Boolean).join('\n');
       return `<tr class="${n.meta.online ? '' : 'offline'}${selected.has(k) ? ' selected' : ''}" data-ip="${esc(k)}" data-rid="${esc(rid(n))}">` +
         `<td class="pin"><span class="cell"><span class="grip" title="glisser pour réordonner les lignes (passe en ordre manuel)"></span><input type="checkbox" class="sel" title="cocher la ligne pour les actions (identifier, préréglage, mise à jour)" ${selected.has(k) ? 'checked' : ''}></span></td>` +
-        `<td class="pin2 ${nameCol.write && !fleet.readonly ? 'rw' : ''}${pn ? ' pending' : ''}${changedCls(k, 'name')}" data-ip="${esc(k)}" data-col="name" title="${esc(nameTitle)}"><span class="cell"><span class="dot ${pr.cls}"></span>${pr.bars}<button class="idbtn" data-act="identify" title="identifier : allume ce node en blanc plein 3 s (même sous flux E1.31 / DDP) puis rétablit son état ; rien n'est écrit en mémoire">💡</button>${oq ? `<button class="idbtn" data-act="offline-queue" style="color:var(--warn)" title="${esc(`en attente (${oqWhat}) — ${n.meta.online ? 'cliquer pour envoyer au node ou abandonner' : 'sera proposé dès que le node répond'}`)}">⏳</button>` : ''}${esc(name)}${n.derived && n.derived.nameMismatch ? ' <span style="color:var(--warn)" title="' + esc(n.derived.nameMismatch) + '">≠</span>' : ''}${n.meta.pending ? ' <span class="muted">…</span>' : ''}</span></td>` +
+        `<td class="pin2 ${nameCol.write && !fleet.readonly ? 'rw' : ''}${pn ? ' pending' : ''}${nameGenre ? ' ecarte' : ''}${changedCls(k, 'name')}" data-ip="${esc(k)}" data-col="name" title="${esc(nameTitle)}"><span class="cell"><span class="dot ${pr.cls}"></span>${pr.bars}<button class="idbtn" data-act="identify" title="identifier : allume ce node en blanc plein 3 s (même sous flux E1.31 / DDP) puis rétablit son état ; rien n'est écrit en mémoire">💡</button>${oq ? `<button class="idbtn" data-act="offline-queue" style="color:var(--warn)" title="${esc(`en attente (${oqWhat}) — ${n.meta.online ? 'cliquer pour envoyer au node ou abandonner' : 'sera proposé dès que le node répond'}`)}">⏳</button>` : ''}${nEc ? `<button class="idbtn" data-act="ecarts" style="color:var(--warn)" title="${esc(`⚑ ${nEc} valeur(s) modifiée(s) en dehors de Fleet : ${ecLbl}\ncliquer : sélectionner ces cellules`)}">⚑${nEc}</button>` : ''}${nameGenre ? celluleEcart(nameCol, pn ? pn.value : nameRef, nameLive, nameGenre) : esc(name)}${n.derived && n.derived.nameMismatch ? ' <span style="color:var(--warn)" title="' + esc(n.derived.nameMismatch) + '">≠</span>' : ''}${n.meta.pending ? ' <span class="muted">…</span>' : ''}</span></td>` +
         `<td class="pin3${n.meta.foreign ? ' chg-ext' : ''}" data-ip="${esc(k)}" data-col="ip" title="${esc(helpText(COLS.find(c => c.id === 'ip')))}"><span class="cell">${display(COLS.find(c => c.id === 'ip'), k)}</span></td>` +
         cells +
         (!showAdv ? '<td></td>' : `<td><span class="cell"><a class="rowbtn" href="/api/node/${encodeURIComponent(k)}/cfg" title="télécharger le cfg.json complet de ce node (sauvegarde de toute sa configuration)">⬇ cfg</a>` +
@@ -1069,11 +1267,11 @@
         <div class="muted" style="font-size:11px">ordre = celui des lignes de la grille (≡ ordre manuel pour le choisir) ; la ligne éditée est l'ancre, les autres s'écartent vers le haut et le bas</div>
         <div class="pop-actions"><button class="pop-cancel">Annuler</button><button class="pop-act green">Mettre en attente</button></div>`;
       document.body.appendChild(box);
-      const W = box.offsetWidth, H = box.offsetHeight;
-      let x = Math.min(Math.max(8, lastPointer.x - 20), innerWidth - W - 8), y = lastPointer.y + 12; if (y + H > innerHeight - 8) y = Math.max(8, lastPointer.y - H - 12);
-      box.style.left = x + 'px'; box.style.top = y + 'px';
       box.querySelectorAll('input').forEach(i => { i.oninput = render; i.onchange = render; });
+      // remplir D'ABORD : la liste des nodes fait la moitié de la hauteur, et
+      // placer avant de la connaître revenait à mesurer une fenêtre vide
       render();
+      placerPop(box);
       const done = v => { document.removeEventListener('mousedown', outside, true); document.removeEventListener('keydown', keyH, true); box.remove(); resolve(v); };
       const outside = e => { if (!box.contains(e.target)) { e.preventDefault(); e.stopPropagation(); done(null); } };
       const keyH = e => { if (e.key === 'Escape') { e.stopPropagation(); done(null); } };
@@ -1089,6 +1287,13 @@
     $('#btnDeploy').disabled = n === 0 || fleet.readonly;
     $('#btnDiscard').disabled = n === 0;
     $('#btnDeploy').textContent = n ? `Déployer ${n} changement${n > 1 ? 's' : ''} → ${nodes} node${nodes > 1 ? 's' : ''}` : 'Déployer';
+    // Les écarts n'ont pas de bouton « appliquer » : ce n'est pas une file
+    // d'attente, c'est un constat. Le bouton dit combien et amène dessus.
+    const be = $('#btnEcarts'); if (!be) return;
+    let cells = 0, nds = 0;
+    for (const x of (fleet.nodes || [])) { const k2 = colsEcartExterne(x).length; if (k2) { nds++; cells += k2; } }
+    be.hidden = cells === 0;
+    be.textContent = `⚑ ${cells} écart${cells > 1 ? 's' : ''} · ${nds} node${nds > 1 ? 's' : ''}`;
   }
 
   async function deploy() {
@@ -1299,6 +1504,12 @@
     const sel = (name, map, cur) => `<select data-out="${name}" data-orig="${cur}">${Object.entries(map).map(([v, l]) => `<option value="${v}" ${Number(v) === Number(cur) ? 'selected' : ''}>${esc(l)}</option>`).join('')}${map[cur] === undefined ? `<option value="${cur}" selected>type ${cur}</option>` : ''}</select>`;
     const nodeCell = (n, span) => {
       const pl = n.plan, rec = nodeRec(n.ip); const cur = c => { const st = pending.get(pkey(n.ip, c.id)); return st ? st.value : (rec ? get(rec, c.path) : undefined); };
+      // Le node peut avoir changé sans Fleet ici comme dans la grille : ce sont
+      // les mêmes colonnes, le même serveur les calcule, ce doit être le même
+      // signe. Sans ça, la grille signalerait un écart que cet onglet ignore —
+      // exactement le défaut qui a fait diverger le rapport de cohérence.
+      const ecN = c => (rec ? ecartDe(rec, c.id) : undefined);
+      const badgeN = c => { const s = ecN(c); return s === undefined ? '' : badgeEcart(n.ip, c, s); };
       const mode = cur(colDmx.mode), uni = cur(colDmx.uni) ?? pl.uni, addr = cur(colDmx.addr) ?? pl.addr, mA = cur(colDmx.mA) ?? '';
       // Le régime ne se lit nulle part : il se DÉDUIT. Limite globale à 0 et au
       // moins une limite par sortie = limiteur par sortie. C'est exactement le
@@ -1314,10 +1525,10 @@
           <span class="ncell-st"><span class="st-bad cf" title="un autre node écoute une partie des mêmes canaux (état des champs à l'écran)" ${inConflict ? '' : 'hidden'}>✗ conflit</span>${pl.multi && !aligned ? ' <span class="st-warn" title="une sortie ne commence pas sur un début d\'univers : à la console, une fixture reste à cheval">▲ à cheval</span>' : ''}${n.live ? ` <span class="st-ok" title="flux temps réel reçu de ${esc(n.lip)}">● ${esc(n.lm)}</span>` : ''}</span>
           <span class="muted" style="font-size:10.5px">${esc(n.ip)}${pl.multi ? ` · ${pl.total} px` : ''}</span></div>
         <div class="ncell-set">
-          <select data-nb="dmxmode" data-orig="${esc(String(mode ?? ''))}" title="mode DMX du node">${Object.entries(colDmx.mode.enum).map(([v, l]) => `<option value="${v}" ${Number(v) === Number(mode) ? 'selected' : ''}>${esc(l)}</option>`).join('')}</select>
-          <label title="univers de départ"><span class="lbl">u</span><input type="number" data-nb="dmxuni" data-orig="${esc(String(uni))}" min="1" max="63999" value="${esc(String(uni))}"></label>
-          <label title="adresse de départ dans cet univers : c'est elle qui permet de loger plusieurs nodes courts dans un même univers"><span class="lbl">adr</span><input type="number" data-nb="dmxaddr" data-orig="${esc(String(addr))}" min="1" max="512" value="${esc(String(addr))}"></label>
-          <label title="limite de courant du node (mA) : l'ABL de WLED baisse la luminosité pour ne jamais dépasser ce budget. Il en retire d'abord 120 mA pour l'ESP lui-même."><span class="lbl">mA</span><input type="number" data-nb="maxpwr" data-orig="${esc(String(mA))}" min="0" step="50" value="${esc(String(mA))}"${ppl ? ' disabled' : ''}></label>
+          <select data-nb="dmxmode" data-orig="${esc(String(mode ?? ''))}" title="mode DMX du node">${Object.entries(colDmx.mode.enum).map(([v, l]) => `<option value="${v}" ${Number(v) === Number(mode) ? 'selected' : ''}>${esc(l)}</option>`).join('')}</select>${badgeN(colDmx.mode)}
+          <label title="univers de départ"><span class="lbl">u</span><input type="number" data-nb="dmxuni" data-orig="${esc(String(uni))}" min="1" max="63999" value="${esc(String(uni))}"></label>${badgeN(colDmx.uni)}
+          <label title="adresse de départ dans cet univers : c'est elle qui permet de loger plusieurs nodes courts dans un même univers"><span class="lbl">adr</span><input type="number" data-nb="dmxaddr" data-orig="${esc(String(addr))}" min="1" max="512" value="${esc(String(addr))}"></label>${badgeN(colDmx.addr)}
+          <label title="limite de courant du node (mA) : l'ABL de WLED baisse la luminosité pour ne jamais dépasser ce budget. Il en retire d'abord 120 mA pour l'ESP lui-même."><span class="lbl">mA</span><input type="number" data-nb="maxpwr" data-orig="${esc(String(mA))}" min="0" step="50" value="${esc(String(mA))}"${ppl ? ' disabled' : ''}></label>${badgeN(colDmx.mA)}
           <label class="chip" title="Un budget par sortie au lieu d'un seul pour tout le node. WLED le recommande dès qu'il y a plusieurs sorties : sans ça, une sortie chargée mange la marge des autres. Les deux régimes s'EXCLUENT — cocher met la limite globale à 0, c'est ce qui bascule le firmware. Indispensable quand les sorties sont sur des circuits ou des alimentations différents."><input type="checkbox" data-ppl data-orig="${ppl ? 1 : 0}" ${ppl ? 'checked' : ''}> par sortie</label>
           <span class="ablnote" data-abl></span>
           ${selCarte(n.ip, (n.power || {}).driver || "")}
@@ -1430,7 +1641,7 @@
       const body = gc.nodes.map((n, idx) => {
         const pl = n.plan; const rec = nodeRec(n.ip); const rawIns = (rec && rec.cfg && rec.cfg.hw && rec.cfg.hw.led && rec.cfg.hw.led.ins) || [];
         const s = suites.get(idx);
-        const tete = (s ? cellAlim(n, s.membres, s.span) : '') + cellLien(n, idx > 0 ? gc.nodes[idx - 1] : null);
+        const tete = (s ? cellAlim(n, s.membres, s.span) : '') + cellLien(n, idx > 0 ? gc.nodes[idx - 1] : null, lignesDe(n));
         if (!pl.multi) return `<tr data-node="${esc(n.ip)}">${tete}${nodeCell(n, 1)}<td class="pickcell"></td><td colspan="${NCOL}" class="muted">mode ${esc(modeName(pl.mode))} : ${esc(pl.note)}</td></tr>`;
         const outs = pl.outputs; const span = Math.max(1, outs.length);
         if (!outs.length) return `<tr data-node="${esc(n.ip)}">${tete}${nodeCell(n, 1)}<td class="pickcell"></td><td colspan="${NCOL}" class="muted">aucune sortie déclarée</td></tr>`;
@@ -1536,6 +1747,28 @@
     // redistribue au prorata des pixels, comme WLED le fait de son côté
     // (:204) — sinon les valeurs par sortie resteraient là à ne rien faire, et
     // c'est précisément ce qu'on trouve aujourd'hui dans les configs.
+    // ⚑ : cette valeur a changé sur le node sans passer par Fleet. Deux issues,
+    // les mêmes que dans la grille — garder le show remet la valeur dans le
+    // champ, donc dans le lot du bouton Enregistrer (rien ne part tout seul) ;
+    // garder le node aligne la référence et n'écrit nulle part.
+    p.querySelectorAll('.ecbadge').forEach(b => b.onclick = e => {
+      e.preventDefault(); e.stopPropagation();
+      const [ip, colId] = b.dataset.ecart.split('|');
+      const col = COLS.find(c => c.id === colId); const rec = nodeRec(ip);
+      if (!col || !rec) return;
+      const show = ecartDe(rec, colId), node = get(rec, col.path);
+      const champ = p.querySelector(`[data-nodecell="${CSS.escape(ip)}"] [data-nb="${colId}"]`); // data-nb = id de colonne
+      menuBox(e.clientX, e.clientY, [
+        { label: `Garder le SHOW : ${raw(col, show) || '(vide)'}`, help: 'remet la valeur du show dans le champ ; elle part avec le bouton Enregistrer, pas avant', act: () => {
+          if (!champ) return toast('champ introuvable', true);
+          champ.value = String(show); champ.dispatchEvent(new Event('input', { bubbles: true })); champ.dispatchEvent(new Event('change', { bubbles: true }));
+        } },
+        { label: `Garder le NODE : ${raw(col, node) || '(vide)'}`, help: 'la référence du show s\'aligne sur le node ; rien n\'est envoyé', act: async () => {
+          try { await post(`/api/node/${encodeURIComponent(ip)}/ref`, { cols: [colId] }); toast(`${nameOf(ip)} : ${col.label} = ${raw(col, node)} adopté`); } catch (err) { toast(err.message, true); }
+          await refresh(); renderDmx();
+        } },
+      ]);
+    });
     p.querySelectorAll('[data-ppl]').forEach(cb => cb.onchange = () => {
       const ip = cb.closest('[data-nodecell]').dataset.nodecell;
       const glob = p.querySelector(`[data-nodecell="${CSS.escape(ip)}"] [data-nb=maxpwr]`);
@@ -1789,12 +2022,13 @@
         const tete = sl.dataset.alim;
         const grp = ((nodePlan(tete) || {}).power || {}).psuGroup || null;
         const cibles = grp ? (d.nodes || []).filter(n => ((n.power || {}).psuGroup) === grp).map(n => n.ip) : [tete];
-        const rates = [];
+        const rates = []; let retenus = 0;
         for (const ip of cibles) {
-          try { await post(`/api/node/${encodeURIComponent(ip)}/power`, { psu: sl.value || null }); }
+          try { const r = await post(`/api/node/${encodeURIComponent(ip)}/power`, { psu: sl.value || null }); if (r.queued) retenus++; }
           catch (e) { rates.push(`${ip} : ${e.message}`); }
         }
         if (rates.length) { sl.value = avant; toast(`alimentation non enregistrée — ${rates.join(' · ')}`, true, 7000); }
+        else if (retenus) toast(`alimentation retenue pour ${retenus} node(s) hors ligne : elle partira à leur retour (⏳)`, false, 6000);
         else toast(sl.value ? `alimentation enregistrée sur ${cibles.length} node(s)` : 'alimentation retirée');
         renderDmx();
       };
@@ -1836,6 +2070,7 @@
         await post(`/api/node/${encodeURIComponent(ip)}/power`, { psu: psuLui, psuGroup: grp });
         toast('nodes liés à la même alimentation');
       } catch (e) { return toast(`lien impossible : ${e.message}`, true, 6000); }
+      // (un node hors ligne ne lève plus : le lien est retenu et partira au retour)
       renderDmx();
     });
     p.querySelectorAll('select[data-carte]').forEach(sl => {
@@ -1843,8 +2078,11 @@
       sl.onchange = async () => {
         const ip = sl.dataset.carte;
         try {
-          await post(`/api/node/${encodeURIComponent(ip)}/power`, { driver: sl.value || null });
-          toast(sl.value ? 'carte enregistrée sur le node' : 'carte retirée');
+          const r = await post(`/api/node/${encodeURIComponent(ip)}/power`, { driver: sl.value || null });
+          // un node hors ligne ne fait pas échouer : Fleet retient, et déposera
+          // au retour. La valeur reste donc affichée, avec la nuance.
+          toast(r.queued ? 'node hors ligne : la carte est retenue, elle partira au retour (⏳)'
+            : (sl.value ? 'carte enregistrée sur le node' : 'carte retirée'));
         } catch (e) { sl.value = avant; toast(`carte non enregistrée : ${e.message}`, true); }
       };
     });
@@ -3787,6 +4025,19 @@
         try { const r = await post(`/api/node/${encodeURIComponent(ip)}/unify`, { name, reboot: true }); toast(`${ip} : nom / mDNS / AP = ${r.name}, redémarrage`); } catch (e) { toast(e.message, true); }
         refresh(); return;
       }
+      // ⚑ : les valeurs de ce node qui ont bougé sans Fleet. Le badge SÉLECTIONNE
+      // les cellules concernées au lieu d'ouvrir une liste — c'est dans la grille
+      // qu'on tranche, et le clic droit y propose déjà les quatre portées.
+      if (act === 'ecarts') {
+        const n = fleet.nodes.find(x => key(x) === ip); if (!n) return;
+        const cols = colsEcartExterne(n); if (!cols.length) return;
+        cellSel.clear(); selected.clear();
+        cols.forEach(colId => cellSel.add(pkey(ip, colId)));
+        active = null; renderBody();
+        const caches = cols.filter(colId => colId !== 'name' && !visibleCols().some(c => c.id === colId));
+        toast(`${nameOf(ip)} : ${cols.length} écart(s) sélectionné(s)${caches.length ? ` — ${caches.length} dans des colonnes masquées (⚙ colonnes)` : ''} · clic droit pour trancher`);
+        return;
+      }
       if (act === 'offline-queue') {
         const n = fleet.nodes.find(x => key(x) === ip); const q = n && n.meta.offlineQueue;
         if (!q) return;
@@ -3837,6 +4088,19 @@
   $('#addIp').onkeydown = e => { if (e.key === 'Enter') $('#btnAdd').click(); };
   $('#filter').oninput = renderBody; $('#diffToggle').onchange = renderBody; $('#hideOffline').onchange = renderBody;
   $('#btnDeploy').onclick = deploy; $('#btnDiscard').onclick = discard;
+  // ⚑ : amener sur les cellules en écart plutôt que d'ouvrir une liste. La
+  // grille EST le récapitulatif, et c'est là qu'on tranche (clic droit).
+  $('#btnEcarts').onclick = () => {
+    cellSel.clear(); selected.clear(); active = null;
+    const groupes = new Set(); let n = 0, caches = 0;
+    const visibles = new Set(visibleCols().map(c => c.id));
+    for (const x of fleet.nodes) {
+      for (const colId of colsEcartExterne(x)) { cellSel.add(pkey(key(x), colId)); n++; if (!visibles.has(colId) && colId !== 'name') { caches++; const c = COLS.find(y => y.id === colId); if (c) groupes.add(c.group); } }
+    }
+    if (currentTab !== 'grid') showTab('grid');
+    renderBody();
+    toast(n ? `${n} écart(s) sélectionné(s)${caches ? ` — ${caches} dans des colonnes masquées (${[...groupes].join(', ')})` : ''} · clic droit pour trancher` : 'aucun écart');
+  };
   // show preset for nodes: staged as pending cells, deployed by the user
   const NODE_PRESET = [['wifisleep', false], ['txpwr', 78], ['seqskip', true]];
   $('#btnPreset').onclick = () => {

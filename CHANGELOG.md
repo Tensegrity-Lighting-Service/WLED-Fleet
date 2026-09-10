@@ -8,13 +8,95 @@ messages de commit ; ici on garde ce qu'il faut savoir avant de mettre à jour.
 | canal | version | ce qu'on y trouve |
 |---|---|---|
 | **stable** | **0.9.0** | la dernière version éprouvée en exploitation |
-| **beta** | **0.13.0** | toute la chaîne électrique, le schéma du plateau, les trois bibliothèques |
+| **beta** | **0.14.0** | l'écart show / node dans la cellule, la chaîne électrique, le schéma du plateau |
 
 Tout ce qui suit la 0.9.0 vit donc **uniquement sur le canal beta** (⚙ Réglages →
 Application → Canal). Le canal stable ne peut pas l'attraper par accident :
 GitHub ne résout jamais `releases/latest` vers une préversion.
 
 ---
+
+## 0.14.0
+
+### Savoir lequel des deux a bougé, du show ou du node
+
+Fleet mémorisait déjà le dernier état connu de chaque node, hors ligne et au
+redémarrage. Ce qui manquait n'était pas la mémoire : c'était de savoir **qui a
+bougé**. Un sondage écrasait la configuration lue sans rien retenir — un node
+qui revenait avec une autre valeur devenait la vérité en silence, et la seule
+trace était un liseré de dix minutes dans la grille. Passé ce délai, plus rien.
+
+Dans l'autre sens, une intention posée par l'utilisateur et pas encore partie
+portait le même genre de marque. Deux situations **opposées**, impossibles à
+distinguer — d'où ce bouton « mettre à jour » qui semblait apparaître par magie
+sans que personne n'ait rien touché côté Fleet.
+
+**Quand les deux ne disent pas la même chose, la cellule montre les deux** :
+
+| | |
+|---|---|
+| `900 ⏳ 420` | modification préplanifiée — le node ne l'a pas encore |
+| `900 ⚑ 420` | information modifiée en dehors de Fleet |
+
+La valeur du show à gauche, celle du node à droite, et le cadre suit : bleu pour
+ce qu'on a décidé, orange pour ce qui nous échappe.
+
+**Le comparatif reste dans la matrice de modification.** Un tableau ailleurs
+serait indigeste et décorrélé du geste qui corrige : le clic droit sur la
+cellule propose de garder l'une ou l'autre valeur — ici, sur la sélection, sur
+tout le node ou sur tout le groupe. Garder le show met la valeur en attente et
+passe par Déployer ; garder le node aligne la référence et n'écrit nulle part.
+
+Deux repères pour trouver les écarts sans liste : un badge `⚑ n` sur la ligne,
+un compteur dans la barre d'outils. Cliquer l'un ou l'autre **sélectionne** les
+cellules concernées, et dit combien sont dans des colonnes masquées.
+
+**Sorties/DMX parle le même langage.** Le champ y porte déjà la valeur du node :
+le badge ne porte donc que celle du show et se clique pour trancher. L'alim et
+la carte d'un node hors ligne portent `⏳` — la valeur affichée est celle du
+show, le node ne la connaît pas encore.
+
+### Ce que la référence ne fait jamais
+
+Elle ne bouge que dans deux cas : un **trou** se remplit — une colonne dont
+Fleet n'a jamais eu d'avis prend la première valeur vue, donc un node
+fraîchement découvert n'affiche **aucun** écart — ou la modification est
+attribuée à **nous**. Un sondage ordinaire ne réaligne rien, et une mise à jour
+de firmware non plus : c'est précisément le moment où l'on veut voir ce que le
+firmware a changé tout seul.
+
+Trente-huit colonnes portent une référence. Ni `state.on`, ni la luminosité, ni
+le preset courant : ils changent à chaque conduite, les suivre couvrirait la
+grille d'écarts que personne n'a provoqués. Leurs équivalents persistants, eux,
+sont suivis.
+
+La référence est persistée dans `known-nodes.json` et voyage dans le showfile —
+c'est la part du fichier qui dit ce qui est **voulu**, par opposition à ce qui
+est branché. Elle s'oublie node par node ou d'un coup, et se resème alors sans
+aucun écart.
+
+### Aussi
+
+- **« Renommer d'après cette cellule » s'applique à la sélection.** Chaque node
+  s'aligne sur *sa* valeur de la colonne, jamais sur celle du node cliqué —
+  sinon vingt-sept nodes prendraient le même nom, le même mDNS et le même SSID.
+
+### Format
+
+Trois routes apparaissent : `POST` et `DELETE /api/node/:ip/ref`,
+`POST /api/ref/reset`. `/api/fleet` porte `meta.ecarts` — les seules colonnes où
+le show et le node divergent, avec la valeur du show. Le showfile emporte un
+champ de plus par node ; un showfile antérieur s'importe sans erreur.
+
+## 0.13.1
+
+- **Un flash réussi ne se déclare plus en échec.** Un ESP32 redémarre aussitôt
+  après avoir accusé réception du firmware : sa réponse part tronquée, et le
+  parseur HTTP refusait le message — « Parse Error: Invalid character in chunk
+  size ». Fleet annonçait un échec sur un node pourtant passé en 16.0.1. La
+  réponse ne décide plus de rien : c est la version relue sur le node qui
+  tranche. Un vrai refus (OTA verrouillé, place insuffisante) échoue toujours,
+  et un node injoignable aussi.
 
 ## 0.13.0
 
@@ -158,6 +240,11 @@ la grille affichait un écart que le rapport ignorait.
 
 - **L'ordre des groupes** dans la grille n'est pas encore réglable (il est
   alphabétique).
+- **Le mA par sortie** ne se voit pas dans le tableau Sorties/DMX : la colonne
+  existe mais reste avancée, cachée derrière ⚙, y compris quand c'est ce régime
+  qui gouverne.
+- **La puissance d'une alimentation** ne se saisit qu'en ampères. Une batterie
+  ou une powerbank s'annonce en mA : il faut pouvoir choisir l'unité.
 - **Le WiFi compilé dans le firmware** attend un dépôt privé — voir
   `wled-firmware/`.
 - **L'`client_id` de l'OAuth App** doit être créé pour que la connexion GitHub

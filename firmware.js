@@ -276,6 +276,23 @@ function view(envsInUse) {
 // onProgress(sentBytes, totalBytes) is called as the multipart body is pushed
 // to the node (the ESP writes flash while receiving, so this IS the flash
 // progress; WLED itself reports nothing until the final page).
+// ── Envoyer un firmware, et savoir si ça a marché ──────────────────────────
+//
+// Le piège est dans la RÉPONSE, pas dans l'envoi. Un ESP32 redémarre aussitôt
+// après avoir accusé réception du firmware : sa réponse part souvent tronquée,
+// en morceaux mal formés, ou la connexion se ferme au milieu. Le parseur HTTP
+// de Node — strict depuis longtemps — refuse alors le message et lève
+// « Parse Error: Invalid character in chunk size » ou « ECONNRESET ».
+//
+// Rejeter là-dessus revient à déclarer un échec après un flash RÉUSSI. C'est
+// arrivé sur une boule 13 passée en 16.0.1 pendant que l'interface affichait
+// « ✗ échec ». Un rapport qui ment dans ce sens-là est pire que pas de rapport :
+// on reflashe un node qui n'en avait pas besoin.
+//
+// Donc : si le corps est parti EN ENTIER, une réponse illisible n'est plus une
+// erreur. On rend la main avec une note, et c'est la version relue sur le node
+// qui tranche — le seul fait observable. Une erreur AVANT la fin de l'envoi
+// reste une vraie erreur : là, le firmware n'est pas arrivé.
 function flashFile(ip, filePath, onProgress = () => {}, timeoutMs = 180000) {
   const [host, port] = ip.split(':');
   const data = fs.readFileSync(filePath);
@@ -283,8 +300,16 @@ function flashFile(ip, filePath, onProgress = () => {}, timeoutMs = 180000) {
   const head = Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="update"; filename="${path.basename(filePath)}"\r\nContent-Type: application/octet-stream\r\n\r\n`);
   const tail = Buffer.from(`\r\n--${boundary}--\r\n`);
   const body = Buffer.concat([head, data, tail]);
+  // ce que le firmware d'un ESP casse en redémarrant, par opposition à un node
+  // qu'on n'a jamais joint
+  const reponseCassee = e => e && (/parse error/i.test(e.message || '') || String(e.code || '').startsWith('HPE_')
+    || e.code === 'ECONNRESET' || e.code === 'EPIPE');
   return new Promise((resolve, reject) => {
+    let toutEnvoye = false;
     const req = http.request({ host, port: port ? +port : 80, method: 'POST', path: '/update', timeout: timeoutMs,
+      // tolérant sur la réponse : c'est celle d'un microcontrôleur qui redémarre,
+      // pas celle d'un serveur qu'on peut corriger
+      insecureHTTPParser: true,
       headers: { 'Content-Type': `multipart/form-data; boundary=${boundary}`, 'Content-Length': body.length } }, res => {
       let d = ''; res.on('data', c => d += c);
       res.on('end', () => {
@@ -293,9 +318,14 @@ function flashFile(ip, filePath, onProgress = () => {}, timeoutMs = 180000) {
         if (/fail|error|lock|not allowed/i.test(text) && !/success/i.test(text)) return reject(new Error(text.slice(0, 200)));
         resolve(text.slice(0, 200));
       });
+      res.on('error', e => (toutEnvoye && reponseCassee(e)
+        ? resolve(`réponse illisible (${e.message}) — la version du node tranchera`)
+        : reject(e)));
     });
     req.on('timeout', () => req.destroy(new Error('timeout upload OTA')));
-    req.on('error', reject);
+    req.on('error', e => (toutEnvoye && reponseCassee(e)
+      ? resolve(`réponse illisible (${e.message}) — la version du node tranchera`)
+      : reject(e)));
     // push the body in 16 kB slices, waiting for the socket to drain, so that
     // progress reflects what the node has really accepted
     const CHUNK = 16384; let off = 0;
@@ -307,10 +337,10 @@ function flashFile(ip, filePath, onProgress = () => {}, timeoutMs = 180000) {
         onProgress(off, body.length);
         if (!ok) { req.once('drain', pump); return; }
       }
+      toutEnvoye = true;
       req.end();
     };
     pump();
   });
 }
-
 module.exports = { loadIndex, refresh, download, remove, addLocal, assess, latestFor, view, localPath, isLocal, flashFile, cmpVer, guessEnv, ASSET_RE, catalogue: () => catalogue };

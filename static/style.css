@@ -87,6 +87,29 @@
   td.pending .cell::after{content:' ✎';color:var(--info)}
   td.chg-ext{box-shadow:inset 4px 0 0 var(--warn)}
   td.chg-us{box-shadow:inset 4px 0 0 var(--accent)}
+  /* Deux valeurs sur une même donnée : le show en gras, le node en gris, un
+     signe entre les deux. Le crayon de .pending ferait doublon avec le ⏳. */
+  td.ecarte .cell::after{content:''}
+  /* le cadre de l'écart remplace le liseré du journal : les deux ensemble ne se
+     lisent plus. Il faut le redire sur les combinaisons, sinon leur spécificité
+     l'emporte et la cellule perd son cadre. */
+  td.ecarte,td.ecarte.chg-ext,td.ecarte.chg-us{background:rgba(210,153,34,.14);box-shadow:inset 0 0 0 2px var(--warn)}
+  td.ecarte.pending,td.ecarte.pending.chg-ext,td.ecarte.pending.chg-us{background:rgba(88,166,255,.22);box-shadow:inset 0 0 0 2px var(--info)}
+  /* La colonne Nom est collante : un fond translucide y laisserait défiler les
+     lignes DERRIÈRE la cellule. Elle garde donc son fond opaque, et n'a que le
+     cadre — qui suffit à la lire. */
+  td.pin2.ecarte{background:var(--panel)}
+  td.pin2.ecarte.pending{background:var(--panel);box-shadow:inset 0 0 0 2px var(--info)}
+  .ecart{display:inline-flex;gap:4px;align-items:baseline;min-width:0}
+  .ecart b{font-weight:600;flex:0 1 auto;overflow:hidden;text-overflow:ellipsis}
+  .ecart i{font-style:normal;flex:0 0 auto;opacity:.9;font-size:.9em}
+  .ecart .autre{opacity:.55;font-size:.85em;flex:0 1 auto;overflow:hidden;text-overflow:ellipsis}
+  .ecart .rien{opacity:.4}
+  /* Sorties/DMX : le champ porte la valeur du node, le badge celle du show */
+  .ecbadge{background:rgba(210,153,34,.18);border:1px solid var(--warn);color:var(--warn);
+    border-radius:4px;padding:1px 5px;font-size:11px;cursor:pointer;line-height:1.5;white-space:nowrap}
+  .ecbadge:hover{background:rgba(210,153,34,.34)}
+  .ecwait{color:var(--warn);cursor:help}
   table.outs td.newprof{box-shadow:inset 3px 0 0 var(--warn)} table.outs td.newprof select{border-color:var(--warn)}
   #journal table{font-size:12px} #journal th{position:static;background:var(--panel2)} #journal td{padding:3px 8px;background:transparent}
   .src{font-size:10px;font-weight:650;padding:1px 6px;border-radius:10px;text-transform:uppercase}
@@ -118,6 +141,13 @@
   body.row-dragging,body.row-dragging *{cursor:grabbing!important;user-select:none}
   .pop{position:fixed;z-index:1000;background:var(--panel);border:1px solid var(--line2);border-radius:9px;padding:10px 12px;box-shadow:0 10px 30px rgba(0,0,0,.45);max-width:460px;font-size:12px;animation:popin .12s ease-out}
   @keyframes popin{from{opacity:0;transform:translateY(-4px)}to{opacity:1;transform:none}}
+  /* Une fenêtre ne déborde jamais de l écran : elle se RÉDUIT. Sa liste perd
+     de la hauteur et défile, mais le titre et les boutons restent visibles —
+     sans quoi on ne peut simplement pas valider, ce qui est arrivé avec 28
+     nodes sélectionnés. */
+  .pop{max-height:calc(100vh - 16px);display:flex;flex-direction:column}
+  .pop-head,.pop-actions{flex:0 0 auto}
+  .pop-body{flex:0 1 auto}
   .pop-head{font-weight:650;margin-bottom:4px}
   .pop-body{white-space:pre-line;color:var(--muted);max-height:220px;overflow:auto;margin-bottom:6px;font-size:11.5px}
   .pop-actions{display:flex;gap:8px;justify-content:flex-end;margin-top:6px}

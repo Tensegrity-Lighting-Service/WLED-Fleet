@@ -8,6 +8,7 @@
 'use strict';
 const test = require('node:test');
 const assert = require('node:assert');
+const fs = require('fs');
 const fw = require('../firmware');
 
 // relevé sur 192.168.88.54 et ses sept jumelles
@@ -58,4 +59,76 @@ test('assess() cesse d\'afficher « ? » sur un node ancien', () => {
   assert.strictEqual(a.env, 'ESP32-C3');
   assert.strictEqual(a.envDeduit, true, 'l\'interface doit pouvoir dire que c\'est déduit');
   assert.notStrictEqual(a.status, '?');
+});
+
+// ── L'envoi d'un firmware, et la réponse d'un node qui redémarre ────────────
+// Un ESP32 redémarre aussitôt après avoir accusé réception : sa réponse part
+// tronquée, en morceaux mal formés, ou la connexion se ferme au milieu. Rejeter
+// là-dessus déclare un échec après un flash RÉUSSI — c'est arrivé sur une boule
+// passée en 16.0.1 pendant que l'interface affichait « ✗ échec ».
+const net = require('net');
+const os = require('os');
+const path = require('path');
+
+// un faux node qui accepte tout l'envoi puis répond n'importe quoi
+const nodeQuiRedemarre = (repondre) => new Promise(resolve => {
+  const srv = net.createServer(sock => {
+    let recu = 0, taille = null, tete = '';
+    sock.on('data', c => {
+      recu += c.length;
+      if (taille === null) { tete += c.toString('latin1'); const m = /content-length:\s*(\d+)/i.exec(tete); if (m) taille = Number(m[1]); }
+      // tout le corps est arrivé : on répond comme un ESP qui repart
+      if (taille !== null && recu >= taille) { repondre(sock); }
+    });
+    sock.on('error', () => { /* le pair coupe : normal ici */ });
+  });
+  srv.listen(0, '127.0.0.1', () => resolve({ srv, port: srv.address().port }));
+});
+
+const fauxFirmware = () => {
+  const p = path.join(os.tmpdir(), `wf-test-${Date.now()}.bin`);
+  fs.writeFileSync(p, Buffer.alloc(4096, 7));
+  return p;
+};
+
+test('une réponse au découpage illisible ne fait PLUS échouer un flash réussi', async () => {
+  // exactement le message rencontré : « Parse Error: Invalid character in chunk size »
+  const { srv, port } = await nodeQuiRedemarre(sock => {
+    sock.write('HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nZZZZ\r\n');
+    sock.destroy();
+  });
+  const bin = fauxFirmware();
+  try {
+    const msg = await fw.flashFile(`127.0.0.1:${port}`, bin, () => {}, 8000);
+    assert.match(String(msg), /illisible|version/i, 'on rend la main avec une note, pas une erreur');
+  } finally { srv.close(); fs.unlinkSync(bin); }
+});
+
+test('une connexion coupée après l\'envoi complet ne fait pas échouer non plus', async () => {
+  const { srv, port } = await nodeQuiRedemarre(sock => sock.destroy());
+  const bin = fauxFirmware();
+  try {
+    const msg = await fw.flashFile(`127.0.0.1:${port}`, bin, () => {}, 8000);
+    assert.ok(typeof msg === 'string');
+  } finally { srv.close(); fs.unlinkSync(bin); }
+});
+
+test('un node qui REFUSE la mise à jour échoue toujours', async () => {
+  // la tolérance ne doit pas avaler un vrai refus : OTA verrouillé, place
+  // insuffisante, mauvaise image
+  const { srv, port } = await nodeQuiRedemarre(sock => {
+    const corps = '<html>Update error: Not Enough Space</html>';
+    sock.write(`HTTP/1.1 200 OK\r\nContent-Length: ${corps.length}\r\n\r\n${corps}`);
+  });
+  const bin = fauxFirmware();
+  try {
+    await assert.rejects(() => fw.flashFile(`127.0.0.1:${port}`, bin, () => {}, 8000), /error|space/i);
+  } finally { srv.close(); fs.unlinkSync(bin); }
+});
+
+test('un node injoignable échoue toujours — le firmware n\'est jamais parti', async () => {
+  const bin = fauxFirmware();
+  try {
+    await assert.rejects(() => fw.flashFile('127.0.0.1:1', bin, () => {}, 3000));
+  } finally { fs.unlinkSync(bin); }
 });

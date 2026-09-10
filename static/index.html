@@ -47,6 +47,7 @@
   <label class="chip" title="dans chaque colonne, teinte en jaune les cellules qui diffèrent de la valeur majoritaire : repère immédiat d'un node réglé autrement que les autres. Ignore les valeurs naturellement uniques (IP, MAC, univers…) et volatiles (RSSI, FPS…)."><input type="checkbox" id="diffToggle" checked> surligner les écarts</label>
   <label class="chip" title="cache les nodes qui ne répondent plus"><input type="checkbox" id="hideOffline"> masquer hors-ligne</label>
   <span class="spacer"></span>
+  <button id="btnEcarts" hidden title="des valeurs ont changé sur les nodes en dehors de Fleet, sans passer par lui : cliquer pour sélectionner ces cellules, puis clic droit pour garder l'une ou l'autre valeur">⚑ écarts</button>
   <span style="width:8px"></span>
   <button id="btnDiscard" disabled title="jeter toutes les modifications en attente (cellules bleues) sans rien envoyer">Annuler</button>
   <button id="btnDeploy" disabled title="envoyer toutes les modifications en attente aux nodes, après récapitulatif et confirmation. Chaque cellule est écrite par un POST partiel sur /json/cfg ou /json/state du node.">Déployer</button>
