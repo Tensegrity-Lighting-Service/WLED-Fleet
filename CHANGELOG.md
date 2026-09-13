@@ -8,13 +8,32 @@ messages de commit ; ici on garde ce qu'il faut savoir avant de mettre à jour.
 | canal | version | ce qu'on y trouve |
 |---|---|---|
 | **stable** | **0.9.0** | la dernière version éprouvée en exploitation |
-| **beta** | **0.14.0** | l'écart show / node dans la cellule, la chaîne électrique, le schéma du plateau |
+| **beta** | **0.14.1** | l'écart show / node dans la cellule, la chaîne électrique, le schéma du plateau |
 
 Tout ce qui suit la 0.9.0 vit donc **uniquement sur le canal beta** (⚙ Réglages →
 Application → Canal). Le canal stable ne peut pas l'attraper par accident :
 GitHub ne résout jamais `releases/latest` vers une préversion.
 
 ---
+
+## 0.14.1
+
+Relecture de la 0.14.0. Quatre correctifs, dont un qui perdait des données.
+
+- **La référence du show survit à un changement d'IP.** Un node qui passait sur
+  une autre adresse en DHCP repartait des valeurs vivantes : tous ses écarts
+  disparaissaient en silence. La file d'attente, les profils de sortie et la
+  copie des métadonnées se perdaient de la même façon — depuis toujours.
+- **Ce qui a bougé pendant que Fleet était fermé se voit.** La référence est
+  semée au chargement, sur le dernier état connu — pas au premier sondage, sur
+  ce que le node dit maintenant. Une flotte mémorisée avant la 0.14 reçoit sa
+  référence de la même façon.
+- **Une valeur qu'on vient d'écrire ne se signale plus comme « modifiée en
+  dehors ».** Après une écriture qui redémarre le node (IP fixe, SSID,
+  passerelle), la cellule dit `⏳ écrit par Fleet — relecture en attente`, en
+  bleu, pendant les quinze secondes avant relecture.
+- **Sorties/DMX** : l'alimentation retenue pour un node hors ligne reste
+  affichée à son retour, jusqu'à ce qu'on l'envoie.
 
 ## 0.14.0
 

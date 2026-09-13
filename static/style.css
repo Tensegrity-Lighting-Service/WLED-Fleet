@@ -95,11 +95,14 @@
      l'emporte et la cellule perd son cadre. */
   td.ecarte,td.ecarte.chg-ext,td.ecarte.chg-us{background:rgba(210,153,34,.14);box-shadow:inset 0 0 0 2px var(--warn)}
   td.ecarte.pending,td.ecarte.pending.chg-ext,td.ecarte.pending.chg-us{background:rgba(88,166,255,.22);box-shadow:inset 0 0 0 2px var(--info)}
+  /* bleu aussi quand c'est Fleet qui vient d'écrire et attend de relire : le
+     cadre dit QUI a bougé, et là c'est nous */
+  td.ecart-relecture,td.ecart-relecture.chg-us,td.ecart-relecture.chg-ext{background:rgba(88,166,255,.22);box-shadow:inset 0 0 0 2px var(--info)}
   /* La colonne Nom est collante : un fond translucide y laisserait défiler les
      lignes DERRIÈRE la cellule. Elle garde donc son fond opaque, et n'a que le
      cadre — qui suffit à la lire. */
   td.pin2.ecarte{background:var(--panel)}
-  td.pin2.ecarte.pending{background:var(--panel);box-shadow:inset 0 0 0 2px var(--info)}
+  td.pin2.ecarte.pending,td.pin2.ecart-relecture{background:var(--panel);box-shadow:inset 0 0 0 2px var(--info)}
   .ecart{display:inline-flex;gap:4px;align-items:baseline;min-width:0}
   .ecart b{font-weight:600;flex:0 1 auto;overflow:hidden;text-overflow:ellipsis}
   .ecart i{font-style:normal;flex:0 0 auto;opacity:.9;font-size:.9em}

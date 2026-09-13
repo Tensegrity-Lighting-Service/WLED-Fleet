@@ -84,7 +84,7 @@
   // masquer : ⏳, le même signe que dans la grille.
   const attendPower = ip => { const r = fleet.nodes.find(x => x.meta.ip === ip); return !!(r && r.meta.offlineQueue && r.meta.offlineQueue.power !== undefined); };
   const marqueAttente = ip => attendPower(ip)
-    ? ` <span class="ecwait" title="⏳ retenu par Fleet — le node est hors ligne et ne le sait pas encore. Ce sera écrit dans son /fleet.json dès qu'il répondra.">⏳</span>` : '';
+    ? ` <span class="ecwait" title="⏳ retenu par Fleet, le node ne le sait pas encore. Il l'a reçu hors ligne : ce sera écrit dans son /fleet.json quand on l'enverra — bouton ⏳ de sa ligne dans la Grille, dès qu'il répond.">⏳</span>` : '';
 
   const cellAlim = (n, membres, span) => {
     const list = catalogueAlims();
@@ -237,6 +237,22 @@
   const ECART = {
     plan: { signe: '⏳', dit: 'en attente — le node ne l\'a pas encore' },
     externe: { signe: '⚑', dit: 'modifié en dehors de Fleet' },
+    // Fleet vient d'écrire et n'a pas encore relu le node : la référence porte
+    // déjà la nouvelle valeur, le record encore l'ancienne. Sur une IP fixe ou
+    // un SSID, le node redémarre et la relecture attend quinze secondes — le
+    // temps d'afficher un ⚑ « modifié en dehors » sur une valeur que l'on
+    // vient soi-même de saisir, qui est exactement la confusion à éviter.
+    relecture: { signe: '⏳', dit: 'écrit par Fleet — relecture du node en attente' },
+  };
+  // Qui a bougé, pour une cellule : le journal des changements dit si le
+  // dernier mouvement sur cette cellule est le nôtre (écriture, restauration)
+  // ou celui du node.
+  const genreDe = (n, colId, p) => {
+    const refShow = ecartDe(n, colId);
+    if (p) return 'plan';
+    if (refShow === undefined) return '';
+    const ch = recentChanges.get(pkey(key(n), colId));
+    return ch && ch.source !== 'externe' && Date.now() - ch.at < RECENT_MS ? 'relecture' : 'externe';
   };
   function celluleEcart(col, show, node, genre) {
     const e = ECART[genre] || ECART.externe;
@@ -262,7 +278,7 @@
   // cellule sur laquelle une modification est déjà en attente est comptée par
   // « Déployer » ; la faire compter deux fois ferait dire au badge ⚑ qu'une
   // valeur a changé en dehors de Fleet alors que c'est nous qui l'avons décidée.
-  const colsEcartExterne = n => Object.keys(ecartsDe(n) || {}).filter(colId => !pending.has(pkey(key(n), colId)));
+  const colsEcartExterne = n => Object.keys(ecartsDe(n) || {}).filter(colId => genreDe(n, colId, pending.get(pkey(key(n), colId))) === 'externe');
   // Même grammaire, sur un champ de formulaire (Sorties / DMX). Le champ porte
   // déjà la valeur du node : le badge porte celle du show, et se clique pour
   // trancher. Un « 900 ⚑ 420 » en texte à côté d'un champ qui affiche 420
@@ -1089,9 +1105,9 @@
         // référence du show). Les confondre, c'est ce qui faisait apparaître un
         // bouton « mettre à jour » sans que personne n'ait rien touché.
         const refShow = ecartDe(n, c.id);
-        const genre = p ? 'plan' : refShow !== undefined ? 'externe' : '';
+        const genre = genreDe(n, c.id, p);
         const show = p ? p.value : refShow;
-        const cls = ['gk-' + GROUPS.indexOf(c.group), c.write && !fleet.readonly ? 'rw' : '', c.type === 'num' ? 'num' : '', isDiff ? 'diff' : '', p ? 'pending' : '', genre ? 'ecarte' : ''].filter(Boolean).join(' ') + changedCls(k, c.id);
+        const cls = ['gk-' + GROUPS.indexOf(c.group), c.write && !fleet.readonly ? 'rw' : '', c.type === 'num' ? 'num' : '', isDiff ? 'diff' : '', p ? 'pending' : '', genre ? 'ecarte ecart-' + genre : ''].filter(Boolean).join(' ') + changedCls(k, c.id);
         const title = (genre ? titreEcart(c, show, live, genre, genre === 'externe' && ch ? ch.at : 0, refShow !== undefined)
           : ch ? `modifié ${ch.source} à ${new Date(ch.at).toLocaleTimeString()} : ${raw(c, ch.old)} → ${raw(c, ch.new)}\n\n` : '') + helpText(c);
         const dedans = genre ? celluleEcart(c, show, live, genre) : display(c, v);
@@ -1101,7 +1117,7 @@
       const nameLive = get(n, nameCol.path) ?? (n.info && n.info.name) ?? '';
       const name = pn ? pn.value : nameLive;
       const nameRef = ecartDe(n, 'name');
-      const nameGenre = pn ? 'plan' : nameRef !== undefined ? 'externe' : '';
+      const nameGenre = genreDe(n, 'name', pn);
       const pr = presenceHtml(n);
       const oq = n.meta.offlineQueue;
       const oqWhat = oq ? Object.keys(oq).map(f => OFFLINE_FIELD_LABEL[f] || f).join(', ') : '';
@@ -1113,7 +1129,7 @@
       const nameTitle = [n.meta.err, pr.status, n.derived && n.derived.nameMismatch ? n.derived.nameMismatch + ' — bouton ≡ unifier en bout de ligne' : '', oq ? `⏳ en attente (${oqWhat}) — ${n.meta.online ? 'cliquer pour envoyer ou abandonner' : 'sera proposé au retour du node'}` : '', nEc ? `⚑ ${nEc} valeur(s) modifiée(s) en dehors de Fleet : ${ecLbl}` : ''].filter(Boolean).join('\n');
       return `<tr class="${n.meta.online ? '' : 'offline'}${selected.has(k) ? ' selected' : ''}" data-ip="${esc(k)}" data-rid="${esc(rid(n))}">` +
         `<td class="pin"><span class="cell"><span class="grip" title="glisser pour réordonner les lignes (passe en ordre manuel)"></span><input type="checkbox" class="sel" title="cocher la ligne pour les actions (identifier, préréglage, mise à jour)" ${selected.has(k) ? 'checked' : ''}></span></td>` +
-        `<td class="pin2 ${nameCol.write && !fleet.readonly ? 'rw' : ''}${pn ? ' pending' : ''}${nameGenre ? ' ecarte' : ''}${changedCls(k, 'name')}" data-ip="${esc(k)}" data-col="name" title="${esc(nameTitle)}"><span class="cell"><span class="dot ${pr.cls}"></span>${pr.bars}<button class="idbtn" data-act="identify" title="identifier : allume ce node en blanc plein 3 s (même sous flux E1.31 / DDP) puis rétablit son état ; rien n'est écrit en mémoire">💡</button>${oq ? `<button class="idbtn" data-act="offline-queue" style="color:var(--warn)" title="${esc(`en attente (${oqWhat}) — ${n.meta.online ? 'cliquer pour envoyer au node ou abandonner' : 'sera proposé dès que le node répond'}`)}">⏳</button>` : ''}${nEc ? `<button class="idbtn" data-act="ecarts" style="color:var(--warn)" title="${esc(`⚑ ${nEc} valeur(s) modifiée(s) en dehors de Fleet : ${ecLbl}\ncliquer : sélectionner ces cellules`)}">⚑${nEc}</button>` : ''}${nameGenre ? celluleEcart(nameCol, pn ? pn.value : nameRef, nameLive, nameGenre) : esc(name)}${n.derived && n.derived.nameMismatch ? ' <span style="color:var(--warn)" title="' + esc(n.derived.nameMismatch) + '">≠</span>' : ''}${n.meta.pending ? ' <span class="muted">…</span>' : ''}</span></td>` +
+        `<td class="pin2 ${nameCol.write && !fleet.readonly ? 'rw' : ''}${pn ? ' pending' : ''}${nameGenre ? ' ecarte ecart-' + nameGenre : ''}${changedCls(k, 'name')}" data-ip="${esc(k)}" data-col="name" title="${esc(nameTitle)}"><span class="cell"><span class="dot ${pr.cls}"></span>${pr.bars}<button class="idbtn" data-act="identify" title="identifier : allume ce node en blanc plein 3 s (même sous flux E1.31 / DDP) puis rétablit son état ; rien n'est écrit en mémoire">💡</button>${oq ? `<button class="idbtn" data-act="offline-queue" style="color:var(--warn)" title="${esc(`en attente (${oqWhat}) — ${n.meta.online ? 'cliquer pour envoyer au node ou abandonner' : 'sera proposé dès que le node répond'}`)}">⏳</button>` : ''}${nEc ? `<button class="idbtn" data-act="ecarts" style="color:var(--warn)" title="${esc(`⚑ ${nEc} valeur(s) modifiée(s) en dehors de Fleet : ${ecLbl}\ncliquer : sélectionner ces cellules`)}">⚑${nEc}</button>` : ''}${nameGenre ? celluleEcart(nameCol, pn ? pn.value : nameRef, nameLive, nameGenre) : esc(name)}${n.derived && n.derived.nameMismatch ? ' <span style="color:var(--warn)" title="' + esc(n.derived.nameMismatch) + '">≠</span>' : ''}${n.meta.pending ? ' <span class="muted">…</span>' : ''}</span></td>` +
         `<td class="pin3${n.meta.foreign ? ' chg-ext' : ''}" data-ip="${esc(k)}" data-col="ip" title="${esc(helpText(COLS.find(c => c.id === 'ip')))}"><span class="cell">${display(COLS.find(c => c.id === 'ip'), k)}</span></td>` +
         cells +
         (!showAdv ? '<td></td>' : `<td><span class="cell"><a class="rowbtn" href="/api/node/${encodeURIComponent(k)}/cfg" title="télécharger le cfg.json complet de ce node (sauvegarde de toute sa configuration)">⬇ cfg</a>` +

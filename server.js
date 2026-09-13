@@ -942,6 +942,16 @@ function mergeByMac(rec) {
     if (!rec.cfg && other.cfg) rec.cfg = other.cfg;
     if (!rec.meta.group && other.meta.group) rec.meta.group = other.meta.group;
     if (!rec.meta.ignoredOutputs && other.meta.ignoredOutputs) rec.meta.ignoredOutputs = other.meta.ignoredOutputs;
+    // Tout ce que Fleet SEUL sait de ce node suit la ligne, sinon un simple
+    // changement d'IP en DHCP l'efface en silence : la référence du show
+    // repartirait des valeurs vivantes — tous les écarts disparaîtraient — et
+    // la file d'attente, les profils de sortie et la copie des métadonnées
+    // seraient perdus avec elle. On est AVANT le semis de cette ligne (il a lieu
+    // en fin de sondage) : la référence héritée reste donc entière.
+    if (!Object.keys(rec.meta.ref || {}).length && other.meta.ref) rec.meta.ref = other.meta.ref;
+    if (!rec.meta.offlineQueue && other.meta.offlineQueue) rec.meta.offlineQueue = other.meta.offlineQueue;
+    if (!rec.meta.outputProfiles && other.meta.outputProfiles) rec.meta.outputProfiles = other.meta.outputProfiles;
+    if (!rec.meta.nodeMetaSeen && other.meta.nodeMetaSeen) { rec.meta.nodeMetaSeen = other.meta.nodeMetaSeen; if (!rec.meta.nodeMeta) rec.meta.nodeMeta = other.meta.nodeMeta; }
     fleet.delete(ip);
     recordChange(rec, 'ip', ip, rec.meta.ip, 'statut');
     console.log(`même node (MAC ${mac}) : ${ip} → ${rec.meta.ip}, ligne fusionnée`);
@@ -1519,12 +1529,18 @@ function loadKnown() {
     const r = addNode(e.ip);
     if (e.offlineQueue && typeof e.offlineQueue === 'object') r.meta.offlineQueue = e.offlineQueue; // edits made while this node was unreachable, not yet resolved
     if (e.info) { r.info = e.info; r.state = e.state || null; r.cfg = e.cfg || null; r.meta.lastSeen = e.lastSeen || null; r.meta.fails = 2; derive(r); }
+    if (e.ref && typeof e.ref === 'object') r.meta.ref = e.ref; // la référence du show, ce que Fleet tient pour vrai
+    // Semer ICI, sur ce que Fleet savait en s'arrêtant — pas au premier sondage,
+    // sur ce que le node dit maintenant. La différence, c'est tout ce qui a bougé
+    // pendant que Fleet était fermé : la remise à zéro le passerait sous silence.
+    // C'est aussi ce qui fait qu'une flotte mémorisée AVANT la référence en
+    // reçoit une au premier lancement, depuis son dernier état connu.
+    if (r.info) seedRef(r);
     if (Array.isArray(e.ignoredOutputs)) r.meta.ignoredOutputs = e.ignoredOutputs; // Fleet-only: outputs not counted in the DMX plan
     // dernière copie connue des métadonnées du node : sert à les afficher hors
     // ligne, et à les remettre si le node revient nu d'une mise à jour
     if (e.nodeMeta) { r.meta.nodeMetaSeen = metadata.parse(e.nodeMeta); r.meta.nodeMeta = r.meta.nodeMetaSeen; }
     if (typeof e.group === 'string' && e.group) r.meta.group = e.group; // Fleet-only: node group (zone, type…)
-    if (e.ref && typeof e.ref === 'object') r.meta.ref = e.ref; // la référence du show, ce que Fleet tient pour vrai
     if (r.meta.offlineQueue) { // offlineQueue overrides the two legacy fallbacks above too
       if (r.meta.offlineQueue.group !== undefined) r.meta.group = r.meta.offlineQueue.group;
       if (r.meta.offlineQueue.ignoredOutputs !== undefined) r.meta.ignoredOutputs = r.meta.offlineQueue.ignoredOutputs;
@@ -1981,7 +1997,7 @@ const server = http.createServer(async (req, res) => {
         // remplace pas celle d'ici quand il y en a déjà une : importer le
         // showfile d'un autre plateau n'efface rien. Pour que celle du fichier
         // l'emporte, remettre la référence à zéro avant d'importer.
-        for (const e of doc.knownNodes) { const ip = typeof e === 'string' ? e : e.ip; if (!ip) continue; const r = addNode(ip); if (e.info && !r.info) { r.info = e.info; r.state = e.state || null; r.cfg = e.cfg || null; r.meta.lastSeen = e.lastSeen || null; r.meta.fails = 2; } if (typeof e.group === 'string' && e.group) r.meta.group = e.group; if (Array.isArray(e.ignoredOutputs)) r.meta.ignoredOutputs = e.ignoredOutputs; if (e.ref && typeof e.ref === 'object' && !Object.keys(r.meta.ref || {}).length) r.meta.ref = e.ref; derive(r); }
+        for (const e of doc.knownNodes) { const ip = typeof e === 'string' ? e : e.ip; if (!ip) continue; const r = addNode(ip); if (e.info && !r.info) { r.info = e.info; r.state = e.state || null; r.cfg = e.cfg || null; r.meta.lastSeen = e.lastSeen || null; r.meta.fails = 2; } if (typeof e.group === 'string' && e.group) r.meta.group = e.group; if (Array.isArray(e.ignoredOutputs)) r.meta.ignoredOutputs = e.ignoredOutputs; if (e.ref && typeof e.ref === 'object' && !Object.keys(r.meta.ref || {}).length) r.meta.ref = e.ref; derive(r); if (r.info) seedRef(r); }
         saveKnown(); pollAll(); done.push(`${doc.knownNodes.length} node(s)`);
       }
       if (what.snapshots && Array.isArray(doc.snapshots)) { let n = 0; for (const s of doc.snapshots) { try { snapshots.importFile(Buffer.from(JSON.stringify(s)), (s.name || s.id || 'snapshot') + '.json'); n++; } catch { /* skip bad one */ } } done.push(`${n} sauvegarde(s)`); }
@@ -2407,7 +2423,11 @@ const server = http.createServer(async (req, res) => {
         // le rattachement électrique voyage avec le plan : la grille y choisit la
         // carte et l'alimentation, et un troisième aller-retour pour deux champs
         // ne se justifie pas
-        power: (r.meta.nodeMeta && r.meta.nodeMeta.power) || null }));
+        // ce que Fleet tient pour le rattachement : l'intention retenue pour un
+        // node absent passe avant la copie relue de son /fleet.json — sinon, au
+        // retour du node, la cellule retombe sur l'ancienne alim avec un ⏳ qui
+        // ne désigne plus rien de visible
+        power: (r.meta.offlineQueue && r.meta.offlineQueue.power) || (r.meta.nodeMeta && r.meta.nodeMeta.power) || null }));
       const conflicts = dmx.conflicts(nodes.map(n => ({ name: n.name || n.ip, plan: n.plan })));
       const inUse = [...new Set(nodes.flatMap(n => (n.plan.occupancy || []).map(iv => iv.u)))].sort((a, b) => a - b);
       return send(res, 200, { nodes: nodes.sort((a, b) => (a.plan.uni || 0) - (b.plan.uni || 0)), conflicts, universesInUse: inUse });
