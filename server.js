@@ -1997,7 +1997,20 @@ const server = http.createServer(async (req, res) => {
         // remplace pas celle d'ici quand il y en a déjà une : importer le
         // showfile d'un autre plateau n'efface rien. Pour que celle du fichier
         // l'emporte, remettre la référence à zéro avant d'importer.
-        for (const e of doc.knownNodes) { const ip = typeof e === 'string' ? e : e.ip; if (!ip) continue; const r = addNode(ip); if (e.info && !r.info) { r.info = e.info; r.state = e.state || null; r.cfg = e.cfg || null; r.meta.lastSeen = e.lastSeen || null; r.meta.fails = 2; } if (typeof e.group === 'string' && e.group) r.meta.group = e.group; if (Array.isArray(e.ignoredOutputs)) r.meta.ignoredOutputs = e.ignoredOutputs; if (e.ref && typeof e.ref === 'object' && !Object.keys(r.meta.ref || {}).length) r.meta.ref = e.ref; derive(r); if (r.info) seedRef(r); }
+        for (const e of doc.knownNodes) { const ip = typeof e === 'string' ? e : e.ip; if (!ip) continue; const r = addNode(ip); if (e.info && !r.info) { r.info = e.info; r.state = e.state || null; r.cfg = e.cfg || null; r.meta.lastSeen = e.lastSeen || null; r.meta.fails = 2; } if (typeof e.group === 'string' && e.group) r.meta.group = e.group; if (Array.isArray(e.ignoredOutputs)) r.meta.ignoredOutputs = e.ignoredOutputs; if (e.ref && typeof e.ref === 'object' && !Object.keys(r.meta.ref || {}).length) r.meta.ref = e.ref;
+          // Ces trois-là étaient écrits dans le fichier et jamais relus : sur un
+          // poste neuf, un node hors ligne arrivait sans ses fixtures, son alim
+          // ni sa carte, et sans ce qu'on lui destinait. Même règle qu'au
+          // démarrage (loadKnown), même réserve que pour la référence : ce qui
+          // existe déjà ici n'est pas remplacé.
+          if (e.nodeMeta && !r.meta.nodeMetaSeen) { r.meta.nodeMetaSeen = metadata.parse(e.nodeMeta); r.meta.nodeMeta = r.meta.nodeMetaSeen; }
+          if (e.offlineQueue && typeof e.offlineQueue === 'object' && !r.meta.offlineQueue) {
+            r.meta.offlineQueue = e.offlineQueue;
+            if (e.offlineQueue.group !== undefined) r.meta.group = e.offlineQueue.group;
+            if (e.offlineQueue.ignoredOutputs !== undefined) r.meta.ignoredOutputs = e.offlineQueue.ignoredOutputs;
+            if (e.offlineQueue.outputProfiles !== undefined) r.meta.outputProfiles = e.offlineQueue.outputProfiles;
+          }
+          derive(r); if (r.info) seedRef(r); }
         saveKnown(); pollAll(); done.push(`${doc.knownNodes.length} node(s)`);
       }
       if (what.snapshots && Array.isArray(doc.snapshots)) { let n = 0; for (const s of doc.snapshots) { try { snapshots.importFile(Buffer.from(JSON.stringify(s)), (s.name || s.id || 'snapshot') + '.json'); n++; } catch { /* skip bad one */ } } done.push(`${n} sauvegarde(s)`); }

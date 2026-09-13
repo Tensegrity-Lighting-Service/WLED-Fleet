@@ -3409,7 +3409,11 @@
   // ── showfile: everything the app knows in ONE file (settings, antennas with
   // passwords, node list with last known data, config backups, firmware
   // catalogue, column layout), optionally encrypted with a passphrase
-  const layoutForShowfile = () => { try { return { colOrder: JSON.parse(localStorage.getItem('wf.colOrder') || 'null'), colWidths: JSON.parse(localStorage.getItem('wf.colWidths') || '{}'), hiddenGroups: JSON.parse(localStorage.getItem('wf.hiddenGroups') || '[]') }; } catch { return null; } };
+  // L'ordre manuel des lignes part avec la mise en page : il décrit le plateau
+  // (les boules dans l'ordre de la rampe), pas une préférence d'écran, et le
+  // reconstituer à la main sur un autre poste prenait vingt-sept glissers.
+  const layoutForShowfile = () => { try { return { colOrder: JSON.parse(localStorage.getItem('wf.colOrder') || 'null'), colWidths: JSON.parse(localStorage.getItem('wf.colWidths') || '{}'), hiddenGroups: JSON.parse(localStorage.getItem('wf.hiddenGroups') || '[]'),
+    rowOrder: JSON.parse(localStorage.getItem('wf.rowOrder') || '[]'), sortKey: localStorage.getItem('wf.sortKey') || null }; } catch { return null; } };
   async function exportShowfile() {
     const pass = $('#sfPass').value;
     const body = { passphrase: pass || undefined, include: { journal: $('#sfJournal').checked }, layout: layoutForShowfile() };
@@ -3429,7 +3433,7 @@
     if (!await confirmBox(`Importer le showfile${doc.exportedAt ? ' du ' + new Date(doc.exportedAt).toLocaleString() : ''} ?\n\nRemplace : ${Object.entries(what).filter(([, v]) => v).map(([k]) => ({ settings: 'réglages', antennas: 'antennes + mots de passe', nodes: 'nodes, groupes, bibliothèques et plan d\'alimentation', snapshots: 'sauvegardes', firmware: 'catalogue firmware' })[k]).join(', ')}${what.settings ? '\n\nLe serveur redémarrera pour appliquer les réglages.' : ''}`)) return;
     try {
       const r = await post('/api/showfile/import', { file: doc, passphrase: pass || undefined, what });
-      if (r.layout && $('#sfW_layout').checked) { try { if (r.layout.colOrder) localStorage.setItem('wf.colOrder', JSON.stringify(r.layout.colOrder)); if (r.layout.colWidths) localStorage.setItem('wf.colWidths', JSON.stringify(r.layout.colWidths)); if (r.layout.hiddenGroups) localStorage.setItem('wf.hiddenGroups', JSON.stringify(r.layout.hiddenGroups)); } catch { /* ignore */ } }
+      if (r.layout && $('#sfW_layout').checked) { try { if (r.layout.colOrder) localStorage.setItem('wf.colOrder', JSON.stringify(r.layout.colOrder)); if (r.layout.colWidths) localStorage.setItem('wf.colWidths', JSON.stringify(r.layout.colWidths)); if (r.layout.hiddenGroups) localStorage.setItem('wf.hiddenGroups', JSON.stringify(r.layout.hiddenGroups)); if (Array.isArray(r.layout.rowOrder) && r.layout.rowOrder.length) { localStorage.setItem('wf.rowOrder', JSON.stringify(r.layout.rowOrder)); if (r.layout.sortKey) localStorage.setItem('wf.sortKey', r.layout.sortKey); } } catch { /* ignore */ } }
       toast(`importé : ${r.done.join(', ')}${r.restarting ? ' · redémarrage…' : ''}`);
       setTimeout(() => location.reload(), r.restarting ? 6000 : 1500);
     } catch (e) { toast(e.message, true); }
@@ -3448,7 +3452,7 @@
         <label class="chip"><input type="checkbox" id="sfW_nodes" checked title="la liste des nodes, leurs groupes, les trois bibliothèques (produits, drivers, alimentations) et le plan d'alimentation — les fiches gardent leurs identifiants, les marqueurs posés sur les nodes continuent donc de désigner la bonne chose"> nodes et bibliothèques</label>
         <label class="chip"><input type="checkbox" id="sfW_snapshots" checked> sauvegardes</label>
         <label class="chip"><input type="checkbox" id="sfW_firmware" checked> catalogue firmware</label>
-        <label class="chip"><input type="checkbox" id="sfW_layout" checked> colonnes</label>
+        <label class="chip" title="ordre et largeur des colonnes, groupes masqués, et l'ordre manuel des lignes"><input type="checkbox" id="sfW_layout" checked> colonnes et ordre des lignes</label>
       </div></div>`;
   }
   function wireShowfile() {

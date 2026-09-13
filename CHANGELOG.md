@@ -8,13 +8,25 @@ messages de commit ; ici on garde ce qu'il faut savoir avant de mettre à jour.
 | canal | version | ce qu'on y trouve |
 |---|---|---|
 | **stable** | **0.9.0** | la dernière version éprouvée en exploitation |
-| **beta** | **0.14.1** | l'écart show / node dans la cellule, la chaîne électrique, le schéma du plateau |
+| **beta** | **0.14.2** | l'écart show / node dans la cellule, la chaîne électrique, le schéma du plateau |
 
 Tout ce qui suit la 0.9.0 vit donc **uniquement sur le canal beta** (⚙ Réglages →
 Application → Canal). Le canal stable ne peut pas l'attraper par accident :
 GitHub ne résout jamais `releases/latest` vers une préversion.
 
 ---
+
+## 0.14.2
+
+- **Le showfile restaure vraiment un node hors ligne.** Trois champs étaient
+  écrits dans le fichier et jamais relus à l'import : la copie des métadonnées
+  du node (fixtures, alimentation, carte), la file d'attente hors ligne et ce
+  qu'elle porte. Sur un poste neuf, un node absent arrivait nu tant qu'il ne
+  revenait pas sur le réseau. Ce qui existe déjà sur le poste n'est toujours
+  pas remplacé.
+- **L'ordre manuel des lignes voyage avec le showfile**, à côté de l'ordre et
+  de la largeur des colonnes. La case s'appelle désormais « colonnes et ordre
+  des lignes ».
 
 ## 0.14.1
 
